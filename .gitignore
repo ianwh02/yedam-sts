@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
+
+# Models (downloaded at runtime)
+models/
+*.bin
+*.pt
+*.onnx
+*.safetensors
+
+# Logs
+logs/
+*.log
+*.txt
+!requirements.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio test artifacts (but allow reference audio for voice cloning)
+*.wav
+!tts-server/ref_audio/*.wav
+!tts-server/nano-qwen3tts-vllm/examples/assets/*.wav
+
+# Rust build artifacts
+target/
+
+# Benchmark outputs
+benchmarks/results/
+
+# Business docs (private, not in open-source repo)
+BUSINESS.md
+
+# Migration plans (internal working docs)
+PLAN-VLLM-OMNI-MIGRATION.md

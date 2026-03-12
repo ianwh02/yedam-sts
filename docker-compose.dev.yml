@@ -1,0 +1,21 @@
+# Development overrides - exposes all service ports for debugging
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  stt:
+    ports:
+      - "9090:9090"
+
+  llm:
+    ports:
+      - "8000:8000"
+
+  tts:
+    ports:
+      - "7860:7860"
+
+  orchestrator:
+    environment:
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./orchestrator/src:/app/src:ro

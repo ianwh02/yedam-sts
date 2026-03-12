@@ -1,0 +1,145 @@
+services:
+  stt:
+    build:
+      context: ./stt-server
+      dockerfile: Dockerfile
+      args:
+        - WHISPER_MODEL_REPO=${WHISPER_MODEL_REPO:-deepdml/faster-whisper-large-v3-turbo-ct2}
+        - WHISPER_MODEL_NAME=${WHISPER_MODEL_NAME:-faster-whisper-large-v3-turbo}
+    container_name: yedam-stt
+    restart: unless-stopped
+    depends_on:
+      llm:
+        condition: service_healthy
+    environment:
+      - OMP_NUM_THREADS=${WHISPER_OMP_NUM_THREADS:-4}
+      - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-int8_float16}
+      - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+      - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${STT_MPS_THREAD_PCT:-30}
+    volumes:
+      - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
+    expose:
+      - "9090"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  llm:
+    image: vllm/vllm-openai:latest
+    container_name: yedam-llm
+    restart: unless-stopped
+    environment:
+      - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+      - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${LLM_MPS_THREAD_PCT:-50}
+    volumes:
+      - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
+    command:
+      - "--model"
+      - "${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}"
+      - "--quantization"
+      - "${LLM_QUANTIZATION:-awq_marlin}"
+      - "--kv-cache-dtype"
+      - "${LLM_KV_CACHE_DTYPE:-fp8}"
+      - "--gpu-memory-utilization"
+      - "${LLM_GPU_MEMORY_UTILIZATION:-0.50}"
+      - "--max-model-len"
+      - "${LLM_MAX_MODEL_LEN:-2048}"
+      - "--max-num-seqs"
+      - "${LLM_MAX_NUM_SEQS:-16}"
+      - "--enable-prefix-caching"
+      - "--enforce-eager"
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  tts:
+    build:
+      context: ./tts-server
+      dockerfile: Dockerfile
+    container_name: yedam-tts
+    restart: unless-stopped
+    depends_on:
+      llm:
+        condition: service_healthy
+    environment:
+      - MODEL_DIR=${TTS_MODEL_DIR:-/app/models/Qwen3-TTS-12Hz-0.6B-Base}
+      - TOKENIZER_DIR=/app/models/Qwen3-TTS-Tokenizer-12Hz
+      - GPU_MEMORY_UTILIZATION=${TTS_GPU_MEMORY_UTILIZATION:-0.35}
+      - PORT=7860
+      - REF_AUDIO_PATH=${REF_AUDIO_PATH:-/app/ref_audio/reference.wav}
+      - REF_TEXT=${REF_TEXT:-Hello I'm recording a test audio to clone my own voice um to qwen tts nano}
+      - X_VECTOR_ONLY=${X_VECTOR_ONLY:-0}
+      - TALKER_MAX_BATCH_SIZE=${TALKER_MAX_BATCH_SIZE:-}
+      - TALKER_ENFORCE_EAGER=${TALKER_ENFORCE_EAGER:-1}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
+      - DECODE_COLLECT_MS=${DECODE_COLLECT_MS:-40}
+      - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+      - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${TTS_MPS_THREAD_PCT:-20}
+    shm_size: '4g'
+    volumes:
+      - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
+      - ${REF_AUDIO_DIR:-./tts-server/ref_audio}:/app/ref_audio:ro
+    ports:
+      - "${TTS_PORT:-7860}:7860"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: yedam-orchestrator
+    restart: unless-stopped
+    environment:
+      - ORCHESTRATOR_PORT=${ORCHESTRATOR_PORT:-8080}
+      - STT_WS_URL=${STT_WS_URL:-ws://stt:9090}
+      - LLM_API_URL=${LLM_API_URL:-http://llm:8000/v1}
+      - TTS_API_URL=${TTS_API_URL:-http://tts:7860}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEFAULT_SOURCE_LANG=${DEFAULT_SOURCE_LANG:-ko}
+      - DEFAULT_TARGET_LANG=${DEFAULT_TARGET_LANG:-en}
+      - DEFAULT_PROCESSOR=${DEFAULT_PROCESSOR:-translation}
+      - LLM_CONTEXT_WINDOW_SEGMENTS=${LLM_CONTEXT_WINDOW_SEGMENTS:-5}
+      - STT_INITIAL_PROMPT_SEGMENTS=${STT_INITIAL_PROMPT_SEGMENTS:-3}
+    ports:
+      - "${ORCHESTRATOR_PORT:-8080}:8080"
+    depends_on:
+      stt:
+        condition: service_healthy
+      llm:
+        condition: service_healthy
+      tts:
+        condition: service_healthy

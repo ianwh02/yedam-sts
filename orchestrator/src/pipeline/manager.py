@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import logging
+import uuid
+
+import httpx
+
+from ..audio.opus import OpusEncoder
+from ..audio.preprocess import AudioPreprocessor
+from ..config import settings
+from ..processors.passthrough import PassthroughProcessor
+from ..processors.translation import TranslationProcessor
+from ..tts.client import TTSClient
+from .callbacks import SessionCallbacks
+from .orchestrator import SessionOrchestrator
+from .session import TranslationSession
+
+logger = logging.getLogger(__name__)
+
+
+class SessionLimitError(Exception):
+    """Raised when max concurrent sessions reached."""
+
+
+class PipelineManager:
+    """Manages the lifecycle of all active translation sessions.
+
+    Each session represents one audio source with its own
+    STT→Processor→TTS pipeline. Output is via consumer callbacks.
+    """
+
+    def __init__(self):
+        self.sessions: dict[str, TranslationSession] = {}
+        self._orchestrators: dict[str, SessionOrchestrator] = {}
+        self._http_client: httpx.AsyncClient | None = None
+
+        # Shared components (set via initialize)
+        self._preprocessor: AudioPreprocessor | None = None
+        self._tts_client: TTSClient | None = None
+        self._audio_encoder: OpusEncoder | None = None
+        self._processors: dict[str, TranslationProcessor | PassthroughProcessor] = {}
+
+    async def initialize(
+        self,
+        preprocessor: AudioPreprocessor,
+        tts_client: TTSClient,
+        audio_encoder: OpusEncoder | None = None,
+    ):
+        self._preprocessor = preprocessor
+        self._tts_client = tts_client
+        self._audio_encoder = audio_encoder
+        self._http_client = httpx.AsyncClient(timeout=10.0)
+
+        # Initialize processors
+        translation = TranslationProcessor()
+        await translation.initialize()
+        self._processors["translation"] = translation
+
+        passthrough = PassthroughProcessor()
+        await passthrough.initialize()
+        self._processors["passthrough"] = passthrough
+
+        logger.info("PipelineManager initialized")
+
+    async def shutdown(self):
+        for session_id in list(self.sessions):
+            await self.stop_session(session_id)
+
+        for processor in self._processors.values():
+            await processor.shutdown()
+        self._processors.clear()
+
+        if self._http_client:
+            await self._http_client.aclose()
+        logger.info("PipelineManager shut down")
+
+    @property
+    def active_session_count(self) -> int:
+        return len(self.sessions)
+
+    async def create_session(
+        self,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
+        processor_type: str | None = None,
+        callbacks: SessionCallbacks | None = None,
+    ) -> TranslationSession:
+        if self.active_session_count >= settings.max_concurrent_sessions:
+            raise SessionLimitError(
+                f"Maximum concurrent sessions ({settings.max_concurrent_sessions}) reached"
+            )
+
+        session_id = str(uuid.uuid4())[:8]
+        proc_type = processor_type or settings.default_processor
+        session = TranslationSession(
+            session_id=session_id,
+            source_lang=source_lang or settings.default_source_lang,
+            target_lang=target_lang or settings.default_target_lang,
+            processor_type=proc_type,
+        )
+        session.is_active = True
+        self.sessions[session_id] = session
+
+        # Create and start the per-session orchestrator
+        processor = self._processors.get(proc_type, self._processors["translation"])
+        orchestrator = SessionOrchestrator(
+            session=session,
+            preprocessor=self._preprocessor,
+            processor=processor,
+            tts_client=self._tts_client,
+            callbacks=callbacks,
+            audio_encoder=self._audio_encoder,
+        )
+        await orchestrator.start()
+        self._orchestrators[session_id] = orchestrator
+
+        logger.info(
+            "Session %s created (%s → %s, processor=%s)",
+            session_id,
+            session.source_lang,
+            session.target_lang,
+            session.processor_type,
+        )
+        return session
+
+    async def stop_session(self, session_id: str) -> bool:
+        # Stop orchestrator first
+        orchestrator = self._orchestrators.pop(session_id, None)
+        if orchestrator:
+            await orchestrator.stop()
+
+        session = self.sessions.pop(session_id, None)
+        if session is None:
+            return False
+        session.cancel()
+        session.is_active = False
+        logger.info(
+            "Session %s stopped (duration=%.0fs, segments=%d)",
+            session_id,
+            session.duration_seconds,
+            session.completed_segment_count,
+        )
+        return True
+
+    def get_session(self, session_id: str) -> TranslationSession | None:
+        return self.sessions.get(session_id)
+
+    def get_orchestrator(self, session_id: str) -> SessionOrchestrator | None:
+        return self._orchestrators.get(session_id)
+
+    async def check_services(self) -> dict[str, str]:
+        """Check health of downstream services."""
+        results = {}
+        checks = {
+            "stt": f"http://{settings.stt_ws_url.replace('ws://', '').split(':')[0]}:9090/health",
+            "llm": f"{settings.llm_api_url.rstrip('/v1')}/health",
+            "tts": f"{settings.tts_api_url}/health",
+        }
+        for name, url in checks.items():
+            try:
+                resp = await self._http_client.get(url, timeout=5.0)
+                results[name] = "healthy" if resp.status_code == 200 else f"unhealthy ({resp.status_code})"
+            except Exception as e:
+                results[name] = f"unreachable ({type(e).__name__})"
+        return results

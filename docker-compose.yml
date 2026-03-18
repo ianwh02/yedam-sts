@@ -6,6 +6,7 @@ services:
       args:
         - WHISPER_MODEL_REPO=${WHISPER_MODEL_REPO:-deepdml/faster-whisper-large-v3-turbo-ct2}
         - WHISPER_MODEL_NAME=${WHISPER_MODEL_NAME:-faster-whisper-large-v3-turbo}
+        - HF_TOKEN=${HF_TOKEN:-}
     container_name: yedam-stt
     restart: unless-stopped
     depends_on:
@@ -51,11 +52,11 @@ services:
       - "--kv-cache-dtype"
       - "${LLM_KV_CACHE_DTYPE:-fp8}"
       - "--gpu-memory-utilization"
-      - "${LLM_GPU_MEMORY_UTILIZATION:-0.50}"
+      - "${LLM_GPU_MEMORY_UTILIZATION:-0.35}"
       - "--max-model-len"
-      - "${LLM_MAX_MODEL_LEN:-2048}"
+      - "${LLM_MAX_MODEL_LEN:-1024}"
       - "--max-num-seqs"
-      - "${LLM_MAX_NUM_SEQS:-16}"
+      - "${LLM_MAX_NUM_SEQS:-8}"
       - "--enable-prefix-caching"
       - "--enforce-eager"
     expose:
@@ -78,6 +79,8 @@ services:
     build:
       context: ./tts-server
       dockerfile: Dockerfile
+      args:
+        - HF_TOKEN=${HF_TOKEN:-}
     container_name: yedam-tts
     restart: unless-stopped
     depends_on:
@@ -86,17 +89,32 @@ services:
     environment:
       - MODEL_DIR=${TTS_MODEL_DIR:-/app/models/Qwen3-TTS-12Hz-0.6B-Base}
       - TOKENIZER_DIR=/app/models/Qwen3-TTS-Tokenizer-12Hz
-      - GPU_MEMORY_UTILIZATION=${TTS_GPU_MEMORY_UTILIZATION:-0.35}
+      - GPU_MEMORY_UTILIZATION=${TTS_GPU_MEMORY_UTILIZATION:-0.40}
       - PORT=7860
-      - REF_AUDIO_PATH=${REF_AUDIO_PATH:-/app/ref_audio/reference.wav}
-      - REF_TEXT=${REF_TEXT:-Hello I'm recording a test audio to clone my own voice um to qwen tts nano}
+      - REF_AUDIO_PATH_EN=${REF_AUDIO_PATH_EN:-/app/ref_audio/en.wav}
+      - REF_TEXT_EN=${REF_TEXT_EN:-Hello I'm recording a test audio to clone my own voice um to qwen tts nano}
+      - REF_AUDIO_PATH_KO=${REF_AUDIO_PATH_KO:-}
+      - REF_TEXT_KO=${REF_TEXT_KO:-}
       - X_VECTOR_ONLY=${X_VECTOR_ONLY:-0}
-      - TALKER_MAX_BATCH_SIZE=${TALKER_MAX_BATCH_SIZE:-}
-      - TALKER_ENFORCE_EAGER=${TALKER_ENFORCE_EAGER:-1}
       - MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
       - DECODE_COLLECT_MS=${DECODE_COLLECT_MS:-40}
+      - TTS_TALKER_TEMPERATURE=${TTS_TALKER_TEMPERATURE:-0.8}
+      - TTS_PREDICTOR_TEMPERATURE=${TTS_PREDICTOR_TEMPERATURE:-0.9}
+      - TTS_HIGHPASS_HZ=${TTS_HIGHPASS_HZ:-80}
+      - TTS_REPETITION_PENALTY=${TTS_REPETITION_PENALTY:-1.05}
+      - TTS_REPETITION_PENALTY_WINDOW=${TTS_REPETITION_PENALTY_WINDOW:-100}
+      - TTS_SUPPRESS_MASK=${TTS_SUPPRESS_MASK:-1}
+      - TTS_EOS_MIN_STEPS=${TTS_EOS_MIN_STEPS:-12}
+      - TTS_EOS_BOOST_MAX=${TTS_EOS_BOOST_MAX:-3.0}
+      - TTS_EOS_BOOST_START_STEP=${TTS_EOS_BOOST_START_STEP:-50}
+      - TTS_EOS_BOOST_MAX_STEP=${TTS_EOS_BOOST_MAX_STEP:-300}
+      - TTS_EOS_LOOP_DETECT_WINDOW=${TTS_EOS_LOOP_DETECT_WINDOW:-20}
+      - TTS_EOS_LOOP_THRESHOLD=${TTS_EOS_LOOP_THRESHOLD:-0.3}
+      - TTS_EOS_LOOP_BOOST=${TTS_EOS_LOOP_BOOST:-5.0}
+      - TTS_EOS_LOOP_FORCE_AFTER=${TTS_EOS_LOOP_FORCE_AFTER:-30}
       - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
       - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${TTS_MPS_THREAD_PCT:-20}
+
     shm_size: '4g'
     volumes:
       - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps

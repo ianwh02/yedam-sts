@@ -24,21 +24,23 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
-# --- Source layer (rebuilds when code changes) ---
-COPY whisper_live/ ./whisper_live/
-COPY run_server.py .
-
-# Download model into image for fast cold starts.
+# --- Model download (cached, rarely changes) ---
 # WHISPER_MODEL_REPO: HuggingFace repo ID (varies by model)
 # Systran repos: large-v3, medium, small, base, tiny
 # Turbo: deepdml/faster-whisper-large-v3-turbo-ct2
 ARG WHISPER_MODEL_REPO=deepdml/faster-whisper-large-v3-turbo-ct2
 ARG WHISPER_MODEL_NAME=faster-whisper-large-v3-turbo
+ARG HF_TOKEN=
+ENV HF_TOKEN=${HF_TOKEN}
 RUN --mount=type=cache,target=/root/.cache/huggingface \
     python -c "from huggingface_hub import snapshot_download; snapshot_download('${WHISPER_MODEL_REPO}', local_dir='/app/models/${WHISPER_MODEL_NAME}')"
 
 # Store model path so CMD can reference it at runtime
 ENV WHISPER_MODEL_DIR=/app/models/${WHISPER_MODEL_NAME}
+
+# --- Source layer (rebuilds when code changes) ---
+COPY whisper_live/ ./whisper_live/
+COPY run_server.py .
 
 EXPOSE 9090
 

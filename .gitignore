@@ -50,6 +50,10 @@ target/
 
 # Benchmark outputs
 benchmarks/results/
+debug_audio/
+
+# Modified backup (internal working copy)
+tts-server/nano-qwen3tts-vllm-modified/
 
 # Business docs (private, not in open-source repo)
 BUSINESS.md

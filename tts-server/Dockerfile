@@ -27,12 +27,7 @@ RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
 RUN pip3 install --no-cache-dir numpy && \
     pip3 install --no-cache-dir "torch==2.8.0" "torchaudio==2.8.0" --index-url https://download.pytorch.org/whl/cu128
 
-# Install nano-qwen3tts-vllm from local source (--no-deps to prevent torch overwrite)
-COPY nano-qwen3tts-vllm/ /app/nano-qwen3tts-vllm/
-RUN pip3 install --no-cache-dir --no-deps /app/nano-qwen3tts-vllm/
-
-# Install nano-qwen3tts-vllm dependencies (minus torch/torchaudio which are already installed)
-# qwen-tts also installed --no-deps to prevent torchaudio from pulling PyPI torch
+# ── Dependencies (rarely change → cached early) ──
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt && \
     pip3 install --no-cache-dir --no-deps "qwen-tts==0.0.5" && \
@@ -42,11 +37,13 @@ RUN pip3 install --no-cache-dir -r requirements.txt && \
 # Prebuilt wheel: torch2.8 + cu12 + cp310 + cxx11abiFALSE (matches pip-installed PyTorch)
 RUN pip3 install --no-cache-dir https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.8cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 
-# Verify torch version hasn't been overwritten, then verify nano-qwen3tts-vllm
+# Verify torch version hasn't been overwritten by transitive deps
 RUN python3 -c "import torch; v=torch.__version__; print(f'torch={v}'); assert v.startswith('2.8'), f'torch was overwritten to {v}!'"
-RUN python3 -c "from nano_qwen3tts_vllm.interface import Qwen3TTSInterface; print('nano-qwen3tts-vllm OK')"
 
-# Download TTS models at build time (cached in Docker layer)
+# ── Download TTS models at build time (cached, rarely change) ──
+ARG HF_TOKEN=
+ENV HF_TOKEN=${HF_TOKEN}
+
 # CustomVoice model (preset speakers: ryan, sohee, etc.)
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
@@ -64,6 +61,15 @@ RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz', \
 local_dir='/app/models/Qwen3-TTS-Tokenizer-12Hz')"
+
+# ── Source code (changes frequently → last layers for fast rebuilds) ──
+# nano-qwen3tts-vllm from local source (editable install so Python reads
+# from /app/nano-qwen3tts-vllm/ directly — no stale site-packages)
+COPY nano-qwen3tts-vllm/ /app/nano-qwen3tts-vllm/
+RUN pip3 install --no-cache-dir --no-deps -e /app/nano-qwen3tts-vllm/
+
+# Verify nano-qwen3tts-vllm imports correctly
+RUN python3 -c "from nano_qwen3tts_vllm.interface import Qwen3TTSInterface; print('nano-qwen3tts-vllm OK')"
 
 # Copy server
 COPY server.py .

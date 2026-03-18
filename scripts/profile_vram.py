@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""VRAM + latency profiling for yedam-sts pipeline.
+"""VRAM + E2E latency profiling for yedam-sts pipeline.
 
-Measures GPU memory usage and per-service / E2E latency at baseline
-and under concurrent session load.
+Measures GPU memory usage under concurrent session load (VRAM-only),
+then benchmarks E2E pipeline latency (LLM→TTS) at increasing concurrency
+with no background sessions polluting results.
 
 Requires all services running:
   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
@@ -189,7 +190,7 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
     """Measure LLM latency: time to first token (TTFT) and total completion."""
     results = []
     messages = [
-        {"role": "system", "content": "Translate Korean to English."},
+        {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
         {"role": "user", "content": "오늘 날씨가 정말 좋습니다. 공원에 가서 산책하고 싶습니다."},
     ]
 
@@ -202,7 +203,7 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
                 json={
                     "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
                     "messages": messages,
-                    "max_tokens": 100,
+                    "max_tokens": 50,
                     "temperature": 0.3,
                 },
             )
@@ -227,7 +228,7 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
                 json={
                     "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
                     "messages": messages,
-                    "max_tokens": 100,
+                    "max_tokens": 50,
                     "temperature": 0.3,
                     "stream": True,
                 },
@@ -265,17 +266,20 @@ async def profile_tts_latency(n_runs: int = 3) -> list[LatencyResult]:
             resp = await client.post(
                 f"{TTS_URL}/synthesize",
                 json={"text": text, "language": "en"},
+                headers={"Accept": "application/octet-stream"},
             )
             t1 = time.perf_counter()
 
-            latency = (t1 - t0) * 1000
-            duration_ms = resp.headers.get("X-Audio-Duration-Ms", "?")
-            rtf = resp.headers.get("X-RTF", "?")
+            latency_s = t1 - t0
+            latency = latency_s * 1000
+            audio_dur_s = len(resp.content) / 2 / 24000
+            duration_ms = int(audio_dur_s * 1000)
+            rtf = latency_s / audio_dur_s if audio_dur_s > 0 else 0
             audio_kb = len(resp.content) / 1024
             save_tts_wav(resp.content, text, f"individual_run{i+1}")
             results.append(LatencyResult(
                 "TTS", latency,
-                f"run {i+1}: \"{text[:40]}\" → {duration_ms}ms audio, RTF={rtf}, {audio_kb:.0f}KB",
+                f"run {i+1}: \"{text[:40]}\" → {duration_ms}ms audio, RTF={rtf:.2f}, {audio_kb:.0f}KB",
             ))
 
     return results
@@ -329,7 +333,7 @@ async def profile_e2e_latency():
     individual service hops: audio → STT → LLM → TTS.
     """
     print("\n" + "=" * 60)
-    print("  End-to-End Pipeline Latency (STT → LLM → TTS)")
+    print("  E2E Pipeline Baseline 1x (LLM → TTS)")
     print("=" * 60)
 
     # Measure the serial chain: STT transcribe → LLM translate → TTS synthesize
@@ -356,10 +360,10 @@ async def profile_e2e_latency():
                 json={
                     "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
                     "messages": [
-                        {"role": "system", "content": "Translate Korean to English. Output only the translation."},
+                        {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                         {"role": "user", "content": text_ko},
                     ],
-                    "max_tokens": 100,
+                    "max_tokens": 50,
                     "temperature": 0.3,
                 },
             )
@@ -374,14 +378,17 @@ async def profile_e2e_latency():
             resp = await client.post(
                 f"{TTS_URL}/synthesize",
                 json={"text": translated, "language": "en"},
+                headers={"Accept": "application/octet-stream"},
             )
             tts_end = time.perf_counter()
-            tts_ms = (tts_end - tts_start) * 1000
+            tts_s = tts_end - tts_start
+            tts_ms = tts_s * 1000
 
-            duration_ms = resp.headers.get("X-Audio-Duration-Ms", "?")
-            rtf = resp.headers.get("X-RTF", "?")
+            audio_dur_s = len(resp.content) / 2 / 24000
+            duration_ms = int(audio_dur_s * 1000)
+            rtf = tts_s / audio_dur_s if audio_dur_s > 0 else 0
             save_tts_wav(resp.content, translated, f"e2e_run{i+1}")
-            print(f"    TTS: {fmt_ms(tts_ms)} → {duration_ms}ms audio, RTF={rtf}")
+            print(f"    TTS: {fmt_ms(tts_ms)} → {duration_ms}ms audio, RTF={rtf:.2f}")
 
             e2e_end = time.perf_counter()
             e2e_ms = (e2e_end - e2e_start) * 1000
@@ -393,17 +400,22 @@ async def profile_e2e_latency():
 
 
 # ============================================================
-# Latency Under Concurrent Load
+# E2E Concurrent Pipeline (LLM → TTS)
 # ============================================================
 
 
-async def profile_latency_at_concurrency(n: int, client: httpx.AsyncClient) -> dict:
-    """Fire N simultaneous STT, LLM, and TTS requests and measure per-request latency.
+async def profile_e2e_concurrent(concurrency_levels: list[int] | None = None):
+    """Fire N simultaneous LLM→TTS pipelines and measure per-request E2E latency.
 
-    Called during the VRAM concurrency test so we measure latency degradation
-    alongside VRAM usage in a single pass.
+    Each pipeline: Korean text → LLM translate → TTS synthesize English audio.
+    Runs at increasing concurrency levels with no background sessions polluting GPU.
     """
-    import websockets
+    if concurrency_levels is None:
+        concurrency_levels = [1, 2, 4]
+
+    print("\n" + "=" * 60)
+    print("  E2E Concurrent Pipeline (LLM → TTS)")
+    print("=" * 60)
 
     test_texts_ko = [
         "오늘 날씨가 정말 좋습니다.",
@@ -412,127 +424,89 @@ async def profile_latency_at_concurrency(n: int, client: httpx.AsyncClient) -> d
         "한국어를 영어로 번역해 주세요.",
         "이 프로젝트는 정말 흥미롭습니다.",
     ]
-    test_texts_en = [
-        "The weather is really nice today.",
-        "I attended church services.",
-        "Thank you. Have a nice day.",
-        "Please translate Korean to English.",
-        "This project is really interesting.",
-    ]
 
-    # ---- Concurrent STT requests ----
-    sample_rate = 16000
-    duration_s = 2.0
-    n_samples = int(sample_rate * duration_s)
-    rng = np.random.default_rng(42)
-    stt_audio = (rng.standard_normal(n_samples) * 0.3).astype(np.float32).tobytes()
-    chunk_duration_s = 0.1
-    chunk_size = int(sample_rate * chunk_duration_s) * 4
-
-    async def stt_request(idx: int) -> float:
-        """Send audio to STT and measure time to first transcription."""
-        async with websockets.connect(STT_WS_URL) as ws:
-            config = {
-                "uid": f"conc-stt-{n}-{idx}",
-                "language": "ko",
-                "task": "transcribe",
-                "model": "large-v3",
-                "use_vad": True,
-            }
-            await ws.send(json.dumps(config))
-            await asyncio.wait_for(ws.recv(), timeout=10.0)
-
-            t0 = time.perf_counter()
-            for offset in range(0, len(stt_audio), chunk_size):
-                await ws.send(stt_audio[offset:offset + chunk_size])
-                await asyncio.sleep(chunk_duration_s)
-
-            # Wait for any transcription response
-            deadline = time.perf_counter() + 8.0
-            while time.perf_counter() < deadline:
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
-                    data = json.loads(msg)
-                    segments = data.get("segments", [])
-                    if segments and segments[-1].get("text", "").strip():
-                        return (time.perf_counter() - t0) * 1000
-                except asyncio.TimeoutError:
-                    break
-            # No text returned — report total wait time
-            return (time.perf_counter() - t0) * 1000
-
-    stt_tasks = [stt_request(i) for i in range(n)]
-    stt_latencies = await asyncio.gather(*stt_tasks)
-    stt_avg = sum(stt_latencies) / len(stt_latencies)
-    stt_max = max(stt_latencies)
-
-    # ---- Concurrent LLM requests ----
-    async def llm_request(text_ko: str) -> float:
+    async def e2e_pipeline(text_ko: str, idx: int, client: httpx.AsyncClient) -> dict:
+        """Single LLM→TTS chain: translate Korean, then synthesize English."""
         t0 = time.perf_counter()
-        await client.post(
+
+        # LLM translate
+        llm_t0 = time.perf_counter()
+        resp = await client.post(
             f"{LLM_URL}/v1/chat/completions",
             json={
                 "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
                 "messages": [
-                    {"role": "system", "content": "Translate Korean to English. Output only the translation."},
+                    {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                     {"role": "user", "content": text_ko},
                 ],
-                "max_tokens": 100,
+                "max_tokens": 50,
                 "temperature": 0.3,
             },
         )
-        return (time.perf_counter() - t0) * 1000
+        translated = resp.json()["choices"][0]["message"]["content"].strip()
+        llm_ms = (time.perf_counter() - llm_t0) * 1000
 
-    llm_tasks = [llm_request(test_texts_ko[i % len(test_texts_ko)]) for i in range(n)]
-    llm_latencies = await asyncio.gather(*llm_tasks)
-    llm_avg = sum(llm_latencies) / len(llm_latencies)
-    llm_max = max(llm_latencies)
-
-    # ---- Concurrent TTS requests ----
-    async def tts_request(text_en: str, idx: int) -> dict:
-        t0 = time.perf_counter()
+        # TTS synthesize
+        tts_t0 = time.perf_counter()
         resp = await client.post(
             f"{TTS_URL}/synthesize",
-            json={"text": text_en, "language": "en"},
+            json={"text": translated, "language": "en"},
+            headers={"Accept": "application/octet-stream"},
         )
-        resp.raise_for_status()
-        latency_ms = (time.perf_counter() - t0) * 1000
-        audio_dur_ms = float(resp.headers.get("X-Audio-Duration-Ms", 0))
-        rtf = float(resp.headers.get("X-RTF", 0))
-        audio_kb = len(resp.content) / 1024
-        save_tts_wav(resp.content, text_en, f"conc{n}x_req{idx+1}")
+        tts_s = time.perf_counter() - tts_t0
+        audio_dur_s = len(resp.content) / 2 / 24000
+        rtf = tts_s / audio_dur_s if audio_dur_s > 0 else 0
+        save_tts_wav(resp.content, translated, f"e2e_conc_req{idx+1}")
+
+        e2e_s = time.perf_counter() - t0
         return {
-            "latency_ms": latency_ms,
-            "audio_dur_ms": audio_dur_ms,
+            "e2e_ms": e2e_s * 1000,
+            "llm_ms": llm_ms,
+            "tts_ms": tts_s * 1000,
+            "audio_dur_ms": audio_dur_s * 1000,
             "rtf": rtf,
-            "audio_kb": audio_kb,
-            "text": text_en,
+            "translated": translated,
+            "text_ko": text_ko,
         }
 
-    tts_tasks = [tts_request(test_texts_en[i % len(test_texts_en)], i) for i in range(n)]
-    tts_results = await asyncio.gather(*tts_tasks)
-    tts_latencies = [r["latency_ms"] for r in tts_results]
-    tts_avg = sum(tts_latencies) / len(tts_latencies)
-    tts_max = max(tts_latencies)
+    all_level_results = []
 
-    print(f"\n  Latency at {n}x concurrency:")
-    print(f"    STT x{n}: avg {fmt_ms(stt_avg)}, max {fmt_ms(stt_max)} "
-          f"[{', '.join(fmt_ms(l) for l in stt_latencies)}]")
-    print(f"    LLM x{n}: avg {fmt_ms(llm_avg)}, max {fmt_ms(llm_max)} "
-          f"[{', '.join(fmt_ms(l) for l in llm_latencies)}]")
-    print(f"    TTS x{n}: avg {fmt_ms(tts_avg)}, max {fmt_ms(tts_max)} "
-          f"[{', '.join(fmt_ms(l) for l in tts_latencies)}]")
-    for r in tts_results:
-        print(f"      \"{r['text'][:40]}\" → {int(r['audio_dur_ms'])}ms audio, "
-              f"RTF={r['rtf']:.2f}, {r['audio_kb']:.0f}KB")
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for n in concurrency_levels:
+            print(f"\n  --- {n}x concurrent ---")
 
-    return {
-        "n": n,
-        "stt_avg": stt_avg, "stt_max": stt_max,
-        "llm_avg": llm_avg, "llm_max": llm_max,
-        "tts_avg": tts_avg, "tts_max": tts_max,
-        "tts_results": tts_results,
-    }
+            tasks = [
+                e2e_pipeline(test_texts_ko[i % len(test_texts_ko)], i, client)
+                for i in range(n)
+            ]
+            results = await asyncio.gather(*tasks)
+
+            # Print per-request breakdown
+            for r in results:
+                print(f"    \"{r['text_ko'][:20]}...\" → \"{r['translated'][:30]}...\"")
+                print(f"      LLM: {fmt_ms(r['llm_ms'])} | TTS: {fmt_ms(r['tts_ms'])} "
+                      f"(RTF {r['rtf']:.2f}) | E2E: {fmt_ms(r['e2e_ms'])}")
+
+            # Averages
+            avg_llm = sum(r["llm_ms"] for r in results) / len(results)
+            avg_tts = sum(r["tts_ms"] for r in results) / len(results)
+            avg_rtf = sum(r["rtf"] for r in results) / len(results)
+            avg_e2e = sum(r["e2e_ms"] for r in results) / len(results)
+
+            if n > 1:
+                print(f"    avg: LLM {fmt_ms(avg_llm)} | TTS {fmt_ms(avg_tts)} "
+                      f"(RTF {avg_rtf:.2f}) | E2E {fmt_ms(avg_e2e)}")
+
+            all_level_results.append({
+                "n": n,
+                "avg_llm_ms": avg_llm,
+                "avg_tts_ms": avg_tts,
+                "avg_rtf": avg_rtf,
+                "avg_e2e_ms": avg_e2e,
+                "results": results,
+            })
+
+    return all_level_results
 
 
 # ============================================================
@@ -566,10 +540,10 @@ async def profile_individual_services():
             json={
                 "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
                 "messages": [
-                    {"role": "system", "content": "Translate Korean to English."},
+                    {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                     {"role": "user", "content": "오늘 날씨가 정말 좋습니다. 공원에 가서 산책하고 싶습니다."},
                 ],
-                "max_tokens": 100,
+                "max_tokens": 50,
                 "temperature": 0.3,
             },
         )
@@ -582,17 +556,21 @@ async def profile_individual_services():
 
         # TTS synthesis
         before = get_vram_mb()
+        tts_t0 = time.perf_counter()
         resp = await client.post(
             f"{TTS_URL}/synthesize",
             json={"text": "The weather is really nice today. I want to go for a walk in the park.", "language": "en"},
+            headers={"Accept": "application/octet-stream"},
         )
+        tts_elapsed = time.perf_counter() - tts_t0
         after = get_vram_mb()
         delta = after["used_mb"] - before["used_mb"]
-        duration_ms = resp.headers.get("X-Audio-Duration-Ms", "?")
-        rtf = resp.headers.get("X-RTF", "?")
+        audio_dur_s = len(resp.content) / 2 / 24000
+        duration_ms = int(audio_dur_s * 1000)
+        rtf = tts_elapsed / audio_dur_s if audio_dur_s > 0 else 0
         save_tts_wav(resp.content, "The weather is really nice today I want to go for a walk", "vram_baseline")
         print(f"\n  TTS synthesis: +{delta} MiB")
-        print(f"    Audio: {duration_ms}ms, RTF={rtf}")
+        print(f"    Audio: {duration_ms}ms, RTF={rtf:.2f}")
         print_vram("After TTS", after)
 
         # STT (just connection, no real audio)
@@ -611,16 +589,15 @@ async def profile_individual_services():
 
 
 async def profile_concurrent_sessions(n_sessions: int) -> dict:
-    """Create N concurrent sessions, measure VRAM and latency together."""
+    """Create N concurrent sessions and measure VRAM impact."""
     print(f"\n" + "=" * 60)
-    print(f"  {n_sessions} Concurrent Session(s) — VRAM + Latency")
+    print(f"  {n_sessions} Concurrent Session(s) — VRAM")
     print("=" * 60)
 
     before = get_vram_mb()
     print_vram("Before", before)
 
     sessions = []
-    latency_result = None
     async with httpx.AsyncClient(timeout=180.0) as client:
         # Create sessions
         for i in range(n_sessions):
@@ -670,9 +647,6 @@ async def profile_concurrent_sessions(n_sessions: int) -> dict:
             print(f"\n  After processing audio in {len(sessions)} session(s): +{delta_peak} MiB from baseline")
             print_vram("Peak", peak)
 
-        # Measure latency at this concurrency level (while sessions are active)
-        latency_result = await profile_latency_at_concurrency(n_sessions, client)
-
         # Cleanup sessions
         for s in sessions:
             await client.delete(f"{ORCHESTRATOR_URL}/api/sessions/{s['session_id']}")
@@ -688,7 +662,6 @@ async def profile_concurrent_sessions(n_sessions: int) -> dict:
         "baseline_mb": before["used_mb"],
         "peak_mb": peak["used_mb"] if sessions else before["used_mb"],
         "delta_mb": delta_peak if sessions else 0,
-        "latency": latency_result,
     }
 
 
@@ -710,7 +683,7 @@ async def main():
     baseline = await profile_baseline()
     await profile_individual_services()
 
-    # Concurrent sessions: 1 through MAX
+    # Concurrent sessions: 1 through MAX (VRAM only)
     vram_results = []
     for n in range(1, MAX_CONCURRENT_SESSIONS + 1):
         try:
@@ -727,11 +700,12 @@ async def main():
             break
         await asyncio.sleep(3.0)
 
-    # ---- Latency Profiling (single-request baseline) ----
+    # ---- Latency Profiling (no active sessions) ----
     await profile_service_latencies()
     await profile_e2e_latency()
+    e2e_results = await profile_e2e_concurrent()
 
-    # ---- Summary ----
+    # ---- VRAM Summary ----
     print("\n" + "=" * 60)
     print("  VRAM Summary")
     print("=" * 60)
@@ -751,31 +725,18 @@ async def main():
         print(f"  Max tested: {max_sessions} concurrent session(s)")
         print(f"  Peak VRAM: {max_peak} MiB ({max_free} MiB remaining)")
 
-    # Latency degradation table
-    latency_data = [r["latency"] for r in vram_results if r.get("latency")]
-    if latency_data:
+    # ---- E2E Scaling Summary ----
+    if e2e_results:
         print("\n" + "=" * 60)
-        print("  Latency Degradation Summary")
+        print("  E2E Scaling Summary (LLM → TTS)")
         print("=" * 60)
-        stt_base = latency_data[0]["stt_avg"]
-        llm_base = latency_data[0]["llm_avg"]
-        tts_base = latency_data[0]["tts_avg"]
-        print(f"\n  {'Sessions':>10} | {'STT avg':>10} | {'vs 1x':>8} | {'LLM avg':>10} | {'vs 1x':>8} | {'TTS avg':>10} | {'vs 1x':>8} | {'Avg Audio':>10} | {'Avg RTF':>8}")
-        print(f"  {'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*10}-+-{'-'*8}-+-{'-'*10}-+-{'-'*8}-+-{'-'*10}-+-{'-'*8}")
-        for d in latency_data:
-            stt_ratio = d["stt_avg"] / stt_base if stt_base else 0
-            llm_ratio = d["llm_avg"] / llm_base if llm_base else 0
-            tts_ratio = d["tts_avg"] / tts_base if tts_base else 0
-            tts_results = d.get("tts_results", [])
-            if tts_results:
-                avg_audio = sum(r["audio_dur_ms"] for r in tts_results) / len(tts_results)
-                avg_rtf = sum(r["rtf"] for r in tts_results) / len(tts_results)
-                audio_str = f"{int(avg_audio)}ms"
-                rtf_str = f"{avg_rtf:.2f}"
-            else:
-                audio_str = "n/a"
-                rtf_str = "n/a"
-            print(f"  {d['n']:>10} | {fmt_ms(d['stt_avg']):>10} | {stt_ratio:>7.2f}x | {fmt_ms(d['llm_avg']):>10} | {llm_ratio:>7.2f}x | {fmt_ms(d['tts_avg']):>10} | {tts_ratio:>7.2f}x | {audio_str:>10} | {rtf_str:>8}")
+        base_e2e = e2e_results[0]["avg_e2e_ms"]
+        print(f"\n  {'Conc':>6} | {'LLM avg':>10} | {'TTS avg':>10} | {'TTS RTF':>8} | {'E2E avg':>10} | {'vs 1x':>7}")
+        print(f"  {'-'*6}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*10}-+-{'-'*7}")
+        for d in e2e_results:
+            ratio = d["avg_e2e_ms"] / base_e2e if base_e2e else 0
+            print(f"  {d['n']:>6} | {fmt_ms(d['avg_llm_ms']):>10} | {fmt_ms(d['avg_tts_ms']):>10} | "
+                  f"{d['avg_rtf']:>8.2f} | {fmt_ms(d['avg_e2e_ms']):>10} | {ratio:>6.2f}x")
     print()
 
 

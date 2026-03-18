@@ -16,14 +16,50 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
+import os
+import re
 import struct
 import time
+import wave
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 import numpy as np
 
 TTS_URL = "http://localhost:7860"
+
+# Debug audio saving
+SAVE_AUDIO = os.environ.get("SAVE_AUDIO", "1").lower() not in ("0", "false", "no")
+AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", "debug_audio"))
+
+def _save_wav(pcm_bytes: bytes, label: str, sample_rate: int = 24000, sample_format: str = "s16le"):
+    """Save raw PCM bytes as a WAV file for inspection."""
+    if not SAVE_AUDIO or not pcm_bytes:
+        return
+    try:
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        # Convert to s16le if needed
+        if sample_format == "f32le":
+            f32 = np.frombuffer(pcm_bytes, dtype=np.float32)
+            s16 = np.clip(f32 * 32767, -32768, 32767).astype(np.int16)
+            raw = s16.tobytes()
+        else:
+            raw = pcm_bytes
+        n_samples = len(raw) // 2
+        duration_ms = int(n_samples / sample_rate * 1000)
+        safe_label = re.sub(r"[^\w\-]", "_", label)[:60]
+        filename = f"{safe_label}_{duration_ms}ms.wav"
+        path = AUDIO_DIR / filename
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(raw)
+        print(f"  [audio] saved {path} ({duration_ms}ms)")
+    except Exception as e:
+        print(f"  [audio] save failed: {e}")
 
 # Mix of English and Korean sentences at varying lengths
 TEST_SENTENCES = [
@@ -109,7 +145,9 @@ def estimate_audio_duration(raw_bytes: bytes, sample_format: str) -> float:
 
 
 async def request_streaming(
-    client: httpx.AsyncClient, text: str, language: str
+    client: httpx.AsyncClient, text: str, language: str,
+    concurrency: int = 1, round_idx: int = 0, req_idx: int = 0,
+    session_id: str | None = None,
 ) -> RequestResult:
     """Send a streaming TTS request and measure timing."""
     result = RequestResult(text=text, language=language, streaming=True)
@@ -117,11 +155,15 @@ async def request_streaming(
     first_chunk_time = None
     audio_data = bytearray()
 
+    payload = {"text": text, "language": language}
+    if session_id is not None:
+        payload["session_id"] = session_id
+
     try:
         async with client.stream(
             "POST",
             "/synthesize/stream",
-            json={"text": text, "language": language},
+            json=payload,
         ) as response:
             response.raise_for_status()
             sample_format = response.headers.get("x-sample-format", "f32le")
@@ -139,6 +181,11 @@ async def request_streaming(
         result.audio_bytes = len(audio_data)
         result.audio_duration_s = estimate_audio_duration(bytes(audio_data), sample_format)
         result.rtf = result.total_time_s / result.audio_duration_s if result.audio_duration_s > 0 else 0
+        if session_id is not None:
+            label = f"s{round_idx}_{req_idx:02d}_{session_id}_stream_{language}_{text[:20]}_{result.total_time_s:.1f}s"
+        else:
+            label = f"c{concurrency}_r{round_idx}_stream_{language}_{text[:20]}_{result.total_time_s:.1f}s"
+        _save_wav(bytes(audio_data), label, sample_format=sample_format)
 
     except Exception as e:
         result.error = str(e)
@@ -148,16 +195,22 @@ async def request_streaming(
 
 
 async def request_non_streaming(
-    client: httpx.AsyncClient, text: str, language: str
+    client: httpx.AsyncClient, text: str, language: str,
+    concurrency: int = 1, round_idx: int = 0, req_idx: int = 0,
+    session_id: str | None = None,
 ) -> RequestResult:
     """Send a non-streaming TTS request and measure timing."""
     result = RequestResult(text=text, language=language, streaming=False)
     start = time.perf_counter()
 
+    payload = {"text": text, "language": language}
+    if session_id is not None:
+        payload["session_id"] = session_id
+
     try:
         response = await client.post(
             "/synthesize",
-            json={"text": text, "language": language},
+            json=payload,
             headers={"Accept": "application/octet-stream"},
         )
         response.raise_for_status()
@@ -169,6 +222,11 @@ async def request_non_streaming(
         result.audio_bytes = len(response.content)
         result.audio_duration_s = estimate_audio_duration(response.content, sample_format)
         result.rtf = result.total_time_s / result.audio_duration_s if result.audio_duration_s > 0 else 0
+        if session_id is not None:
+            label = f"s{round_idx}_{req_idx:02d}_{session_id}_full_{language}_{text[:20]}_{result.total_time_s:.1f}s"
+        else:
+            label = f"c{concurrency}_r{round_idx}_full_{language}_{text[:20]}_{result.total_time_s:.1f}s"
+        _save_wav(response.content, label, sample_format=sample_format)
 
     except Exception as e:
         result.error = str(e)
@@ -198,13 +256,66 @@ async def benchmark_concurrency(
 
             # Launch all requests concurrently
             if streaming:
-                tasks = [request_streaming(client, text, lang) for text, lang in sentences]
+                tasks = [request_streaming(client, text, lang, concurrency, round_idx, i)
+                         for i, (text, lang) in enumerate(sentences)]
             else:
-                tasks = [request_non_streaming(client, text, lang) for text, lang in sentences]
+                tasks = [request_non_streaming(client, text, lang, concurrency, round_idx, i)
+                         for i, (text, lang) in enumerate(sentences)]
 
             results = await asyncio.gather(*tasks)
             cr.results.extend(results)
 
+        cr.wall_clock_s = time.perf_counter() - wall_start
+
+    return cr
+
+
+async def benchmark_sessions(
+    url: str, num_sessions: int, sentences_per_session: int, streaming: bool,
+) -> ConcurrencyResult:
+    """Run session-aware benchmark: N concurrent sessions, each sending M sentences sequentially.
+
+    This simulates the real E2E pipeline where same-session sentences are serial
+    but different sessions run concurrently. Tests per-session decoder context caching.
+    """
+    import uuid
+
+    cr = ConcurrencyResult(concurrency=num_sessions, streaming=streaming)
+
+    async def _run_session(client: httpx.AsyncClient, session_idx: int):
+        """One session: send sentences sequentially with same session_id."""
+        sid = f"bench-{uuid.uuid4().hex[:8]}"
+        results = []
+        for sent_idx in range(sentences_per_session):
+            text, lang = TEST_SENTENCES[(session_idx * sentences_per_session + sent_idx) % len(TEST_SENTENCES)]
+            if streaming:
+                r = await request_streaming(
+                    client, text, lang, num_sessions, session_idx, sent_idx, session_id=sid,
+                )
+            else:
+                r = await request_non_streaming(
+                    client, text, lang, num_sessions, session_idx, sent_idx, session_id=sid,
+                )
+            label = "1st" if sent_idx == 0 else f"{sent_idx+1}th"
+            status = "OK" if r.error is None else f"ERR: {r.error}"
+            print(f"    session {session_idx} [{sid}] sent {label}: {r.total_time_s:.2f}s {status}")
+            results.append(r)
+        # Cleanup session
+        try:
+            await client.delete(f"/sessions/{sid}")
+        except Exception:
+            pass
+        return results
+
+    async with httpx.AsyncClient(
+        base_url=url,
+        timeout=httpx.Timeout(120.0, connect=10.0),
+    ) as client:
+        wall_start = time.perf_counter()
+        session_tasks = [_run_session(client, i) for i in range(num_sessions)]
+        all_session_results = await asyncio.gather(*session_tasks)
+        for session_results in all_session_results:
+            cr.results.extend(session_results)
         cr.wall_clock_s = time.perf_counter() - wall_start
 
     return cr
@@ -254,7 +365,16 @@ async def main():
     parser.add_argument("--rounds", type=int, default=2, help="Rounds per concurrency level")
     parser.add_argument("--streaming-only", action="store_true", help="Only test streaming")
     parser.add_argument("--non-streaming-only", action="store_true", help="Only test non-streaming")
+    parser.add_argument("--sessions", type=int, default=0,
+                        help="Run session benchmark: N concurrent sessions, each sending sentences sequentially")
+    parser.add_argument("--sentences-per-session", type=int, default=4,
+                        help="Sentences per session in session benchmark (default: 4)")
     args = parser.parse_args()
+
+    if SAVE_AUDIO:
+        print(f"Saving TTS audio to: {AUDIO_DIR.resolve()}  (set SAVE_AUDIO=0 to disable)")
+    else:
+        print("Audio saving disabled (set SAVE_AUDIO=1 to enable)")
 
     # Health check
     async with httpx.AsyncClient(base_url=args.url, timeout=10.0) as client:
@@ -271,6 +391,22 @@ async def main():
     async with httpx.AsyncClient(base_url=args.url, timeout=60.0) as client:
         await request_non_streaming(client, "Hello world.", "en")
     print("Warmup complete.\n")
+
+    # Session benchmark mode
+    if args.sessions > 0:
+        for streaming in [True, False]:
+            if args.non_streaming_only and streaming:
+                continue
+            if args.streaming_only and not streaming:
+                continue
+            mode = "streaming" if streaming else "non-streaming"
+            print(f"\nSession benchmark: {args.sessions} sessions x {args.sentences_per_session} sentences ({mode})...")
+            cr = await benchmark_sessions(
+                args.url, args.sessions, args.sentences_per_session, streaming=streaming,
+            )
+            print_results(cr)
+        print("\nSession benchmark complete.")
+        return
 
     concurrency_levels = [1, 2, 4, 8]
     concurrency_levels = [c for c in concurrency_levels if c <= args.max_concurrent]

@@ -25,6 +25,7 @@ docker-compose.override.yml
 
 # Models (downloaded at runtime)
 models/
+!tts-server/nano-qwen3tts-vllm/nano-qwen3tts-vllm/models/
 *.bin
 *.pt
 *.onnx

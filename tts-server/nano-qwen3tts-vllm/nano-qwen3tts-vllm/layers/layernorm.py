@@ -14,7 +14,6 @@ class Qwen3TTSRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
 
-    @torch.compile
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -26,7 +25,6 @@ class Qwen3TTSRMSNorm(nn.Module):
         x = x.to(orig_dtype) * self.weight
         return x
 
-    @torch.compile
     def add_rms_forward(
         self,
         x: torch.Tensor,
@@ -41,7 +39,6 @@ class Qwen3TTSRMSNorm(nn.Module):
         return x, residual
 
 
-    @torch.compile
     def forward(
         self,
         x: torch.Tensor,

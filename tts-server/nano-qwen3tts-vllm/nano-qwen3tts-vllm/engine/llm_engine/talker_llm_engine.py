@@ -1,5 +1,4 @@
 import logging
-import os
 
 import torch
 from nano_qwen3tts_vllm.engine.llm_engine.base import LLMEngine
@@ -17,12 +16,6 @@ class TalkerScheduler(Scheduler):
     def __init__(self, config: Config):
         super().__init__(config)
         self.request_id_to_seq: dict[str, Sequence] = {}
-        # Allow env-var override for A/B testing batch size impact on audio quality.
-        # Set TALKER_MAX_BATCH_SIZE=1 to force single-request decoding (no batching).
-        talker_max_bs = os.environ.get("TALKER_MAX_BATCH_SIZE", "").strip()
-        if talker_max_bs:
-            self.max_num_seqs = int(talker_max_bs)
-            logger.info(f"[TalkerScheduler] TALKER_MAX_BATCH_SIZE={self.max_num_seqs}")
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         # prefill: same as base
@@ -100,16 +93,6 @@ class TalkerLLMEngine(LLMEngine):
         super().__init__(model, **kwargs)
         self.model_runner = TalkerModeModelRunner(self.config, 0, self.events)
         self.scheduler = TalkerScheduler(self.config)
-        # Fix: base LLMEngine sets config.eos = text_tokenizer.eos_token_id (151643),
-        # but the talker generates codec tokens where EOS is codec_eos_token_id (e.g. 2150).
-        # The text EOS is suppressed by the codec whitelist, so the scheduler's EOS check
-        # could never fire — causing infinite generation for request_id sequences.
-        codec_eos = self.model_runner.model_config.codec_eos_token_id
-        text_eos = self.scheduler.eos
-        self.scheduler.eos = codec_eos
-        logger.info(
-            f"[TalkerLLMEngine] overrode scheduler EOS: {text_eos} (text) -> {codec_eos} (codec)"
-        )
 
     def add_request(
         self,

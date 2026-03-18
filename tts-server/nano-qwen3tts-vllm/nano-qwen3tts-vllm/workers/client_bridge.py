@@ -111,6 +111,7 @@ class TalkerWorkerClient:
 
     def send_clear_request(self, request_id: str) -> None:
         self._push.send(serialize_clear_request(request_id))
+        self._talker_ready.discard(request_id)
 
     def run_step_async(self) -> asyncio.Future:
         """Send run_step to worker; return a Future that resolves to outputs_all (list of 5-tuples)."""
@@ -159,6 +160,7 @@ class PredictorWorkerClient:
 
     def send_clear_request(self, request_id: str) -> None:
         self._push.send(serialize_clear_request(request_id))
+        self._predictor_ready.discard(request_id)
 
     def run_step_async(self) -> asyncio.Future:
         """Send run_step; return Future that resolves to outputs_all (list of (request_id, seq_id, token_ids))."""

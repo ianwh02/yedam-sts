@@ -44,6 +44,14 @@ async def run_talker_loop_mp(
             active = set(request_queues.keys())
         if not talker_ready:
             continue
+        # Orphan detection: discard talker_ready entries whose request_queues are gone
+        # (safety net for race between clear_request and the ready set)
+        orphans = talker_ready - active
+        if orphans:
+            logger.warning(f"[talker_loop_mp] discarding {len(orphans)} orphan(s) from talker_ready: {list(orphans)[:3]!r}")
+            talker_ready -= orphans
+        if not talker_ready:
+            continue
         # Adaptive collection: use longer window for decode steps (previous batch > 1)
         # to allow all concurrent requests to complete their predictor feedback cycle
         # (~33ms) before running the next talker step.
@@ -61,7 +69,7 @@ async def run_talker_loop_mp(
         # Run step with whoever is ready; do not wait for all active, so chunk-2
         # / time-to-first-audio stays low when many requests are concurrent.
         try:
-            logger.info(
+            logger.debug(
                 f"[talker_loop_mp] run_step active={len(active)} talker_ready={len(talker_ready)} "
                 f"request_ids={list(talker_ready)[:3]!r}"
             )
@@ -85,12 +93,21 @@ async def run_talker_loop_mp(
             async with queues_lock:
                 q = request_queues.get(request_id)
             if q is not None:
+                last_id = token_ids[-1] if token_ids else -1
                 try:
                     q.put_nowait(("talker", "token", payload))
                     if step_count <= 1:
-                        logger.info(f"[talker_loop_mp] dispatched token to request_id={request_id[:8]} token_ids={token_ids[:5]!r}")
+                        logger.debug(f"[talker_loop_mp] dispatched token to request_id={request_id[:8]} token_ids={token_ids[:5]!r}")
                 except asyncio.QueueFull:
-                    pass
+                    if last_id == 2150:
+                        await q.put(("talker", "token", payload))
+                        logger.warning(f"[talker_loop_mp] queue full but forced EOS delivery for {request_id[:8]}")
+                    else:
+                        logger.error(
+                            f"[talker_loop_mp] DROPPED talker token for {request_id[:8]}! "
+                            f"Queue full (size={q.qsize()}, last_id={last_id}). "
+                            f"This may cause a hang in generate_async."
+                        )
             if is_finished:
                 async with queues_lock:
                     q = request_queues.get(request_id)
@@ -98,12 +115,13 @@ async def run_talker_loop_mp(
                     try:
                         q.put_nowait(("talker", "done", {}))
                     except asyncio.QueueFull:
-                        pass
+                        await q.put(("talker", "done", {}))
+                        logger.warning(f"[talker_loop_mp] queue full but forced done delivery for {request_id[:8]}")
 
         # Clear only the request_ids that were in this step (they've been served)
         talker_ready -= completed_this_step
         last_batch_size = len(completed_this_step)
-        if step_count % 50 == 1:
+        if step_count % 200 == 1:
             logger.info(f"[talker_loop_mp] step#{step_count} batch={len(outputs_all)}")
 
 
@@ -123,19 +141,29 @@ async def run_predictor_loop_mp(
         await asyncio.sleep(0.0005)
         if not predictor_ready:
             continue
-        # Adaptive collection: wait for more predictor requests to arrive (batching)
+        # Orphan detection: discard predictor_ready entries whose request_queues are gone
+        async with queues_lock:
+            active = set(request_queues.keys())
+        orphans = predictor_ready - active
+        if orphans:
+            logger.warning(f"[predictor_loop_mp] discarding {len(orphans)} orphan(s) from predictor_ready: {list(orphans)[:3]!r}")
+            predictor_ready -= orphans
+        if not predictor_ready:
+            continue
+        # Brief yield to let more add_requests arrive (batching)
         async with queues_lock:
             active = set(request_queues.keys())
         if len(predictor_ready) < len(active) and len(active) > 1:
-            t_start = time.perf_counter()
-            while (time.perf_counter() - t_start) * 1000 < PREDICTOR_COLLECT_MS:
-                await asyncio.sleep(0.0005)
-                async with queues_lock:
-                    active = set(request_queues.keys())
-                if predictor_ready >= active:
-                    break
+            await asyncio.sleep(PREDICTOR_COLLECT_MS / 1000.0)
+            async with queues_lock:
+                active = set(request_queues.keys())
+                predictor_ready_copy = set(predictor_ready)
+        else:
+            async with queues_lock:
+                active = set(request_queues.keys())
+                predictor_ready_copy = set(predictor_ready)
 
-        if not predictor_ready:
+        if not predictor_ready_copy:
             continue
 
         try:
@@ -156,8 +184,11 @@ async def run_predictor_loop_mp(
                 try:
                     q.put_nowait(("predictor", "token", payload))
                 except asyncio.QueueFull:
-                    pass
+                    logger.error(
+                        f"[predictor_loop_mp] DROPPED predictor tokens for {request_id[:8]}! "
+                        f"Queue full (size={q.qsize()}). This will cause a hang in generate_async."
+                    )
             predictor_ready.discard(request_id)
 
-        if burst_count % 50 == 1:
+        if burst_count % 200 == 1:
             logger.info(f"[predictor_loop_mp] burst#{burst_count} finished={len(outputs_all)}")

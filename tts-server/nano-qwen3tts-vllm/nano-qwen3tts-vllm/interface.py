@@ -223,6 +223,10 @@ def _get_processor(model_path: str):
 
 
 class Qwen3TTSInterface:
+    # Configurable via env vars; lower temperature = more consistent tone across runs.
+    TTS_TALKER_TEMPERATURE = float(os.environ.get("TTS_TALKER_TEMPERATURE", "0.9"))
+    TTS_PREDICTOR_TEMPERATURE = float(os.environ.get("TTS_PREDICTOR_TEMPERATURE", "0.9"))
+
     @classmethod
     def from_pretrained(
         cls,
@@ -699,15 +703,6 @@ class Qwen3TTSInterface:
         enc = self.speech_tokenizer.tokenizer.encode(wav, sr=sr)
         # enc.audio_codes[0] is [time, 16]
         ref_code = enc.audio_codes[0].cpu()
-        # Cap reference audio to 30s (360 frames at 12Hz) to keep prefill
-        # prompt within a reasonable token budget.
-        max_ref_frames = 360  # 30s * 12Hz
-        if ref_code.shape[0] > max_ref_frames:
-            logger.warning(
-                f"[create_voice_clone_prompt] ref_code truncated from {ref_code.shape[0]} "
-                f"to {max_ref_frames} frames ({max_ref_frames / 12:.0f}s)"
-            )
-            ref_code = ref_code[:max_ref_frames]
         
         # Resample to 24kHz for speaker encoder if needed
         wav_resample = wav
@@ -737,7 +732,7 @@ class Qwen3TTSInterface:
         ref_text: Optional[str] = None,
         x_vector_only_mode: bool = False,
         voice_clone_prompt: Optional[Dict[str, Any]] = None,
-        non_streaming_mode: bool = False,
+        non_streaming_mode: bool = True,
     ):
         """Generate speech using voice clone (yields codec chunks).
         
@@ -853,8 +848,8 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=0.9, max_tokens=1),
-            SamplingParams(temperature=0.9, max_tokens=17),
+            SamplingParams(temperature=self.TTS_TALKER_TEMPERATURE, max_tokens=1),
+            SamplingParams(temperature=self.TTS_PREDICTOR_TEMPERATURE, max_tokens=17),
         )
     
     async def generate_voice_clone_async(
@@ -865,7 +860,7 @@ class Qwen3TTSInterface:
         ref_text: Optional[str] = None,
         x_vector_only_mode: bool = False,
         voice_clone_prompt: Optional[Dict[str, Any]] = None,
-        non_streaming_mode: bool = False,
+        non_streaming_mode: bool = True,
     ):
         """Async generator of codebook_id chunks for voice clone. Call await start_zmq_tasks() first.
 
@@ -1083,8 +1078,8 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=0.9, max_tokens=1),
-            SamplingParams(temperature=0.9, max_tokens=17),
+            SamplingParams(temperature=self.TTS_TALKER_TEMPERATURE, max_tokens=1),
+            SamplingParams(temperature=self.TTS_PREDICTOR_TEMPERATURE, max_tokens=17),
         )
     
     async def start_zmq_tasks(self) -> None:
@@ -1147,8 +1142,8 @@ class Qwen3TTSInterface:
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
             str(uuid.uuid4()),
-            SamplingParams(temperature=0.9, max_tokens=1),
-            SamplingParams(temperature=0.9, max_tokens=17),
+            SamplingParams(temperature=self.TTS_TALKER_TEMPERATURE, max_tokens=1),
+            SamplingParams(temperature=self.TTS_PREDICTOR_TEMPERATURE, max_tokens=17),
         )
 
     async def generate_custom_voice_async(
@@ -1183,17 +1178,12 @@ class Qwen3TTSInterface:
         """Sync generator. Not supported; use generate_async() after await start_zmq_tasks()."""
         raise RuntimeError("Use generate_async() after await start_zmq_tasks()")
         request_id = request_id or str(uuid.uuid4())
-        talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
-        predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
+        talker_sampling_params = SamplingParams(temperature=self.TTS_TALKER_TEMPERATURE, max_tokens=1)
+        predictor_sampling_params = SamplingParams(temperature=self.TTS_PREDICTOR_TEMPERATURE, max_tokens=17)
         yield from self._generate_caller_driven(
             inputs_embeds, trailing_text_hiddens, tts_pad_embed,
             request_id, talker_sampling_params, predictor_sampling_params,
         )
-
-    # Safety limit: max generation steps before force-stopping.
-    # 4096 steps at 12Hz = ~341s of audio. Original qwen-tts uses max_new_tokens=4096.
-    # Configurable via MAX_GENERATION_STEPS env var.
-    MAX_GENERATION_STEPS = int(os.environ.get("MAX_GENERATION_STEPS", "4096"))
 
     async def generate_async(
         self,
@@ -1206,8 +1196,8 @@ class Qwen3TTSInterface:
         """Async generator of codebook_id chunks. Call await start_zmq_tasks() first."""
         if not (self._use_mp_engines and self._mp_holder is not None):
             raise RuntimeError("generate_async requires start_zmq_tasks() to be called first")
-        talker_sampling_params = SamplingParams(temperature=0.9, max_tokens=1)
-        predictor_sampling_params = SamplingParams(temperature=0.9, max_tokens=17)
+        talker_sampling_params = SamplingParams(temperature=self.TTS_TALKER_TEMPERATURE, max_tokens=1)
+        predictor_sampling_params = SamplingParams(temperature=self.TTS_PREDICTOR_TEMPERATURE, max_tokens=17)
         request_id = request_id or str(uuid.uuid4())
         request_queue: asyncio.Queue = asyncio.Queue()
         async with self._queues_lock:
@@ -1217,16 +1207,38 @@ class Qwen3TTSInterface:
             if next_talker_embeds.dim() == 2:
                 next_talker_embeds = next_talker_embeds.unsqueeze(0)
             generation_step = 0
-            _gen_start_time = time.time()
-            _token_history = []  # track last_id per step for diagnostics
-            _exit_reason = "unknown"
+            max_generation_steps = int(os.environ.get("MAX_GENERATION_STEPS", "300"))
+            step_timeout = float(os.environ.get("TTS_STEP_TIMEOUT", "30.0"))
+
+            gen_start_time = time.time()
+            slow_gen_warn_threshold = float(os.environ.get("TTS_SLOW_GEN_WARN_SECS", "30.0"))
+            slow_gen_warned = False
 
             self._mp_holder.talker_client.send_add_request(request_id, [next_talker_embeds], talker_sampling_params)
             logger.info(f"[gen_async:{request_id[:8]}] add_request sent to talker, waiting for first message ...")
 
-            while generation_step < self.MAX_GENERATION_STEPS:
+            while True:
+                if generation_step >= max_generation_steps:
+                    logger.error(
+                        f"[gen_async:{request_id[:8]}] hit max_generation_steps={max_generation_steps}, forcing termination"
+                    )
+                    self._mp_holder.talker_client.send_clear_request(request_id)
+                    raise RuntimeError(
+                        f"TTS generation exceeded max_generation_steps ({max_generation_steps}) "
+                        f"without producing EOS token. Request {request_id[:8]} terminated."
+                    )
                 t_wait_talker = time.time()
-                engine_type, msg_type, payload = await request_queue.get()
+                try:
+                    engine_type, msg_type, payload = await asyncio.wait_for(
+                        request_queue.get(), timeout=step_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self._mp_holder.talker_client.send_clear_request(request_id)
+                    raise RuntimeError(
+                        f"TTS talker step timed out after {step_timeout}s at generation_step={generation_step}. "
+                        f"Likely cause: KV cache exhaustion (sequence preempted and cannot re-allocate), "
+                        f"or talker worker crashed. Request {request_id[:8]} terminated."
+                    )
                 t_got_talker = time.time()
                 if generation_step == 0:
                     logger.info(
@@ -1235,7 +1247,6 @@ class Qwen3TTSInterface:
                     )
 
                 if engine_type == "talker" and msg_type == "done":
-                    _exit_reason = "talker_done"
                     if generation_step == 0:
                         logger.warning(
                             f"[gen_async:{request_id[:8]}] exiting with 0 codes (talker sent 'done' immediately)"
@@ -1246,16 +1257,15 @@ class Qwen3TTSInterface:
                     token_ids = payload["token_ids"]
                     hidden_states = payload.get("hidden_states")
                     last_id = token_ids[-1]
-                    _token_history.append(last_id)
-                    _codec_eos = self.model_config.talker_config.codec_eos_token_id
                     if generation_step == 0:
-                        logger.info(f"[gen_async:{request_id[:8]}] first token: last_id={last_id} ({_codec_eos}=EOS)")
-                    if last_id == _codec_eos:
-                        _exit_reason = f"eos_{_codec_eos}"
+                        logger.info(f"[gen_async:{request_id[:8]}] first token: last_id={last_id} (2150=EOS)")
+                    if last_id in (2150, 2157):
                         if generation_step == 0:
                             logger.warning(
-                                f"[gen_async:{request_id[:8]}] exiting with 0 codes (talker sent EOS token {_codec_eos} immediately)"
+                                f"[gen_async:{request_id[:8]}] exiting with 0 codes (talker sent EOS token {last_id} immediately)"
                             )
+                        else:
+                            logger.info(f"[gen_async:{request_id[:8]}] EOS token {last_id} at step {generation_step}")
                         self._mp_holder.talker_client.send_clear_request(request_id)
                         break
 
@@ -1278,7 +1288,7 @@ class Qwen3TTSInterface:
                     )
                     t_pred_submitted = time.time()
 
-                    if generation_step % 10 == 0:
+                    if generation_step % 50 == 0:
                         logger.info(
                             f"[gen_async:{request_id[:8]}] step={generation_step} "
                             f"wait_talker={(t_got_talker - t_wait_talker)*1000:.1f}ms "
@@ -1287,7 +1297,17 @@ class Qwen3TTSInterface:
                         )
 
                     t_wait_pred = time.time()
-                    _, _, payload2 = await request_queue.get()
+                    try:
+                        _, _, payload2 = await asyncio.wait_for(
+                            request_queue.get(), timeout=step_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        self._mp_holder.talker_client.send_clear_request(request_id)
+                        raise RuntimeError(
+                            f"TTS predictor step timed out after {step_timeout}s at generation_step={generation_step}. "
+                            f"Likely cause: predictor worker crashed or KV cache exhaustion in predictor. "
+                            f"Request {request_id[:8]} terminated."
+                        )
                     t_got_pred = time.time()
                     pred_token_ids = payload2.get("token_ids", [])
                     codebook_ids = [last_id] + pred_token_ids
@@ -1306,67 +1326,29 @@ class Qwen3TTSInterface:
                         next_talker_embeds = next_talker_embeds + tts_pad_embed
                     generation_step += 1
 
+                    # Slow generation warning: detect "never hits EOS" early
+                    elapsed = time.time() - gen_start_time
+                    if not slow_gen_warned and elapsed > slow_gen_warn_threshold:
+                        slow_gen_warned = True
+                        logger.warning(
+                            f"[gen_async:{request_id[:8]}] slow generation: {generation_step} steps "
+                            f"in {elapsed:.1f}s ({generation_step/elapsed:.1f} steps/s). "
+                            f"EOS not yet reached. Will timeout at max_generation_steps={max_generation_steps}."
+                        )
+
                     self._mp_holder.talker_client.send_add_request(
                         request_id, [next_talker_embeds], talker_sampling_params,
                     )
                     t_post_end = time.time()
 
-                    if generation_step % 10 == 1:
+                    if generation_step % 50 == 1:
                         logger.info(
                             f"[gen_async:{request_id[:8]}] step={generation_step} "
                             f"wait_pred={(t_got_pred - t_wait_pred)*1000:.1f}ms "
                             f"post_cpu={(t_post_end - t_post_start)*1000:.1f}ms "
                             f"frame_total={(t_post_end - t_wait_talker)*1000:.1f}ms"
                         )
-            # Fell through: max generation steps reached
-            else:
-                _exit_reason = f"max_steps_{self.MAX_GENERATION_STEPS}"
-                logger.warning(
-                    f"[gen_async:{request_id[:8]}] hit MAX_GENERATION_STEPS={self.MAX_GENERATION_STEPS} "
-                    f"({self.MAX_GENERATION_STEPS / 12:.0f}s audio) — force stopping"
-                )
-                self._mp_holder.talker_client.send_clear_request(request_id)
-        except GeneratorExit:
-            _exit_reason = "generator_exit"
-            logger.warning(f"[gen_async:{request_id[:8]}] GeneratorExit at step={generation_step}")
-        except asyncio.CancelledError:
-            _exit_reason = "cancelled"
-            logger.warning(f"[gen_async:{request_id[:8]}] CancelledError at step={generation_step}")
-        except Exception as exc:
-            _exit_reason = f"exception:{type(exc).__name__}"
-            logger.exception(f"[gen_async:{request_id[:8]}] EXCEPTION at step={generation_step}: {exc}")
         finally:
-            # --- Generation summary diagnostics ---
-            elapsed = time.time() - _gen_start_time
-            total_steps = generation_step
-            expected_audio_ms = total_steps * (1000 / 12)  # 12Hz codec
-            if _token_history:
-                from collections import Counter
-                token_counts = Counter(_token_history)
-                most_common = token_counts.most_common(5)
-                unique_tokens = len(token_counts)
-                # Detect repetition: if any single token is >40% of all tokens
-                top_token, top_count = most_common[0]
-                repetition_ratio = top_count / len(_token_history)
-                repetition_flag = " REPETITIVE" if repetition_ratio > 0.4 else ""
-                logger.info(
-                    f"[gen_async:{request_id[:8]}] SUMMARY: exit={_exit_reason} "
-                    f"steps={total_steps} elapsed={elapsed:.2f}s "
-                    f"expected_audio~{int(expected_audio_ms)}ms "
-                    f"unique_tokens={unique_tokens}/{len(_token_history)} "
-                    f"top5={most_common}{repetition_flag}"
-                )
-                if repetition_ratio > 0.4:
-                    logger.warning(
-                        f"[gen_async:{request_id[:8]}] HIGH REPETITION: "
-                        f"token {top_token} appeared {top_count}/{len(_token_history)} times "
-                        f"({repetition_ratio:.0%})"
-                    )
-            else:
-                logger.info(
-                    f"[gen_async:{request_id[:8]}] SUMMARY: exit={_exit_reason} "
-                    f"steps={total_steps} elapsed={elapsed:.2f}s (no tokens generated)"
-                )
             try:
                 if self._mp_holder is not None:
                     self._mp_holder.talker_client.send_clear_request(request_id)
@@ -1405,8 +1387,7 @@ class Qwen3TTSInterface:
                 continue
             _, _, token_ids, hidden_states, is_finished = match
             last_id = token_ids[-1]
-            _codec_eos = self.model_config.talker_config.codec_eos_token_id
-            if last_id == _codec_eos:
+            if last_id == 2150:
                 self.talker_llm.clear_request(request_id)
                 return
 

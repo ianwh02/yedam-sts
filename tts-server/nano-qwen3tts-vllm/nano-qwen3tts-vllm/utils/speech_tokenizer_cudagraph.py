@@ -91,9 +91,7 @@ class SpeechTokenizerCUDAGraph:
             device_map=device,
         )
         self.tokenizer.model = self.tokenizer.model.to(dtype)
-        # Force decoder to float32: SnakeBeta activation uses torch.exp() which
-        # overflows in bf16 for certain codebook values, causing random silence/
-        # distortion (vllm-omni PR #1664). Perf cost is ~0.3ms per decode call.
+        # Decoder uses SnakeBeta with torch.exp() that overflows in bf16
         self.tokenizer.model.decoder = self.tokenizer.model.decoder.to(torch.float32)
 
         if hasattr(self.tokenizer.config, "sample_rate"):

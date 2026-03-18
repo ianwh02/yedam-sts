@@ -139,8 +139,6 @@ def run_talker_worker(
                 except Exception as e:
                     logger.exception(f"[talker_worker] step failed: {e}")
                     # Send empty result so main doesn't hang, but keep the worker alive.
-                    # This can happen due to race between clear_request and run_step
-                    # (e.g. sequence grew beyond MAX_MODEL_LEN before clear arrived).
                     payload = serialize_talker_result(step_id, [])
                     push.send(payload)
                 continue

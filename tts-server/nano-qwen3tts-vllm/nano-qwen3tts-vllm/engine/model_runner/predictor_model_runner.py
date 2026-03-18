@@ -41,18 +41,18 @@ class PredictorModelRunner(ModelRunner):
         with open(os.path.join(config.model, "config.json"), "r") as f:
             model_config = json.load(f)
             model_config = Qwen3TTSConfig(**model_config)
-
+        
         model_config.talker_config.code_predictor_config.talker_hidden_size = model_config.talker_config.hidden_size
         model = Qwen3TTSCodePredictorForCausalLM(model_config.talker_config.code_predictor_config, model_config.talker_config)
-
+        
         self.model_config = model_config.talker_config.code_predictor_config
-
+        
         state_dict = load_file(
             os.path.join(config.model, "model.safetensors")
         )
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict)   
         return model
-
+    
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -62,7 +62,7 @@ class PredictorModelRunner(ModelRunner):
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-
+    
     @torch.inference_mode()
     def run_model(
         self,
@@ -71,7 +71,7 @@ class PredictorModelRunner(ModelRunner):
         is_prefill: bool = False,
         generation_steps: list[int] = [],
     ) -> torch.Tensor:
-        start = time.time()
+        start = time.time()        
         if self.enforce_eager or input_embeds.size(0) > 512:
             hidden_states = self.model(input_embeds, positions)
         elif is_prefill:
@@ -79,15 +79,15 @@ class PredictorModelRunner(ModelRunner):
             # via torch.stack; flatten to 2D [total_tokens, hidden] for flash attention
             if input_embeds.dim() == 3:
                 input_embeds = input_embeds.view(-1, input_embeds.size(-1))
-
-
+                
+                
             num_tokens = input_embeds.size(0)
             context = get_context()
             num_seqs = context.cu_seqlens_q.size(0) - 1
             # Prefill graph: use when we have a captured (num_seqs, num_tokens) and no prefix cache
             key = (num_seqs, num_tokens)
             if key in self.graphs_prefill and context.block_tables is None:
-                logger.info(f"[predictor model runner] Running prefill graph with num_seqs={num_seqs} num_tokens={num_tokens}")
+                logger.debug(f"[predictor model runner] Running prefill graph with num_seqs={num_seqs} num_tokens={num_tokens}")
                 graph = self.graphs_prefill[key]
                 graph_vars = self.graph_vars_prefill
                 graph_vars["input_embeds"][:num_tokens] = input_embeds
@@ -111,7 +111,7 @@ class PredictorModelRunner(ModelRunner):
             else:
                 hidden_states = self.model(input_embeds, positions)
         else:
-            logger.info(f"[predictor model runner] Running decode graph")
+            logger.debug(f"[predictor model runner] Running decode graph")
             bs = input_embeds.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -126,24 +126,24 @@ class PredictorModelRunner(ModelRunner):
             graph.replay()
             # Use outputs from the graph; do NOT run self.model() again (that would double the work).
             hidden_states = graph_vars["outputs"][:bs]
-
-        logits = self.model.compute_logits(hidden_states, generation_steps)
+            
+        logits = self.model.compute_logits(hidden_states, generation_steps)        
         return logits
-
-
+        
+    
     def run(self, seqs: list[PredictorSequence], is_prefill: bool) -> list[int]:
         input_embeds = None
         if is_prefill:
             input_ids, input_embeds, positions = self.prepare_prefill(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs)
-
+            
         generation_steps = [seq.generation_steps for seq in seqs]
-
+            
         input_embeds = self.model.get_input_embeddings(input_ids, input_embeds, generation_steps)
 
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-
+        
         try:
             logits = self.run_model(positions, input_embeds, is_prefill, generation_steps)
         except Exception as e:
@@ -152,10 +152,10 @@ class PredictorModelRunner(ModelRunner):
             traceback.print_exc()
             raise e
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-
+        
         reset_context()
         return token_ids
-
+    
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
@@ -203,9 +203,9 @@ class PredictorModelRunner(ModelRunner):
         config = self.config
         hf_config = self.model_config
         max_num_tokens = 36
-        # Sparse set of num_seqs to reduce graph captures. Misses use eager prefill.
+        # Support multi-sequence prefill: capture for num_seqs in [1,2,4,8]
         max_num_seqs_prefill = min(16, getattr(config, "max_num_seqs", 512))
-        prefill_num_seqs_list = [n for n in [1, 2, 4] if n <= max_num_seqs_prefill]
+        prefill_num_seqs_list = [n for n in range(1,8) if n <= max_num_seqs_prefill]
         max_cu_len = max(prefill_num_seqs_list) + 1
         input_embeds = torch.zeros(max_num_tokens, hf_config.talker_hidden_size, device="cuda")
         positions = torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda")
@@ -262,3 +262,4 @@ class PredictorModelRunner(ModelRunner):
             slot_mapping=slot_mapping,
             outputs=outputs,
         )
+

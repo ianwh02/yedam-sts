@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import multiprocessing as mp
+from scipy.signal import butter, sosfilt
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
@@ -36,6 +37,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("tts-server")
+
+# TF32: use reduced-precision float32 matmuls for ~2x throughput on Ampere+
+torch.set_float32_matmul_precision("high")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -66,6 +70,14 @@ BLEND_SAMPLES = int(os.environ.get("STREAM_BLEND_SAMPLES", "512"))
 _HANN_FADE_IN: np.ndarray | None = None
 _HANN_FADE_OUT: np.ndarray | None = None
 
+# Decoder warmup: prepend N copies of first codec frame as left context on first decode
+# to avoid cold-start artifacts. Trimmed from output via left_context_frames.
+DECODER_WARMUP_FRAMES = int(os.environ.get("DECODER_WARMUP_FRAMES", "4"))
+
+# Audio post-processing
+HIGHPASS_FREQ = int(os.environ.get("TTS_HIGHPASS_HZ", "80"))
+_HP_SOS = butter(2, HIGHPASS_FREQ, btype='high', fs=TARGET_SAMPLE_RATE, output='sos') if HIGHPASS_FREQ > 0 else None
+
 SUPPORTED_LANGUAGES = {
     "en": "English",
     "english": "English",
@@ -84,13 +96,22 @@ SPEAKER_MAP = {
 DEFAULT_SPEAKER = "ryan"
 
 # Voice clone mode: set REF_AUDIO_PATH to a .wav file to use base model with clone mode.
-# When unset, uses custom voice mode (preset speakers like ryan/sohee).
+# Per-language overrides: REF_AUDIO_PATH_KO, REF_AUDIO_PATH_EN, REF_TEXT_KO, REF_TEXT_EN, etc.
+# Falls back to generic REF_AUDIO_PATH/REF_TEXT if no language-specific one is set.
 REF_AUDIO_PATH = os.environ.get("REF_AUDIO_PATH", "").strip() or None
 REF_TEXT = os.environ.get("REF_TEXT", "").strip() or None
 X_VECTOR_ONLY = os.environ.get("X_VECTOR_ONLY", "0").lower() in ("1", "true", "yes")
 
-# Precomputed voice clone prompt (set during startup if clone mode)
-_voice_clone_prompt = None
+# Per-language ref audio config: {canonical_language -> (path, ref_text)}
+_REF_AUDIO_LANG_CONFIG: dict[str, tuple[str, str | None]] = {}
+for _lang_suffix, _canon in [("EN", "English"), ("KO", "Korean"), ("ZH", "Chinese"), ("JA", "Japanese")]:
+    _path = os.environ.get(f"REF_AUDIO_PATH_{_lang_suffix}", "").strip()
+    _text = os.environ.get(f"REF_TEXT_{_lang_suffix}", "").strip() or None
+    if _path:
+        _REF_AUDIO_LANG_CONFIG[_canon] = (_path, _text)
+
+# Precomputed voice clone prompts: {canonical_language -> prompt} + None key for generic fallback
+_voice_clone_prompts: dict[str | None, object] = {}
 
 # Debug: save generated audio to WAV files for inspection
 DEBUG_SAVE_AUDIO = os.environ.get("DEBUG_SAVE_AUDIO", "1").lower() in ("1", "true", "yes")
@@ -132,10 +153,38 @@ _mp_decoder_request_queue: mp.Queue = None
 _mp_decoder_result_queue: mp.Queue = None
 _mp_decoder_process: mp.Process = None
 
+# Cached warmup codec frames from startup speech generation (last N frames of real speech)
+_warmup_codec_frames: list | None = None
+
+# Per-session decoder context cache: session_id -> (last_codec_frames, last_access_time)
+_session_codec_cache: dict[str, tuple[list, float]] = {}
+SESSION_CODEC_TTL = float(os.environ.get("SESSION_CODEC_TTL", "300"))  # 5 minutes
+_ttl_task: asyncio.Task | None = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_session_warmup(session_id: str | None) -> list | None:
+    """Retrieve cached codec frames for a session, refreshing TTL."""
+    if session_id is None:
+        return None
+    entry = _session_codec_cache.get(session_id)
+    if entry is None:
+        return None
+    frames, _ = entry
+    _session_codec_cache[session_id] = (frames, time.time())
+    return frames
+
+
+def _set_session_warmup(session_id: str | None, all_codes: list):
+    """Cache the last DECODER_WARMUP_FRAMES codec frames for a session."""
+    if session_id is None or not all_codes:
+        return
+    tail = all_codes[-DECODER_WARMUP_FRAMES:] if len(all_codes) >= DECODER_WARMUP_FRAMES else list(all_codes)
+    _session_codec_cache[session_id] = (tail, time.time())
 
 
 def _get_leading_silence_bytes() -> bytes:
@@ -156,6 +205,7 @@ def _get_hann_windows() -> tuple[np.ndarray, np.ndarray]:
     return _HANN_FADE_IN, _HANN_FADE_OUT
 
 
+
 def _float_to_pcm16(wav: np.ndarray) -> np.ndarray:
     wav = np.clip(wav, -1.0, 1.0)
     return (wav * 32767).astype(np.int16)
@@ -170,6 +220,13 @@ def _resample_to_24k(wav: np.ndarray, orig_sr: int) -> np.ndarray:
         return wav
     indices = np.linspace(0, n_orig - 1, n_new, dtype=np.float64)
     return np.interp(indices, np.arange(n_orig), wav).astype(np.float32)
+
+
+def _postprocess_audio(wav: np.ndarray) -> np.ndarray:
+    """High-pass filter on decoded float32 audio."""
+    if len(wav) == 0 or _HP_SOS is None:
+        return wav
+    return sosfilt(_HP_SOS, wav).astype(np.float32)
 
 
 def _to_wav_bytes(pcm16: np.ndarray, sr: int) -> bytes:
@@ -322,6 +379,7 @@ async def _decode_worker_loop():
 
                     wav_results, sr = await loop.run_in_executor(None, _do_full)
                     wav_24k = _resample_to_24k(wav_results[0], sr)
+                    wav_24k = _postprocess_audio(wav_24k)
                     pcm16 = _float_to_pcm16(wav_24k)
                     if not req["future"].done():
                         req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
@@ -344,6 +402,7 @@ async def _decode_worker_loop():
                         wav_list, sr = result["wav_list"], result["sr"]
                         for req, wav in zip(batch_window, wav_list):
                             wav_24k = _resample_to_24k(wav, sr)
+                            wav_24k = _postprocess_audio(wav_24k)
                             pcm16 = _float_to_pcm16(wav_24k)
                             if not req["future"].done():
                                 req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
@@ -356,6 +415,7 @@ async def _decode_worker_loop():
                     wav_list, sr = await loop.run_in_executor(None, _do_window)
                     for req, wav in zip(batch_window, wav_list):
                         wav_24k = _resample_to_24k(wav, sr)
+                        wav_24k = _postprocess_audio(wav_24k)
                         pcm16 = _float_to_pcm16(wav_24k)
                         if not req["future"].done():
                             req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
@@ -384,6 +444,7 @@ async def _decode_batched(audio_codes: list, left_context_frames: int = None) ->
 class SynthesizeRequest(BaseModel):
     text: str
     language: str = "en"
+    session_id: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -397,7 +458,7 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _generate_speech_stream(text: str, language: str, speaker: str):
+async def _generate_speech_stream(text: str, language: str, speaker: str, session_id: str | None = None):
     """
     Streaming decode: producer feeds code chunks to a queue; consumer decodes
     (window + context) and yields PCM audio chunks.
@@ -414,15 +475,15 @@ async def _generate_speech_stream(text: str, language: str, speaker: str):
         interface = get_interface()
         start_time = time.time()
 
-        # Prepend "..." for generation quality (nano-qwen3tts-vllm pattern)
-        gen_text = "..." + text
+        gen_text = text
         logger.info("[stream] text=%d chars speaker=%s lang=%s", len(text), speaker, language)
 
-        if _voice_clone_prompt is not None:
+        clone_prompt = _voice_clone_prompts.get(language) or _voice_clone_prompts.get(None)
+        if clone_prompt is not None:
             gen = interface.generate_voice_clone_async(
                 text=gen_text,
                 language=language,
-                voice_clone_prompt=_voice_clone_prompt,
+                voice_clone_prompt=clone_prompt,
             )
         else:
             gen = interface.generate_custom_voice_async(
@@ -468,6 +529,7 @@ async def _generate_speech_stream(text: str, language: str, speaker: str):
                 raise
             finally:
                 logger.info("[producer] done, total_codes=%d", len(audio_codes))
+                _set_session_warmup(session_id, audio_codes)
                 await codes_queue.put(None)
 
         producer_task = asyncio.create_task(producer())
@@ -487,6 +549,18 @@ async def _generate_speech_stream(text: str, language: str, speaker: str):
                 window = item[start_ctx:]
                 context_frames = prev_code_pos - start_ctx
 
+                # First decode: prepend warmup frames so the decoder doesn't cold-start
+                if chunk_index == 0 and DECODER_WARMUP_FRAMES > 0 and len(window) > 0:
+                    session_warmup = _get_session_warmup(session_id)
+                    if session_warmup is not None:
+                        warmup = session_warmup
+                    elif _warmup_codec_frames is not None:
+                        warmup = _warmup_codec_frames[:DECODER_WARMUP_FRAMES]
+                    else:
+                        warmup = [window[0]] * DECODER_WARMUP_FRAMES
+                    window = warmup + window
+                    context_frames += len(warmup)
+
                 pcm16, _ = await _decode_batched(window, left_context_frames=context_frames)
                 prev_code_pos = len(item)
 
@@ -501,7 +575,7 @@ async def _generate_speech_stream(text: str, language: str, speaker: str):
                     blended = prev_tail * fade_out + audio_f32[:BLEND_SAMPLES] * fade_in
                     audio_f32 = np.concatenate([blended, audio_f32[BLEND_SAMPLES:]])
                 elif chunk_index == 0 and len(audio_f32) > BLEND_SAMPLES:
-                    # Hann fade-in on first chunk to prevent startup pop
+                    # Short Hann fade-in on first chunk to prevent startup pop
                     fade_in, _ = _get_hann_windows()
                     audio_f32[:BLEND_SAMPLES] *= fade_in
 
@@ -565,27 +639,39 @@ async def lifespan(app: FastAPI):
     global _decode_queue, _decode_worker_task
     global _mp_decoder_request_queue, _mp_decoder_result_queue, _mp_decoder_process
 
-    global _voice_clone_prompt
-
     logger.info("Loading model: %s (GPU_MEMORY_UTILIZATION=%.2f)", MODEL_DIR, GPU_MEMORY_UTILIZATION)
     interface = get_interface()
     get_tokenizer()
     await interface.start_zmq_tasks()
 
-    # Precompute voice clone prompt if reference audio is provided
-    if REF_AUDIO_PATH is not None:
-        import soundfile as sf
-        logger.info("[clone] Loading reference audio: %s", REF_AUDIO_PATH)
-        ref_audio, ref_sr = sf.read(REF_AUDIO_PATH)
+    # Precompute voice clone prompts
+    import soundfile as sf
+
+    def _load_clone_prompt(path: str, ref_text: str | None, label: str):
+        logger.info("[clone] Loading reference audio for %s: %s", label, path)
+        ref_audio, ref_sr = sf.read(path)
         if ref_audio.ndim > 1:
             ref_audio = np.mean(ref_audio, axis=-1)
-        _voice_clone_prompt = interface.create_voice_clone_prompt(
+        prompt = interface.create_voice_clone_prompt(
             ref_audio=(ref_audio, ref_sr),
-            ref_text=REF_TEXT,
+            ref_text=ref_text,
             x_vector_only_mode=X_VECTOR_ONLY,
         )
-        mode = "x_vector_only" if X_VECTOR_ONLY else ("ICL" if REF_TEXT else "x_vector_only")
-        logger.info("[clone] Voice clone prompt ready (mode=%s, ref_text=%s)", mode, repr(REF_TEXT)[:60])
+        mode = "x_vector_only" if X_VECTOR_ONLY else ("ICL" if ref_text else "x_vector_only")
+        logger.info("[clone] %s prompt ready (mode=%s, ref_text=%s)", label, mode, repr(ref_text)[:60])
+        return prompt
+
+    # Per-language ref audio
+    for lang, (path, ref_text) in _REF_AUDIO_LANG_CONFIG.items():
+        _voice_clone_prompts[lang] = _load_clone_prompt(path, ref_text, lang)
+
+    # Generic fallback ref audio
+    if REF_AUDIO_PATH is not None:
+        _voice_clone_prompts[None] = _load_clone_prompt(REF_AUDIO_PATH, REF_TEXT, "default")
+
+    if _voice_clone_prompts:
+        langs = [k or "default" for k in _voice_clone_prompts]
+        logger.info("[clone] Voice clone prompts loaded: %s", ", ".join(langs))
 
     # Optional multiprocessing decoder worker
     if os.environ.get("DECODER_MP_WORKER", "0").lower() in ("1", "true", "yes"):
@@ -603,24 +689,62 @@ async def lifespan(app: FastAPI):
     _decode_queue = asyncio.Queue()
     _decode_worker_task = asyncio.create_task(_decode_worker_loop())
 
-    # Warmup: batch=1 then batch=8 to compile CUDA kernels for all batch sizes
-    async def _warmup_one():
+    # Warmup: batch=1 then batch=2 to compile CUDA kernels for various batch sizes.
+    # First pass also captures codec frames for decoder warmup context.
+    global _warmup_codec_frames
+
+    async def _warmup_one(capture_codes: bool = False) -> list | None:
+        codes = [] if capture_codes else None
         try:
-            async for _ in _generate_speech_stream("Hello, warmup.", "English", DEFAULT_SPEAKER):
+            async for chunk in _generate_speech_stream("Hello, warmup.", "English", DEFAULT_SPEAKER):
                 pass
         except Exception as e:
             logger.warning("[warmup] error (non-fatal): %s", e)
+        # Capture codec frames via a separate non-streaming generation.
+        # Use a longer sentence so the decoder is fully warmed by the tail frames.
+        if capture_codes:
+            try:
+                gen = interface.generate_custom_voice_async(
+                    text="The quick brown fox jumps over the lazy dog near the river bank.",
+                    language="English", speaker=DEFAULT_SPEAKER,
+                )
+                async for audio_code in gen:
+                    codes.append(audio_code)
+            except Exception as e:
+                logger.warning("[warmup] codec capture error (non-fatal): %s", e)
+        return codes if capture_codes else None
 
-    logger.info("[warmup] batch=1...")
-    await _warmup_one()
-    logger.info("[warmup] batch=8...")
-    await asyncio.gather(*[_warmup_one() for _ in range(16)])
+    logger.info("[warmup] batch=1 (capturing codec frames)...")
+    warmup_codes = await _warmup_one(capture_codes=True)
+    if warmup_codes and len(warmup_codes) > DECODER_WARMUP_FRAMES:
+        _warmup_codec_frames = warmup_codes[-DECODER_WARMUP_FRAMES:]
+        logger.info("[warmup] cached %d codec frames for decoder warmup", len(_warmup_codec_frames))
+    else:
+        logger.warning("[warmup] not enough codec frames captured, will fall back to first-frame repeat")
+
+    logger.info("[warmup] batch=2...")
+    await asyncio.gather(*[_warmup_one() for _ in range(2)])
     logger.info("[warmup] done.")
+
+
+    # Start TTL eviction for session codec cache
+    async def _ttl_eviction_loop():
+        while True:
+            await asyncio.sleep(60)
+            now = time.time()
+            stale = [k for k, (_, t) in _session_codec_cache.items() if now - t > SESSION_CODEC_TTL]
+            for k in stale:
+                _session_codec_cache.pop(k, None)
+            if stale:
+                logger.info("[session_cache] evicted %d stale sessions", len(stale))
+
+    _ttl_task = asyncio.create_task(_ttl_eviction_loop())
 
     logger.info("Server ready on 0.0.0.0:%d", PORT)
     yield
 
     # Shutdown
+    _ttl_task.cancel()
     if _decode_queue is not None:
         await _decode_queue.put(None)
     if _decode_worker_task is not None:
@@ -652,6 +776,15 @@ async def health():
     )
 
 
+@app.delete("/sessions/{session_id}")
+async def delete_session_context(session_id: str):
+    """Remove cached decoder context for a session."""
+    removed = _session_codec_cache.pop(session_id, None) is not None
+    if removed:
+        logger.info("[session_cache] cleared context for session %s", session_id)
+    return {"session_id": session_id, "removed": removed}
+
+
 @app.post("/synthesize/stream")
 async def synthesize_stream(req: SynthesizeRequest):
     """Streaming TTS: yields s16le PCM chunks as they're generated."""
@@ -670,7 +803,7 @@ async def synthesize_stream(req: SynthesizeRequest):
     speaker = SPEAKER_MAP.get(lang_key, DEFAULT_SPEAKER)
 
     return StreamingResponse(
-        _generate_speech_stream(text, language, speaker),
+        _generate_speech_stream(text, language, speaker, session_id=req.session_id),
         media_type="application/octet-stream",
         headers={
             "x-sample-rate": str(TARGET_SAMPLE_RATE),
@@ -699,13 +832,14 @@ async def synthesize(req: SynthesizeRequest, request: Request):
 
     # Collect all audio codes from the model (no windowed decode)
     interface = get_interface()
-    gen_text = "..." + text
+    gen_text = text
     logger.info("[synthesize] text=%d chars speaker=%s lang=%s", len(text), speaker, language)
 
     audio_codes = []
-    if _voice_clone_prompt is not None:
+    clone_prompt = _voice_clone_prompts.get(language) or _voice_clone_prompts.get(None)
+    if clone_prompt is not None:
         gen = interface.generate_voice_clone_async(
-            text=gen_text, language=language, voice_clone_prompt=_voice_clone_prompt,
+            text=gen_text, language=language, voice_clone_prompt=clone_prompt,
         )
     else:
         gen = interface.generate_custom_voice_async(
@@ -716,10 +850,27 @@ async def synthesize(req: SynthesizeRequest, request: Request):
 
     logger.info("[synthesize] collected %d codes, decoding full sequence", len(audio_codes))
 
-    # Decode all codes in one pass — no chunk boundaries, no pops
+    # Decode all codes in one pass — no chunk boundaries, no pops.
     if audio_codes:
-        pcm16, _ = await _decode_batched(audio_codes)
+        if DECODER_WARMUP_FRAMES > 0:
+            session_warmup = _get_session_warmup(req.session_id)
+            if session_warmup is not None:
+                warmup = session_warmup
+            elif _warmup_codec_frames is not None:
+                warmup = _warmup_codec_frames[:DECODER_WARMUP_FRAMES]
+            else:
+                warmup = [audio_codes[0]] * DECODER_WARMUP_FRAMES
+            pcm16, _ = await _decode_batched(warmup + audio_codes, left_context_frames=len(warmup))
+        else:
+            pcm16, _ = await _decode_batched(audio_codes)
+        # Short Hann fade-in to prevent startup pop
+        if len(pcm16) > BLEND_SAMPLES:
+            pcm16_f32 = pcm16.astype(np.float32)
+            fade_in, _ = _get_hann_windows()
+            pcm16_f32[:BLEND_SAMPLES] *= fade_in
+            pcm16 = np.clip(pcm16_f32, -32768, 32767).astype(np.int16)
         raw_pcm = pcm16.tobytes()
+        _set_session_warmup(req.session_id, audio_codes)
     else:
         raw_pcm = b""
 

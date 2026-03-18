@@ -80,6 +80,11 @@ class TTSClient:
             await queue.put(None)  # Poison pill
         if task:
             task.cancel()
+        # Clean up TTS server session decoder context (fire-and-forget, TTL handles failures)
+        try:
+            await self._client.delete(f"/sessions/{session_id}")
+        except Exception:
+            pass
 
     async def enqueue(
         self,
@@ -133,7 +138,7 @@ class TTSClient:
                     if settings.tts_streaming_enabled:
                         await self._synthesize_streaming(item)
                     else:
-                        audio_bytes = await self._synthesize(item.text, item.language)
+                        audio_bytes = await self._synthesize(item.text, item.language, session_id=item.session_id)
                         callbacks = self._on_audio.get(item.session_id, [])
                         for cb in callbacks:
                             await cb(audio_bytes, item)
@@ -146,7 +151,7 @@ class TTSClient:
             async with self._client.stream(
                 "POST",
                 "/synthesize/stream",
-                json={"text": item.text, "language": item.language},
+                json={"text": item.text, "language": item.language, "session_id": item.session_id},
             ) as response:
                 response.raise_for_status()
                 sample_format = response.headers.get("x-sample-format", "f32le")
@@ -173,7 +178,7 @@ class TTSClient:
             else:
                 raise
 
-    async def _synthesize(self, text: str, language: str = "en") -> bytes:
+    async def _synthesize(self, text: str, language: str = "en", session_id: str | None = None) -> bytes:
         """Call Qwen3-TTS server to synthesize speech.
 
         Requests raw PCM to avoid WAV encode/decode round-trip.
@@ -181,7 +186,7 @@ class TTSClient:
         """
         response = await self._client.post(
             "/synthesize",
-            json={"text": text, "language": language},
+            json={"text": text, "language": language, "session_id": session_id},
             headers={"Accept": "application/octet-stream"},
         )
         response.raise_for_status()

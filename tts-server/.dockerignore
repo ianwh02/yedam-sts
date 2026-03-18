@@ -1,13 +1,21 @@
-# Legacy Rust TTS (no longer used)
+# Legacy TTS implementations (no longer used)
 qwen3-tts-rs/
-# Legacy Python TTS (replaced by nano-qwen3tts-vllm)
 faster-qwen3-tts/
+# Modified backup (reference only, not needed in build)
+nano-qwen3tts-vllm-modified/
 # nano-qwen3tts-vllm: exclude non-essential files
 nano-qwen3tts-vllm/.git/
 nano-qwen3tts-vllm/examples/
 nano-qwen3tts-vllm/*.md
 nano-qwen3tts-vllm/LICENSE
 nano-qwen3tts-vllm/.github/
+nano-qwen3tts-vllm/.gitignore
+nano-qwen3tts-vllm/.python-version
+nano-qwen3tts-vllm/uv.lock
+# Reference audio (mounted at runtime, not needed in image)
+ref_audio/
+# Stage configs (not used by current server)
+stage-configs/
 # Python cache
 __pycache__/
 *.pyc

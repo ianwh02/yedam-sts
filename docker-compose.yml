@@ -46,19 +46,23 @@ services:
       - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
     command:
       - "--model"
-      - "${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct-AWQ}"
+      - "${LLM_MODEL:-Qwen/Qwen3-4B-AWQ}"
       - "--quantization"
       - "${LLM_QUANTIZATION:-awq_marlin}"
       - "--kv-cache-dtype"
       - "${LLM_KV_CACHE_DTYPE:-fp8}"
       - "--gpu-memory-utilization"
-      - "${LLM_GPU_MEMORY_UTILIZATION:-0.35}"
+      - "${LLM_GPU_MEMORY_UTILIZATION:-0.20}"
       - "--max-model-len"
-      - "${LLM_MAX_MODEL_LEN:-1024}"
+      - "${LLM_MAX_MODEL_LEN:-512}"
       - "--max-num-seqs"
       - "${LLM_MAX_NUM_SEQS:-8}"
       - "--enable-prefix-caching"
       - "--enforce-eager"
+      - "--attention-backend"
+      - "${LLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+      - "--performance-mode"
+      - "interactivity"
     expose:
       - "8000"
     healthcheck:
@@ -89,7 +93,7 @@ services:
     environment:
       - MODEL_DIR=${TTS_MODEL_DIR:-/app/models/Qwen3-TTS-12Hz-0.6B-Base}
       - TOKENIZER_DIR=/app/models/Qwen3-TTS-Tokenizer-12Hz
-      - GPU_MEMORY_UTILIZATION=${TTS_GPU_MEMORY_UTILIZATION:-0.40}
+      - GPU_MEMORY_UTILIZATION=${TTS_GPU_MEMORY_UTILIZATION:-0.35}
       - PORT=7860
       - REF_AUDIO_PATH_EN=${REF_AUDIO_PATH_EN:-/app/ref_audio/en.wav}
       - REF_TEXT_EN=${REF_TEXT_EN:-Hello I'm recording a test audio to clone my own voice um to qwen tts nano}

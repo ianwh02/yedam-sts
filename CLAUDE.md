@@ -74,7 +74,8 @@ The developer has a prior project at `C:\Users\ianch\Documents\Ian\Shannon\repos
 - [ ] 1.5 Audio preprocessing: implement RNNoise integration in orchestrator/src/audio/
 - [ ] 1.13 Legacy GPU compatibility (SM75 / T4 — TTS needs `CUDA_COMPUTE_CAP` rebuild, vLLM needs `--dtype float16`)
 - [ ] 1.14 Example fork repos (demonstrate callback API usage)
-- [ ] README.md: quickstart, architecture, GPU compatibility matrix, benchmarks, callback API docs
+- [ ] 1.15 Auto VRAM allocator + MPS thread balancer: detect available VRAM at startup, calculate model requirements from config, auto-set per-process fractions and MPS thread percentages
+- [ ] 1.16 README.md: quickstart, architecture, GPU compatibility matrix, benchmarks, callback API docs
 
 ## Competitive Positioning
 No existing open-source STS project optimises for concurrent sessions on a single GPU. Existing projects are either:

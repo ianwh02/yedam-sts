@@ -100,17 +100,18 @@ class ConversationProcessor(BaseProcessor):
 
 Consumers implement their own processor or use the built-in ones. The pipeline handles all the GPU-optimised orchestration.
 
-### VRAM Budget (16GB GPU - 5060 Ti / T4)
+### VRAM Budget (16GB GPU - RTX 5060 Ti)
 
-| Service | Model | VRAM |
-|---------|-------|------|
-| STT | Whisper large-v3-turbo (int8_float16) | ~1.5 GB |
-| LLM | Qwen2.5-7B-Instruct-AWQ (4-bit) | ~5.2 GB model + ~2.8 GB KV cache |
-| TTS | nano-qwen3tts-vllm 0.6B (FP16 + vLLM batching) | ~2 GB model + ~5.6 GB KV cache (0.35) |
-| CUDA overhead | - | ~1.2 GB |
-| **Total** | | **~12-14 GB** |
+| Service | Model | Setting | VRAM |
+|---------|-------|---------|------|
+| STT | Whisper large-v3-turbo (TensorRT) | — | ~3.2 GB |
+| LLM | Qwen3-4B-AWQ (awq_marlin, fp8 KV) | gpu_memory_utilization=0.20 | ~3.4 GB |
+| TTS main | nano-qwen3tts-vllm (embeddings + speech tokenizer + CUDA graphs) | fraction=0.15 | ~2.6 GB |
+| TTS talker | nano-qwen3tts-vllm (model + KV cache) | fraction≈0.23 | ~3.9 GB |
+| TTS predictor | nano-qwen3tts-vllm (model + lm_heads + torch.compile) | fraction≈0.04 | ~0.7 GB |
+| **Total** | | | **~13.8 GB** |
 
-All 3 services share one GPU via CUDA MPS. LLM capped at `GPU_MEMORY_UTILIZATION=0.50` (auto-scales KV cache). TTS at `GPU_MEMORY_UTILIZATION=0.35` for vLLM-style continuous batching KV cache.
+All 3 services share one GPU via CUDA MPS. TTS runs 3 OS processes (main, talker_worker, predictor_worker) each with separate `torch.cuda.set_per_process_memory_fraction()` caps computed by `_compute_memory_split()` in interface.py.
 
 ### Audio Format Strategy
 
@@ -305,16 +306,19 @@ TTS audio ready → on_tts_audio callback immediately
 - Audio token / shared embedding approaches exist (SeamlessM4T, Moshi) but aren't production-ready for many languages
 - Text boundary is the right abstraction for now — simple, debuggable, swappable models
 
-### Concurrency Capacity Estimates (16GB GPU)
+### Concurrency Capacity Estimates
 
-| Sessions | STT VRAM | LLM VRAM (KV cache) | TTS VRAM | Total | Feasible? |
-|----------|----------|---------------------|----------|-------|-----------|
-| 1 | 3 GB | 4.5 GB (small KV) | 2 GB | 9.5 GB | Yes |
-| 3 | 3 GB | 5.5 GB (larger KV) | 2 GB | 10.5 GB | Yes |
-| 5 | 3 GB | 7 GB (5 concurrent seqs) | 2 GB | 12 GB | Tight |
-| 8+ | 3 GB | 9+ GB | 2 GB | 14+ GB | Needs 24GB GPU |
+**16GB GPU (RTX 5060 Ti):**
 
-STT and TTS VRAM is constant (model weights only). LLM VRAM grows with concurrent KV caches. On a 24GB GPU (L4/A10G), 8-10 concurrent sessions are feasible.
+| Sessions | STT (TRT) | LLM (Qwen3-4B-AWQ) | TTS (nano) | Total | Feasible? |
+|----------|-----------|---------------------|------------|-------|-----------|
+| 1 | 3.2 GB | 3.4 GB | 7.2 GB | 13.8 GB | Yes |
+| 3 | 3.2 GB | 3.4 GB | 7.2 GB | 13.8 GB | Yes |
+| 5 | 3.2 GB | 3.4 GB | 7.2 GB | 13.8 GB | Tight (TTS bottleneck) |
+
+STT and TTS VRAM are constant (model weights + fixed KV/graph allocations). LLM KV cache is capped at 0.20 utilization. Concurrency is limited by TTS throughput (RTF 1.0-1.5), not VRAM — TTS is the pipeline bottleneck at high concurrency (8.3x slowdown at 5 sessions).
+
+**24GB GPU (A5000/L4/A10G):** Run Qwen3-8B-AWQ (gpu_memory_utilization=0.35), higher TTS KV cache budget. 8-10 concurrent sessions feasible with TTS batching improvements.
 
 ### Stage 1 Milestones
 
@@ -332,8 +336,43 @@ STT and TTS VRAM is constant (model weights only). LLM VRAM grows with concurren
 | 1.10 | End-to-end integration testing on local GPU | 2 days | 1.9 |
 | 1.11 | Concurrency testing: multi-session VRAM profiling + latency benchmarks | 2 days | 1.10 |
 | 1.12 | Optimization pass: CUDA MPS tuning, TTS staleness dropping, connection pooling | 2 days | 1.11 |
+| 1.13 | Legacy GPU compatibility (SM75 / T4 — TTS `CUDA_COMPUTE_CAP` rebuild, vLLM `--dtype float16`) | 2 days | 1.10 |
+| 1.14 | Example fork repos (demonstrate callback API usage) | 2 days | 1.10 |
+| 1.15 | Auto VRAM allocator + MPS thread balancer (see below) | 3 days | 1.12 |
+| 1.16 | README.md: quickstart, architecture, GPU compatibility matrix, benchmarks, callback API docs | 2 days | 1.15 |
 
-**1.2, 1.3, 1.4, 1.5 can run in parallel.** Total: ~21 days.
+**1.2, 1.3, 1.4, 1.5 can run in parallel. 1.13, 1.14 can run in parallel with 1.12+.** Total: ~28 days.
+
+### 1.15: Auto VRAM Allocator + MPS Thread Balancer
+
+**Goal:** Zero-config GPU resource allocation. On startup, automatically detect available VRAM, calculate minimum model requirements, and allocate budgets to maximise concurrency — no manual tuning of `gpu_memory_utilization` or `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`.
+
+**Startup sequence:**
+1. Query `torch.cuda.mem_get_info()` → total VRAM and current free
+2. Parse model configs (`config.json` + safetensors index) to calculate weight sizes without loading
+3. Apply empirically-profiled overhead factors per process (main: embeddings + speech tokenizer + CUDA graphs, talker: 1.5x for KV cache, predictor: 1.7x for torch.compile)
+4. Compute minimum per-process VRAM floors
+5. Allocate remaining headroom to talker KV cache (determines max concurrent sessions)
+6. Set `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` proportionally based on workload profile (TTS bottleneck gets more threads)
+
+**Empirical calibration data** from `scripts/profile_vram.py`:
+- TTS main process fixed overhead: ~300 MB (speech tokenizer) + ~200 MB (50 CUDA graphs) + embeddings (bf16)
+- Talker: model weights + 1.5x overhead for KV cache + activation memory
+- Predictor: model weights + 15 lm_heads + 15 codec_embeddings + 1.7x overhead for torch.compile L2 cache buffer
+- STT TensorRT: ~3.2 GB (engines + runtime)
+- LLM vLLM: model weights + KV cache (scales with `gpu_memory_utilization`)
+
+**MPS thread allocation** (set per-process at container launch):
+- Calculated by orchestrator before starting containers
+- Written to compose env or passed as container env vars
+- Default profile: TTS 40%, LLM 35%, STT 25% (TTS is the bottleneck)
+- Adaptive: if STT is TensorRT (faster), shift threads to TTS
+
+**Constraints:**
+- Per-process fractions are caps, not pre-allocations — conservative floors are safe
+- VRAM usage isn't fully deterministic (KV cache grows with sequence length, torch.compile spikes)
+- Use a conservative floor (minimum known-good) + proportional allocation of remaining headroom
+- Must handle variable starting conditions (other services may already be loaded)
 
 ---
 

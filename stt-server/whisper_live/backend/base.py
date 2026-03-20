@@ -85,6 +85,8 @@ class ServeClientBase(object):
             Exception: If there is an issue with audio processing or WebSocket communication.
 
         """
+        last_transcribed_samples = 0
+
         while True:
             if self.exit:
                 logging.info("Exiting speech to text thread")
@@ -102,11 +104,18 @@ class ServeClientBase(object):
             epoch = self.buffer_epoch
 
             input_bytes, duration = self.get_audio_chunk_for_processing()
-            if duration < 1.0:
+            if duration < 0.5:
                 time.sleep(0.1)     # wait for audio chunks to arrive
                 continue
             if self.exit:
                 break
+
+            # Skip re-transcription if no new audio has arrived since last pass
+            n_samples = len(input_bytes)
+            if n_samples == last_transcribed_samples:
+                time.sleep(0.1)
+                continue
+
             try:
                 input_sample = input_bytes.copy()
                 result = self.transcribe_audio(input_sample)
@@ -114,11 +123,14 @@ class ServeClientBase(object):
                 # Discard result if buffer was cleared during transcription
                 if self.buffer_epoch != epoch:
                     logging.info(f"[{self.client_uid}] Discarding stale transcription (buffer cleared during processing)")
+                    last_transcribed_samples = 0  # reset on buffer clear
                     continue
+
+                last_transcribed_samples = n_samples
 
                 if result is None or self.language is None:
                     self.timestamp_offset += duration
-                    time.sleep(0.25)    # wait for voice activity, result is None when no voice activity
+                    time.sleep(0.1)     # wait for voice activity
                     continue
                 self.handle_transcription_output(result, duration)
 

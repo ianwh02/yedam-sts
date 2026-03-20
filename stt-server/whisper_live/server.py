@@ -234,7 +234,7 @@ class TranscriptionServer:
                     worker.start()
                     ServeClientTensorRT.BATCH_WORKER = worker
             except Exception as e:
-                logging.error(f"TensorRT-LLM not supported: {e}")
+                logging.error(f"TensorRT-LLM not supported: {e}", exc_info=True)
                 self.client_uid = options["uid"]
                 websocket.send(json.dumps({
                     "uid": self.client_uid,
@@ -391,12 +391,14 @@ class TranscriptionServer:
             return False
 
         if self.backend.is_tensorrt() and hasattr(self, 'vad_detector') and self.use_vad:
-            voice_active = self.voice_activity(websocket, frame_np)
-            if voice_active:
-                client.no_voice_activity_chunks = 0
-                client.set_eos(False)
-            else:
-                return True  # Drop silence frame
+            # Silero VAD requires >= 512 samples at 16kHz; skip VAD for short trailing chunks
+            if len(frame_np) >= 512:
+                voice_active = self.voice_activity(websocket, frame_np)
+                if voice_active:
+                    client.no_voice_activity_chunks = 0
+                    client.set_eos(False)
+                else:
+                    return True  # Drop silence frame
 
         client.add_frames(frame_np)
         return True
@@ -469,6 +471,7 @@ class TranscriptionServer:
             batch_enabled=False,
             batch_max_size=8,
             batch_window_ms=50,
+            beam_size=1,
             vac_enabled=False):
         """
         Run the transcription server.
@@ -500,8 +503,9 @@ class TranscriptionServer:
             self.batch_config = {
                 'max_batch_size': batch_max_size,
                 'batch_window_ms': batch_window_ms,
+                'beam_size': beam_size,
             }
-            logging.info(f"Batch inference enabled (max_batch={batch_max_size}, window={batch_window_ms}ms)")
+            logging.info(f"Batch inference enabled (max_batch={batch_max_size}, window={batch_window_ms}ms, beam={beam_size})")
         else:
             self.batch_config = None
 
@@ -555,72 +559,42 @@ class TranscriptionServer:
                 if response_format not in supported_formats:
                     return JSONResponse({"error": f"Unsupported response_format. Supported: {supported_formats}"}, status_code=400)
 
-                if model != "whisper-1":
-                    logging.warning(f"Model '{model}' requested; using 'small' as fallback.")
-                model_name = faster_whisper_custom_model_path or "small"
-
                 try:
                     suffix = os.path.splitext(file.filename)[1] or ".wav"
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                         shutil.copyfileobj(file.file, tmp)
                         tmp_path = tmp.name
 
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                    compute_type = "float16" if device == "cuda" else "int8"
+                    # Use pre-loaded TRT model if available, else fall back to faster-whisper
+                    from whisper_live.backend.trt_backend import ServeClientTensorRT
+                    if ServeClientTensorRT.SINGLE_MODEL is not None:
+                        trt_model = ServeClientTensorRT.SINGLE_MODEL
+                        mel, duration = trt_model.log_mel_spectrogram(tmp_path)
+                        lang = language or "en"
+                        text_prefix = f"<|startoftranscript|><|{lang}|><|transcribe|><|notimestamps|>"
+                        text = trt_model.transcribe(mel, text_prefix=text_prefix) or ""
+                    else:
+                        model_name = faster_whisper_custom_model_path or "small"
+                        device = "cuda" if torch.cuda.is_available() else "cpu"
+                        compute_type = "float16" if device == "cuda" else "int8"
+                        fw_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+                        segments, info = fw_model.transcribe(
+                            tmp_path, language=language, initial_prompt=prompt,
+                            temperature=temperature, vad_filter=False,
+                            word_timestamps=(timestamp_granularities and "word" in timestamp_granularities)
+                        )
+                        text = " ".join([s.text.strip() for s in segments])
 
-                    transcriber = WhisperModel(model_name, device=device, compute_type=compute_type)
-                    segments, info = transcriber.transcribe(
-                        tmp_path,
-                        language=language,
-                        initial_prompt=prompt,
-                        temperature=temperature,
-                        vad_filter=False,
-                        word_timestamps=(timestamp_granularities and "word" in timestamp_granularities)
-                    )
-
-                    text = " ".join([s.text.strip() for s in segments])
                     os.unlink(tmp_path)
 
                     if response_format == "text":
-                        return PlainTextResponse(text)
+                        return PlainTextResponse(text.strip())
                     elif response_format == "json":
-                        return {"text": text}
-                    elif response_format == "verbose_json":
-                        verbose = {
-                            "task": "transcribe",
-                            "language": info.language,
-                            "duration": info.duration,
-                            "text": text,
-                            "segments": []
-                        }
-                        for seg in segments:
-                            seg_dict = {
-                                "id": seg.id,
-                                "seek": seg.seek,
-                                "start": seg.start,
-                                "end": seg.end,
-                                "text": seg.text.strip(),
-                                "tokens": seg.tokens,
-                                "temperature": seg.temperature,
-                                "avg_logprob": seg.avg_logprob,
-                                "compression_ratio": seg.compression_ratio,
-                                "no_speech_prob": seg.no_speech_prob
-                            }
-                            if timestamp_granularities and "word" in timestamp_granularities:
-                                seg_dict["words"] = [{"word": w.word, "start": w.start, "end": w.end, "probability": w.probability} for w in seg.words]
-                            verbose["segments"].append(seg_dict)
-                        return verbose
-                    elif response_format in ["srt", "vtt"]:
-                        output = []
-                        for i, seg in enumerate(segments, 1):
-                            start = f"{int(seg.start // 3600):02}:{int((seg.start % 3600) // 60):02}:{seg.start % 60:06.3f}"
-                            end = f"{int(seg.end // 3600):02}:{int((seg.end % 3600) // 60):02}:{seg.end % 60:06.3f}"
-                            if response_format == "srt":
-                                output.append(f"{i}\n{start.replace('.', ',')} --> {end.replace('.', ',')}\n{seg.text.strip()}\n")
-                            else:  # vtt
-                                output.append(f"{start} --> {end}\n{seg.text.strip()}\n")
-                        return PlainTextResponse("\n".join(output))
+                        return {"text": text.strip()}
+                    else:
+                        return {"text": text.strip()}
                 except Exception as e:
+                    logging.error(f"REST transcription error: {e}", exc_info=True)
                     return JSONResponse({"error": str(e)}, status_code=500)
 
             threading.Thread(
@@ -630,6 +604,51 @@ class TranscriptionServer:
                 daemon=True
             ).start()
             logging.info(f"✅ OpenAI-Compatible API started on http://0.0.0.0:{rest_port}")
+
+        # Pre-load model and warmup at startup (before accepting connections)
+        if backend == "tensorrt" and whisper_tensorrt_path:
+            try:
+                from whisper_live.backend.trt_backend import ServeClientTensorRT
+                from whisper_live.transcriber.transcriber_tensorrt import WhisperTRTLLM
+                trt_max_batch = (
+                    self.batch_config.get("max_batch_size", 8)
+                    if self.batch_config is not None
+                    else 1
+                )
+                assets_dir = os.environ.get("ASSETS_DIR", "/app/assets")
+                logging.info("Pre-loading TensorRT model at startup...")
+                transcriber = WhisperTRTLLM(
+                    whisper_tensorrt_path,
+                    assets_dir=assets_dir,
+                    device="cuda",
+                    is_multilingual=trt_multilingual,
+                    language="en",
+                    task="transcribe",
+                    use_py_session=trt_py_session,
+                    max_output_len=96,
+                    max_batch_size=trt_max_batch,
+                )
+                # Warmup: run inference to trigger CUDA graph capture
+                warmup_audio = os.path.join(assets_dir, "jfk.flac")
+                logging.info("Warming up TensorRT engine (10 steps)...")
+                mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
+                for _ in range(10):
+                    transcriber.transcribe(mel)
+                logging.info("TensorRT warmup complete.")
+                ServeClientTensorRT.SINGLE_MODEL = transcriber
+
+                # Start batch worker immediately if batch inference is enabled
+                if self.batch_config is not None:
+                    from whisper_live.batch_inference_trt import BatchInferenceTRTWorker
+                    worker = BatchInferenceTRTWorker(
+                        transcriber=transcriber,
+                        **self.batch_config,
+                    )
+                    worker.start()
+                    ServeClientTensorRT.BATCH_WORKER = worker
+                    logging.info("TRT batch inference worker started at startup.")
+            except Exception as e:
+                logging.error(f"Failed to pre-load TensorRT model: {e}", exc_info=True)
 
         # Health check handler — intercepts HTTP requests before WebSocket upgrade
         def process_request(connection, request):

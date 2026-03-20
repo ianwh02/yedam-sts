@@ -85,6 +85,13 @@ if __name__ == "__main__":
         help='Maximum time in ms to wait for batch to fill (default: 50).'
     )
     parser.add_argument(
+        '--beam_size',
+        type=int,
+        default=1,
+        help='Beam size for decoding (default: 1 = greedy). '
+             'Higher values improve accuracy at the cost of latency.'
+    )
+    parser.add_argument(
         '--vac',
         action='store_true',
         help='Enable Voice Activity Controller: server-side silence gating for all backends. '
@@ -120,5 +127,6 @@ if __name__ == "__main__":
         batch_enabled=args.batch_inference,
         batch_max_size=args.batch_max_size,
         batch_window_ms=args.batch_window_ms,
+        beam_size=args.beam_size,
         vac_enabled=args.vac,
     )

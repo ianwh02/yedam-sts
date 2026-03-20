@@ -56,4 +56,6 @@ CMD python -u run_server.py \
     --max_clients 10 \
     --max_connection_time 7200 \
     --batch_inference \
-    --batch_max_size 8
+    --batch_max_size 8 \
+    --batch_window_ms 25 \
+    --beam_size 1

@@ -113,10 +113,12 @@ class BatchInferenceWorker:
         transcriber,
         max_batch_size: int = 8,
         batch_window_ms: int = 50,
+        beam_size: int = 1,
     ):
         self.transcriber = transcriber
         self.max_batch_size = max_batch_size
         self.batch_window_ms = batch_window_ms
+        self.beam_size = beam_size
         self._queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -313,7 +315,7 @@ class BatchInferenceWorker:
             results = self.transcriber.model.generate(
                 encoder_output,
                 prompts,
-                beam_size=5,
+                beam_size=self.beam_size,
                 patience=1,
                 length_penalty=1,
                 max_length=self.transcriber.max_length,

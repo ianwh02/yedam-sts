@@ -32,6 +32,9 @@ TTS_URL = "http://localhost:7860"
 LLM_URL = "http://localhost:8000"
 STT_WS_URL = "ws://localhost:9090"
 
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen3-4B-AWQ")
+# Qwen3 defaults to thinking mode — disable for translation output
+LLM_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 MAX_CONCURRENT_SESSIONS = 5
 
 # Save TTS audio locally for qualitative inspection
@@ -66,17 +69,20 @@ def save_tts_wav(pcm_bytes: bytes, text: str, label: str, sample_rate: int = 240
 
 
 def get_vram_mb() -> dict:
-    """Query nvidia-smi for current VRAM usage."""
-    result = subprocess.run(
-        [
-            "docker", "exec", "yedam-stt", "nvidia-smi",
-            "--query-gpu=memory.used,memory.total,memory.free",
-            "--format=csv,noheader,nounits",
-        ],
-        capture_output=True, text=True, timeout=10,
-    )
-    used, total, free = [int(x.strip()) for x in result.stdout.strip().split(",")]
-    return {"used_mb": used, "total_mb": total, "free_mb": free}
+    """Query nvidia-smi for current VRAM usage (host or container fallback)."""
+    # Try host nvidia-smi first (works on Windows/Linux with drivers installed)
+    for cmd in [
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total,memory.free", "--format=csv,noheader,nounits"],
+        ["docker", "exec", "yedam-stt", "nvidia-smi", "--query-gpu=memory.used,memory.total,memory.free", "--format=csv,noheader,nounits"],
+    ]:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                used, total, free = [int(x.strip()) for x in result.stdout.strip().split(",")]
+                return {"used_mb": used, "total_mb": total, "free_mb": free}
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    raise RuntimeError("Could not query VRAM: nvidia-smi not found on host or in yedam-stt container")
 
 
 def print_vram(label: str, vram: dict):
@@ -201,10 +207,11 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
             resp = await client.post(
                 f"{LLM_URL}/v1/chat/completions",
                 json={
-                    "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+                    "model": LLM_MODEL,
                     "messages": messages,
                     "max_tokens": 50,
                     "temperature": 0.3,
+                    "extra_body": LLM_EXTRA_BODY,
                 },
             )
             t1 = time.perf_counter()
@@ -213,7 +220,7 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
             data = resp.json()
             usage = data.get("usage", {})
             tokens = usage.get("completion_tokens", "?")
-            content = data["choices"][0]["message"]["content"]
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", f"(error: {str(data)[:100]})")
             results.append(LatencyResult(
                 "LLM (total)", total_ms,
                 f"run {i+1}: {tokens} tokens, \"{content[:60]}\"",
@@ -226,11 +233,12 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
                 "POST",
                 f"{LLM_URL}/v1/chat/completions",
                 json={
-                    "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+                    "model": LLM_MODEL,
                     "messages": messages,
                     "max_tokens": 50,
                     "temperature": 0.3,
                     "stream": True,
+                    "extra_body": LLM_EXTRA_BODY,
                 },
             ) as stream:
                 async for line in stream.aiter_lines():
@@ -358,19 +366,20 @@ async def profile_e2e_latency():
             resp = await client.post(
                 f"{LLM_URL}/v1/chat/completions",
                 json={
-                    "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+                    "model": LLM_MODEL,
                     "messages": [
                         {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                         {"role": "user", "content": text_ko},
                     ],
                     "max_tokens": 50,
                     "temperature": 0.3,
+                    "extra_body": LLM_EXTRA_BODY,
                 },
             )
             llm_end = time.perf_counter()
             llm_ms = (llm_end - llm_start) * 1000
 
-            translated = resp.json()["choices"][0]["message"]["content"].strip()
+            translated = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             print(f"    LLM: {fmt_ms(llm_ms)} → \"{translated[:60]}\"")
 
             # Stage 3: TTS synthesis
@@ -434,16 +443,17 @@ async def profile_e2e_concurrent(concurrency_levels: list[int] | None = None):
         resp = await client.post(
             f"{LLM_URL}/v1/chat/completions",
             json={
-                "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+                "model": LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                     {"role": "user", "content": text_ko},
                 ],
                 "max_tokens": 50,
                 "temperature": 0.3,
+                "extra_body": LLM_EXTRA_BODY,
             },
         )
-        translated = resp.json()["choices"][0]["message"]["content"].strip()
+        translated = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
         llm_ms = (time.perf_counter() - llm_t0) * 1000
 
         # TTS synthesize
@@ -538,18 +548,23 @@ async def profile_individual_services():
         resp = await client.post(
             f"{LLM_URL}/v1/chat/completions",
             json={
-                "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
+                "model": LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                     {"role": "user", "content": "오늘 날씨가 정말 좋습니다. 공원에 가서 산책하고 싶습니다."},
                 ],
                 "max_tokens": 50,
                 "temperature": 0.3,
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
             },
         )
         after = get_vram_mb()
         delta = after["used_mb"] - before["used_mb"]
-        content = resp.json()["choices"][0]["message"]["content"]
+        resp_json = resp.json()
+        if "choices" in resp_json:
+            content = resp_json["choices"][0]["message"]["content"]
+        else:
+            content = f"(error: {resp_json.get('message', resp_json.get('detail', str(resp_json)[:120]))})"
         print(f"\n  LLM completion: +{delta} MiB")
         print(f"    Response: {content[:80]}")
         print_vram("After LLM", after)

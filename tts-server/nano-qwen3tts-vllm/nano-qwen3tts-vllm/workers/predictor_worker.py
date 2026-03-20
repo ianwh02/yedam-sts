@@ -57,9 +57,7 @@ def run_predictor_worker(
     from nano_qwen3tts_vllm.interface import _compute_memory_split
     mem_cfg = _compute_memory_split(model_path, gpu_memory_utilization)
     pred_util = mem_cfg["pred_util"]
-    proc_frac = mem_cfg["process_gpu_memory_fraction"]
-    # Leave headroom so KV cache fits: process limit includes non-PyTorch overhead; pred_util=1.0 can OOM.
-    pred_util = min(pred_util, 0.85)
+    proc_frac = mem_cfg.get("predictor_process_fraction", mem_cfg["process_gpu_memory_fraction"])
 
     # Cap this process's GPU memory before loading the model.
     if torch.cuda.is_available():

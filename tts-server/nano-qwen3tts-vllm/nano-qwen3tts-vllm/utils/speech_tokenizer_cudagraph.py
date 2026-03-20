@@ -20,7 +20,7 @@ def _capture_decoder_cudagraphs(decoder, device: str, graph_lengths: List[int]):
     decoder.eval()
     # Warmup
     with torch.inference_mode():
-        _ = decoder(torch.randint(0, 100, (1, 16, 100), device=device))
+        _ = decoder(torch.randint(0, 100, (1, 16, max(graph_lengths)), device=device))
         torch.cuda.synchronize()
 
     decoder.graphs = {}
@@ -86,11 +86,12 @@ class SpeechTokenizerCUDAGraph:
         speech_tokenizer_path = model_path
 
         print(f"Loading speech tokenizer (CUDAGraph) from {speech_tokenizer_path}...")
+        # Load on CPU to avoid transformers caching_allocator_warmup hitting GPU memory cap,
+        # then manually move to GPU in the target dtype.
         self.tokenizer = _Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_path,
-            device_map=device,
         )
-        self.tokenizer.model = self.tokenizer.model.to(dtype)
+        self.tokenizer.model = self.tokenizer.model.to(device=device, dtype=dtype)
         # Decoder uses SnakeBeta with torch.exp() that overflows in bf16
         self.tokenizer.model.decoder = self.tokenizer.model.decoder.to(torch.float32)
 
@@ -124,6 +125,16 @@ class SpeechTokenizerCUDAGraph:
         Returns:
             (wavs, sample_rate).
         """
+        # Ensure codes are on the correct device before upstream decode
+        # (upstream chunked_decode creates chunks that hit our CUDA graph-patched
+        # forward; if codes are on CPU, the fallback path fails with device mismatch)
+        for inp in inputs:
+            codes = inp.get("audio_codes")
+            if codes is not None:
+                if isinstance(codes, list):
+                    inp["audio_codes"] = torch.tensor(codes, dtype=torch.long, device=self.device)
+                elif isinstance(codes, torch.Tensor) and not codes.is_cuda:
+                    inp["audio_codes"] = codes.to(self.device)
         return self.tokenizer.decode(inputs)
 
     @torch.inference_mode()

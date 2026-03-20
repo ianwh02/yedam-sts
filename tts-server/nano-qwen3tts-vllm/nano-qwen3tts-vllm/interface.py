@@ -89,26 +89,24 @@ def _compute_memory_split(
     gpu_memory_utilization: float,
     kvcache_block_size: int = 256,
 ) -> dict:
-    """Compute per-model memory settings so both fit within the user's target.
+    """Compute per-process memory settings so talker, predictor, and main
+    process each get their own VRAM fraction.
 
-    The user passes ONE number (e.g. 0.9 or 0.3) and this function figures out
-    how to split VRAM between Talker and Predictor.
+    The user passes ONE number (e.g. 0.4) representing the TOTAL fraction of
+    GPU memory for all TTS processes combined.  This function splits that
+    budget across 3 OS processes:
+      - main process: embeddings + speech tokenizer (~5% of GPU)
+      - talker worker: talker model + KV cache + CUDA graphs (bulk)
+      - predictor worker: predictor model + KV cache (small)
 
-    Always uses process_gpu_memory_fraction so that each server process only
-    sees its OWN memory via torch.cuda.memory_allocated(), not the whole GPU.
-    This means you can start multiple independent servers on the same GPU
-    (e.g. 2 servers with gpu_memory_utilization=0.3 each) and they just work.
-
-    Strategy:
-      1. Set process_gpu_memory_fraction = gpu_memory_utilization.
-         This gives this process an "effective_total" = total * fraction.
-         The KV cache formula then uses per-process memory accounting.
-      2. Within that budget, calculate talker_util (fraction of effective_total
-         the talker should claim). Predictor gets the rest (pred_util=1.0).
-      3. Both models get an equal number of KV cache blocks.
+    Each process gets its own process_gpu_memory_fraction so that
+    set_per_process_memory_fraction caps it correctly and allocate_kv_cache
+    computes the right number of KV blocks.
 
     Returns:
-        dict with: talker_util, pred_util, process_gpu_memory_fraction
+        dict with: talker_util, talker_process_fraction,
+                   pred_util, predictor_process_fraction,
+                   main_process_fraction, process_gpu_memory_fraction (legacy)
     """
     with open(os.path.join(model_path, "config.json"), "r") as f:
         raw_cfg = json.load(f)
@@ -128,72 +126,89 @@ def _compute_memory_split(
     talker_weight_bytes += text_vocab * text_hidden * dtype_bytes  # text embedding
     talker_weight_bytes += text_hidden * talker_cfg.hidden_size * dtype_bytes  # text projection
 
-    # ── Overhead factor for CUDA graphs, activations, fragmentation ──
-    overhead_factor = 1.5
+    # Predictor has (num_code_groups - 1) lm_head projections + codec_embeddings
+    # that _estimate_model_params doesn't count
+    n_code_groups = getattr(pred_cfg, 'num_code_groups', 16)
+    n_extra = n_code_groups - 1  # 15 for default config
+    pred_lm_heads = n_extra * pred_cfg.hidden_size * pred_cfg.vocab_size * dtype_bytes
+    pred_codec_emb = n_extra * pred_cfg.vocab_size * talker_cfg.hidden_size * dtype_bytes
+    pred_weight_bytes += pred_lm_heads + pred_codec_emb
 
-    talker_fixed = int(talker_weight_bytes * overhead_factor)
-    pred_fixed = int(pred_weight_bytes * overhead_factor)
+    # ── Overhead factor for CUDA graphs, activations, fragmentation ──
+    talker_overhead = 1.5
+    pred_overhead = 1.7  # higher: torch.compile autotuning allocates L2 cache buffer (~32 MiB)
+
+    talker_fixed = int(talker_weight_bytes * talker_overhead)
+    pred_fixed = int(pred_weight_bytes * pred_overhead)
 
     # ── KV block sizes ──
     kv_block_talker = _kv_block_bytes(talker_cfg, kvcache_block_size, dtype_bytes)
     kv_block_pred = _kv_block_bytes(pred_cfg, kvcache_block_size, dtype_bytes)
 
-    # ── Budget ──
-    # process_gpu_memory_fraction = gpu_memory_utilization
-    # → effective_total = total * gpu_memory_utilization (this process's VRAM cap)
-    # → allocate_kv_cache uses torch.cuda.memory_allocated() (per-process only)
-    # This is what makes multiple independent servers on the same GPU work.
     total_vram = torch.cuda.get_device_properties(0).total_memory
-    process_fraction = gpu_memory_utilization
-    effective_total = total_vram * process_fraction
+    effective_total = total_vram * gpu_memory_utilization
 
-    # ── KV cache budget (what's left after models within this process's share) ──
-    kv_budget = effective_total - talker_fixed - pred_fixed
+    # ── Reserve for main process (embeddings ~672 MB + speech tokenizer ~648 MB + CUDA graphs ~500 MB) ──
+    main_reserve = 0.15 * total_vram  # ~2.57 GB on 17.1 GB GPU
+    worker_budget = effective_total - main_reserve
+
+    # ── KV cache budget (what's left after models within worker budget) ──
+    kv_budget = worker_budget - talker_fixed - pred_fixed
     if kv_budget <= 0:
         logger.warning(
             f"[memory_split] Model weights ({(talker_fixed + pred_fixed) / 1e9:.2f} GB) "
-            f"exceed budget ({effective_total / 1e9:.2f} GB). Using minimum KV cache."
+            f"exceed worker budget ({worker_budget / 1e9:.2f} GB). Using minimum KV cache."
         )
-        talker_util = max(0.05, (talker_fixed + kv_block_talker) / effective_total)
-        return {
-            "talker_util": talker_util,
-            "pred_util": 1.0,
-            "process_gpu_memory_fraction": process_fraction,
-        }
+        kv_budget = (kv_block_talker + kv_block_pred)  # at least 1 block each
 
     # ── Equal blocks: N = kv_budget / (block_talker + block_pred) ──
-    n_blocks = kv_budget / (kv_block_talker + kv_block_pred)
+    n_blocks = max(1, int(kv_budget / (kv_block_talker + kv_block_pred)))
     talker_kv_bytes = n_blocks * kv_block_talker
+    pred_kv_bytes = n_blocks * kv_block_pred
 
-    # ── Talker's share as fraction of effective_total ──
-    # KV formula: effective_total * talker_util - talker_model_stuff
-    # → talker_util = (talker_model_stuff + talker_kv) / effective_total
-    talker_util = (talker_fixed + talker_kv_bytes) / effective_total
-    talker_util = max(0.05, min(talker_util, 0.95))
+    # ── Per-process VRAM needs ──
+    talker_total = talker_fixed + talker_kv_bytes
+    pred_total = pred_fixed + pred_kv_bytes
 
-    # Predictor uses util=1.0 → claims up to effective_total minus everything already used
-    pred_util = 1.0
+    # ── Convert to fractions of total GPU, with 10% headroom per worker ──
+    talker_process_fraction = min(0.95, (talker_total / total_vram) * 1.1)
+    predictor_process_fraction = min(0.95, (pred_total / total_vram) * 1.1)
+    main_process_fraction = 0.15
+
+    # Within each process, use 0.90 of the process budget (10% headroom for fragmentation)
+    talker_util = 0.90
+    pred_util = 0.90
 
     logger.info(
         f"[memory_split] GPU total={total_vram / 1e9:.1f} GB, "
-        f"process_fraction={process_fraction:.2f} "
-        f"({effective_total / 1e9:.1f} GB for this instance)\n"
+        f"user budget={gpu_memory_utilization:.2f} "
+        f"({effective_total / 1e9:.1f} GB total TTS)\n"
+        f"  Main process: fraction={main_process_fraction:.3f} "
+        f"({main_process_fraction * total_vram / 1e6:.0f} MB)\n"
         f"  Talker: weights~{talker_weight_bytes / 1e6:.0f} MB, "
         f"kv_block={kv_block_talker / 1024:.0f} KB, "
-        f"util={talker_util:.3f}\n"
+        f"fraction={talker_process_fraction:.3f} "
+        f"({talker_total / 1e6:.0f} MB), util={talker_util}\n"
         f"  Predictor: weights~{pred_weight_bytes / 1e6:.0f} MB, "
         f"kv_block={kv_block_pred / 1024:.0f} KB, "
-        f"util={pred_util:.3f} (claims rest)\n"
+        f"fraction={predictor_process_fraction:.3f} "
+        f"({pred_total / 1e6:.0f} MB), util={pred_util}\n"
         f"  KV budget: {kv_budget / 1e6:.0f} MB → "
-        f"{int(n_blocks)} blocks each "
-        f"(talker {int(n_blocks) * kv_block_talker / 1e6:.0f} MB + "
-        f"pred {int(n_blocks) * kv_block_pred / 1e6:.0f} MB)"
+        f"{n_blocks} blocks each "
+        f"(talker {talker_kv_bytes / 1e6:.0f} MB + "
+        f"pred {pred_kv_bytes / 1e6:.0f} MB)\n"
+        f"  Total fractions: {main_process_fraction + talker_process_fraction + predictor_process_fraction:.3f} "
+        f"(main {main_process_fraction:.3f} + talker {talker_process_fraction:.3f} + "
+        f"pred {predictor_process_fraction:.3f})"
     )
 
     return {
         "talker_util": talker_util,
         "pred_util": pred_util,
-        "process_gpu_memory_fraction": process_fraction,
+        "process_gpu_memory_fraction": gpu_memory_utilization,  # legacy (unused by patched code)
+        "main_process_fraction": main_process_fraction,
+        "talker_process_fraction": talker_process_fraction,
+        "predictor_process_fraction": predictor_process_fraction,
     }
 
 
@@ -351,9 +366,10 @@ class Qwen3TTSInterface:
 
         # ── Smart memory split ──
         mem_cfg = _compute_memory_split(model_path, gpu_memory_utilization)
-        proc_frac = mem_cfg["process_gpu_memory_fraction"]
+        proc_frac = mem_cfg.get("main_process_fraction", mem_cfg["process_gpu_memory_fraction"])
 
         # Cap this process's GPU memory before any model load.
+        # Main process only holds embeddings + speech tokenizer — small fraction.
         if torch.cuda.is_available():
             try:
                 set_frac = getattr(torch.cuda, "set_per_process_memory_fraction", None) or getattr(
@@ -361,7 +377,7 @@ class Qwen3TTSInterface:
                 )
                 if set_frac is not None:
                     set_frac(proc_frac, 0)
-                    logger.info(f"[memory] set_per_process_memory_fraction({proc_frac}) on device 0")
+                    logger.info(f"[memory] set_per_process_memory_fraction({proc_frac}) on device 0 (main process)")
             except Exception as e:
                 logger.warning(f"[memory] set_per_process_memory_fraction failed: {e}")
 

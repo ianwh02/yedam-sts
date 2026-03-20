@@ -95,13 +95,13 @@ def load_embeddings_only(model_path: str, device: str = "cpu"):
     pred_emb = _PredictorCodecOnly()
     pred_emb.load_state_dict(predictor_sd, strict=False)
 
-    # Move to device
+    # Move to device in bf16 (nn.Embedding defaults to float32 which doubles GPU usage)
     d = torch.device(device)
-    model_config = model_config
-    text_embedding = talker_emb.model.text_embedding.to(d)
-    input_embedding = talker_emb.model.codec_embedding.to(d)
-    text_projection = talker_emb.text_projection.to(d)
-    predictor_input_embeddings = pred_emb.model.codec_embedding.to(d)
+    dtype = torch.bfloat16
+    text_embedding = talker_emb.model.text_embedding.to(device=d, dtype=dtype)
+    input_embedding = talker_emb.model.codec_embedding.to(device=d, dtype=dtype)
+    text_projection = talker_emb.text_projection.to(device=d, dtype=dtype)
+    predictor_input_embeddings = pred_emb.model.codec_embedding.to(device=d, dtype=dtype)
 
     return (
         model_config,

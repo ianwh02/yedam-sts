@@ -247,15 +247,13 @@ def start_multiprocess_engines(
     from nano_qwen3tts_vllm.workers.talker_worker import run_talker_worker
     from nano_qwen3tts_vllm.workers.predictor_worker import run_predictor_worker
 
-    # Split user's GPU_MEMORY_UTILIZATION between the two workers (e.g. 0.3 → 0.15 each).
-    per_worker_util = gpu_memory_utilization / 2.0
-
+    # Pass full budget to each worker — _compute_memory_split computes per-process fractions.
     ctx_spawn = mp.get_context("spawn")
     talker_proc = ctx_spawn.Process(
         target=run_talker_worker,
         args=(addrs["talker_command"], addrs["talker_result"], model_path),
         kwargs=dict(
-            gpu_memory_utilization=per_worker_util,
+            gpu_memory_utilization=gpu_memory_utilization,
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
         ),
@@ -264,7 +262,7 @@ def start_multiprocess_engines(
         target=run_predictor_worker,
         args=(addrs["predictor_command"], addrs["predictor_result"], model_path),
         kwargs=dict(
-            gpu_memory_utilization=per_worker_util,
+            gpu_memory_utilization=gpu_memory_utilization,
             enforce_eager=enforce_eager,
             tensor_parallel_size=tensor_parallel_size,
         ),

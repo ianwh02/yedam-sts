@@ -57,15 +57,13 @@ def run_talker_worker(
     if zmq is None:
         raise ImportError("pyzmq is required for talker worker. pip install pyzmq")
 
-    # Memory split: worker only loads talker, use same split logic to get talker_util and proc_frac
+    # Memory split: worker only loads talker, use per-process fraction
     from nano_qwen3tts_vllm.interface import _compute_memory_split
     mem_cfg = _compute_memory_split(model_path, gpu_memory_utilization)
     talker_util = mem_cfg["talker_util"]
-    proc_frac = mem_cfg["process_gpu_memory_fraction"]
-    # Leave headroom so KV cache fits (non-PyTorch overhead + fragmentation).
-    talker_util = min(talker_util, 0.85)
+    proc_frac = mem_cfg.get("talker_process_fraction", mem_cfg["process_gpu_memory_fraction"])
 
-    # Cap this process's GPU memory before loading the model (so e.g. 0.3 = at most 30% of GPU).
+    # Cap this process's GPU memory before loading the model.
     if torch.cuda.is_available():
         try:
             set_frac = getattr(torch.cuda, "set_per_process_memory_fraction", None) or getattr(

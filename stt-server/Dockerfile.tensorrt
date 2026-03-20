@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+# WhisperLive TensorRT-LLM STT Server for yedam-sts
+# Target: RTX 5060 Ti 16GB (SM 120 Blackwell)
+#
+# Uses NGC release container (TRT-LLM pre-installed, sm_120 supported).
+# TRT engines are architecture-specific and built on first startup.
+#
+# Build: docker compose -f docker-compose.yml -f docker-compose.tensorrt.yml build stt
+# Run:   docker compose -f docker-compose.yml -f docker-compose.tensorrt.yml up
+
+FROM nvcr.io/nvidia/tensorrt-llm/release:1.2.0
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Install curl for healthcheck (may already be present in NGC image)
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Whisper examples (convert_checkpoint.py + build scripts)
+# Path changed in TRT-LLM 1.x: examples/whisper -> examples/models/core/whisper
+RUN if [ -d /app/tensorrt_llm/examples/models/core/whisper ]; then \
+        cp -r /app/tensorrt_llm/examples/models/core/whisper /app/trt-whisper-examples; \
+    elif [ -d /opt/tensorrt_llm/examples/models/core/whisper ]; then \
+        cp -r /opt/tensorrt_llm/examples/models/core/whisper /app/trt-whisper-examples; \
+    else \
+        echo "TRT-LLM Whisper examples not found in container, cloning from GitHub..." && \
+        git clone -b v1.2.0 --depth 1 --sparse https://github.com/NVIDIA/TensorRT-LLM.git /tmp/trtllm && \
+        cd /tmp/trtllm && git sparse-checkout set examples/models/core/whisper && \
+        mv /tmp/trtllm/examples/models/core/whisper /app/trt-whisper-examples && \
+        rm -rf /tmp/trtllm; \
+    fi
+
+# Download mel_filters.npz + warmup audio
+RUN mkdir -p /app/assets && \
+    wget -q -P /app/assets/ \
+    https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz && \
+    wget -q -O /app/assets/jfk.flac \
+    https://raw.githubusercontent.com/openai/whisper/main/tests/jfk.flac
+
+# Python deps for WhisperLive server
+# Note: torch, tensorrt_llm already installed in NGC base image
+COPY requirements.tensorrt.txt .
+RUN pip install --no-cache-dir -r requirements.tensorrt.txt
+
+# Copy WhisperLive source
+COPY whisper_live/ ./whisper_live/
+COPY run_server.py .
+
+# Copy model conversion script + entrypoint
+COPY convert_model.sh .
+COPY entrypoint.tensorrt.sh .
+RUN chmod +x convert_model.sh entrypoint.tensorrt.sh
+
+EXPOSE 9090
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=10 --start-period=300s \
+    CMD curl -f http://localhost:9090/health || exit 1
+
+ENTRYPOINT ["./entrypoint.tensorrt.sh"]

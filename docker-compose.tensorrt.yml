@@ -1,0 +1,47 @@
+# docker-compose.tensorrt.yml
+# Override file that replaces the STT service with TensorRT backend.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.tensorrt.yml up
+#
+# NOTE: First startup takes ~10-15 minutes to build TRT engines.
+# Engines are cached in the trt_engines named volume for subsequent starts.
+# To rebuild engines (e.g. after model change): docker volume rm yedam-sts_trt_engines
+
+services:
+  stt:
+    build:
+      context: ./stt-server
+      dockerfile: Dockerfile.tensorrt
+    container_name: yedam-stt-trt
+    restart: unless-stopped
+    depends_on:
+      llm:
+        condition: service_healthy
+    environment:
+      - OMP_NUM_THREADS=${WHISPER_OMP_NUM_THREADS:-4}
+      - WHISPER_MODEL=${WHISPER_TRT_MODEL:-large-v3-turbo}
+      - ENGINE_DIR=/app/engines
+      - ASSETS_DIR=/app/assets
+      - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+      - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${STT_MPS_THREAD_PCT:-30}
+    volumes:
+      - trt_engines:/app/engines
+      - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
+    expose:
+      - "9090"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 600s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: '2g'
+
+volumes:
+  trt_engines:

@@ -13,9 +13,6 @@ services:
       dockerfile: Dockerfile.tensorrt
     container_name: yedam-stt-trt
     restart: unless-stopped
-    depends_on:
-      llm:
-        condition: service_healthy
     environment:
       - OMP_NUM_THREADS=${WHISPER_OMP_NUM_THREADS:-4}
       - WHISPER_MODEL=${WHISPER_TRT_MODEL:-large-v3-turbo}
@@ -23,6 +20,10 @@ services:
       - ASSETS_DIR=/app/assets
       - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
       - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${STT_MPS_THREAD_PCT:-30}
+      - PMIX_MCA_gds_ds21_lock_on=0
+      - OMPI_MCA_btl_vader_single_copy_mechanism=none
+      - STT_KV_CACHE_FREE_GPU_FRACTION=${STT_KV_CACHE_FREE_GPU_FRACTION:-0.05}
+      - STT_DEFER_KV_CACHE=1
     volumes:
       - trt_engines:/app/engines
       - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
@@ -30,10 +31,10 @@ services:
       - "9090"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
-      retries: 10
-      start_period: 600s
+      retries: 60
+      start_period: 30s
     deploy:
       resources:
         reservations:
@@ -41,7 +42,7 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    shm_size: '2g'
+    shm_size: '16g'
 
 volumes:
   trt_engines:

@@ -338,41 +338,69 @@ STT and TTS VRAM are constant (model weights + fixed KV/graph allocations). LLM 
 | 1.12 | Optimization pass: CUDA MPS tuning, TTS staleness dropping, connection pooling | 2 days | 1.11 |
 | 1.13 | Legacy GPU compatibility (SM75 / T4 — TTS `CUDA_COMPUTE_CAP` rebuild, vLLM `--dtype float16`) | 2 days | 1.10 |
 | 1.14 | Example fork repos (demonstrate callback API usage) | 2 days | 1.10 |
-| 1.15 | Auto VRAM allocator + MPS thread balancer (see below) | 3 days | 1.12 |
-| 1.16 | README.md: quickstart, architecture, GPU compatibility matrix, benchmarks, callback API docs | 2 days | 1.15 |
+| 1.15 | VRAM budget system (`vram_budget.yml` + `scripts/vram_budget.py` + `start.sh`) | 3 days | 1.12 |
+| 1.16 | Per-service KV cache vs concurrency benchmarks (see below) | 2 days | 1.15 |
+| 1.17 | README.md: quickstart, architecture, GPU compatibility matrix, benchmarks, callback API docs | 2 days | 1.16 |
 
 **1.2, 1.3, 1.4, 1.5 can run in parallel. 1.13, 1.14 can run in parallel with 1.12+.** Total: ~28 days.
 
-### 1.15: Auto VRAM Allocator + MPS Thread Balancer
+### 1.15: VRAM Budget System (implemented)
 
-**Goal:** Zero-config GPU resource allocation. On startup, automatically detect available VRAM, calculate minimum model requirements, and allocate budgets to maximise concurrency — no manual tuning of `gpu_memory_utilization` or `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`.
+**Status:** In progress. Core system working, tuning `fixed_mb` values from measured data.
 
-**Startup sequence:**
-1. Query `torch.cuda.mem_get_info()` → total VRAM and current free
-2. Parse model configs (`config.json` + safetensors index) to calculate weight sizes without loading
-3. Apply empirically-profiled overhead factors per process (main: embeddings + speech tokenizer + CUDA graphs, talker: 1.5x for KV cache, predictor: 1.7x for torch.compile)
-4. Compute minimum per-process VRAM floors
-5. Allocate remaining headroom to talker KV cache (determines max concurrent sessions)
-6. Set `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` proportionally based on workload profile (TTS bottleneck gets more threads)
+Single source of truth: `vram_budget.yml` → `scripts/vram_budget.py` computes per-service env vars → `scripts/start.sh` passes them to docker-compose. Two-tier model: fixed costs (weights + CUDA context + graphs) allocated first, then variable KV cache distributed from remaining VRAM by priority weight.
 
-**Empirical calibration data** from `scripts/profile_vram.py`:
-- TTS main process fixed overhead: ~300 MB (speech tokenizer) + ~200 MB (50 CUDA graphs) + embeddings (bf16)
-- Talker: model weights + 1.5x overhead for KV cache + activation memory
-- Predictor: model weights + 15 lm_heads + 15 codec_embeddings + 1.7x overhead for torch.compile L2 cache buffer
-- STT TensorRT: ~3.2 GB (engines + runtime)
-- LLM vLLM: model weights + KV cache (scales with `gpu_memory_utilization`)
+- Auto-detects GPU size via nvidia-smi, works across any GPU (16 GB to 80 GB)
+- LLM must start first (`depends_on`) since vLLM validates free VRAM at startup
+- TTS accepts absolute byte budget (`TTS_VRAM_BUDGET_MB`) instead of fraction-of-total
+- `set_per_process_memory_fraction` disabled on shared GPU (gated behind `TTS_ENABLE_PROCESS_MEMORY_CAP`)
 
-**MPS thread allocation** (set per-process at container launch):
-- Calculated by orchestrator before starting containers
-- Written to compose env or passed as container env vars
+### 1.16: Per-Service KV Cache vs Concurrency Benchmarks
+
+**Goal:** Empirically measure each service's relationship between KV cache allocation and concurrency, so priority weights and `fixed_mb` values in `vram_budget.yml` are data-driven instead of estimated.
+
+**Test methodology:** For each service in isolation, vary KV cache size and concurrent load, measure throughput + latency + VRAM. Find the point where adding more KV cache stops helping (GPU compute becomes the bottleneck, not memory).
+
+**Per-service measurements:**
+
+| Metric | What it tells us |
+|--------|-----------------|
+| KV cache blocks → max concurrent sessions | How many sessions fit before "no free blocks" |
+| Avg GPU compute time per inference step | How fast the service cycles through queued requests |
+| Latency at N concurrent sessions | Where degradation starts (the "knee" of the curve) |
+| VRAM at N concurrent sessions over time | Verify no memory leak / unbounded growth |
+
+**Test plan:**
+1. **TTS (priority 3):** Run in isolation with varying `TTS_VRAM_BUDGET_MB`. Send N concurrent TTS requests with realistic text lengths. Measure: time-to-first-audio, total generation time, KV blocks used per session, peak VRAM. TTS has 3 CUDA processes (main + talker + predictor), so measure which subprocess saturates first.
+2. **LLM (priority 1):** Run vLLM with varying `--gpu-memory-utilization`. Send N concurrent chat completions with realistic prompt lengths. Measure: tokens/sec, TTFT, KV cache utilization (vLLM reports this via `/metrics`). With short context (512 tokens) and 8 max seqs, LLM is likely compute-bound, not memory-bound — data will confirm.
+3. **STT (priority 1):** Run with varying KV cache allocation. Stream N concurrent audio sessions. Measure: transcription latency, batch utilization (WhisperLive BatchInferenceWorker), VRAM. STT processes audio in chunks so memory should be near-constant regardless of sessions.
+4. **Full pipeline:** Re-run `scripts/profile_vram.py` with optimised budget. Compare against baseline from milestone 1.11 (5 sessions at 875 MiB free).
+
+**Expected outcomes:**
+- Data-driven `variable_priority` weights (replace current 1:1:3 guess)
+- Measured `fixed_mb` values (replace current estimates with observed startup VRAM)
+- Maximum safe concurrent sessions per GPU tier (16 GB / 24 GB / 48 GB)
+- Identification of which service is the true bottleneck at each concurrency level
+
+**Extends:** `scripts/profile_vram.py` with per-service isolation mode and KV cache sweep parameters.
+
+### vLLM Fork: Deferred KV Cache Allocation (future, post-1.16)
+
+Fork vLLM from a stable release tag and add a single patch: deferred KV cache allocation via HTTP signal, matching the two-phase startup protocol used by TTS and STT. This gives the coordinator full control over all three services' VRAM allocation.
+
+**Why this matters:** vLLM computes available KV cache as `(gpu_memory_utilization × total) - (total - free)`. The `(total - free)` term includes ALL processes on the GPU, not just vLLM's own. This means vLLM must start first and finish before TTS/STT load weights — otherwise it sees their VRAM against its budget and OOMs. With deferred allocation, all three services could load weights truly in parallel, and the coordinator distributes KV cache after measuring actual free VRAM.
+
+- **Patch scope:** ~50 lines in vLLM's engine startup to support `--defer-kv-cache` flag
+- **Benefit:** Fully parallel startup (all three load weights simultaneously), coordinator controls all KV allocation, eliminates LLM-first ordering constraint
+- **Maintenance:** Pin to a release tag, rebase only when needed (new model support, security fix). Expect 6-12 month update cadence.
+- **Build:** Custom Docker image pushed to GHCR, replaces `vllm/vllm-openai:latest` in docker-compose
+
+### MPS Thread Balancer (future, post-1.16)
+
+MPS thread allocation (`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`) can be tuned using 1.16 benchmark data:
 - Default profile: TTS 40%, LLM 35%, STT 25% (TTS is the bottleneck)
 - Adaptive: if STT is TensorRT (faster), shift threads to TTS
-
-**Constraints:**
-- Per-process fractions are caps, not pre-allocations — conservative floors are safe
-- VRAM usage isn't fully deterministic (KV cache grows with sequence length, torch.compile spikes)
-- Use a conservative floor (minimum known-good) + proportional allocation of remaining headroom
-- Must handle variable starting conditions (other services may already be loaded)
+- Data from 1.16 shows which service is compute-bound vs memory-bound, informing thread allocation
 
 ---
 
@@ -470,8 +498,39 @@ RunPod Serverless is NOT a fit — stateless request-response, doesn't support l
 
 **Architecture: Single Container + Network Volume**
 - RunPod pods run ONE container — bundle all 4 services (STT, LLM, TTS, orchestrator) into a single Docker image using `supervisord` to manage processes
-- **Network Volume** (~50GB, ~$3.50/month) persists model weights across pod creates/destroys — no re-downloading 10+GB of models on each cold start
-- Cold start with network volume: ~2-3 min (image pull + volume mount + VRAM load)
+- **Network Volume** (~10 GB, ~$0.70/month) persists TRT engines only — model weights baked into images
+- Pod disk is ephemeral — destroyed on terminate, rebuilt from image pull on every cold start
+
+**Image Build & Distribution Strategy:**
+- **Build locally** on dev machine (one-time, needs ~150 GB scratch space) — aggressive build cache cleanup between each service
+- **Push to container registry** (GHCR, free for public repos) — Docker images are GPU-architecture-portable (PyTorch ships multi-SM-arch fat binaries), so images built on an RTX 5060 Ti run on T4/A100/H100
+- **RunPod pulls from registry** on every cold start — no pre-baked disk snapshots, no build step on GPU pods
+- Images slimmed via multi-stage `FROM scratch` squash (e.g., TRT base reduced from 59 GB to ~42 GB)
+- To update: rebuild locally, `docker push`, next pod create pulls the new version automatically
+
+**Cold Start Flow:**
+```
+Pod create (RunPod REST API)
+  → Pull images from GHCR (~100 GB total, ~2 min on RunPod network)
+  → Mount network volume (TRT engines cached from prior boot)
+  → scripts/start.sh auto-detects GPU, computes VRAM budget
+  → Services start: LLM first (needs free VRAM), then STT + TTS in parallel
+  → CUDA graph warmup (~30 sec)
+  → Ready to accept connections
+```
+
+**VRAM budget auto-detection** — `scripts/vram_budget.py` queries the assigned GPU (T4/A100/H100), computes per-service allocations from `vram_budget.yml`, writes `.env.vram`. No manual tuning per GPU type.
+
+| Cold Start Scenario | Time | Notes |
+|---------------------|------|-------|
+| First boot on new GPU type (TRT engine build) | ~15 min | One-time per GPU architecture, engines cached on network volume |
+| Subsequent cold starts (cached TRT engines) | ~3 min | Pod provisioning + image pull + volume mount + service startup + warmup |
+
+| Storage | Cost | Persists? |
+|---------|------|-----------|
+| Container registry (GHCR public) | Free | Yes |
+| Network volume (TRT engines) | ~$0.70/month (10 GB) | Yes (across pod creates/destroys) |
+| Pod disk | Included in pod price | No (destroyed on terminate) |
 
 **Pod Lifecycle via RunPod REST API** (`https://rest.runpod.io/v1`):
 ```

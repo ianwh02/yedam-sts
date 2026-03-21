@@ -48,9 +48,7 @@ class LLMClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": True,
-            "extra_body": {
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         async with self._client.stream(

@@ -9,9 +9,6 @@ services:
         - HF_TOKEN=${HF_TOKEN:-}
     container_name: yedam-stt
     restart: unless-stopped
-    depends_on:
-      llm:
-        condition: service_healthy
     environment:
       - OMP_NUM_THREADS=${WHISPER_OMP_NUM_THREADS:-4}
       - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-int8_float16}
@@ -23,10 +20,10 @@ services:
       - "9090"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
-      retries: 10
-      start_period: 180s
+      retries: 30
+      start_period: 30s
     deploy:
       resources:
         reservations:
@@ -87,19 +84,17 @@ services:
         - HF_TOKEN=${HF_TOKEN:-}
     container_name: yedam-tts
     restart: unless-stopped
-    depends_on:
-      llm:
-        condition: service_healthy
     environment:
       - MODEL_DIR=${TTS_MODEL_DIR:-/app/models/Qwen3-TTS-12Hz-0.6B-Base}
       - TOKENIZER_DIR=/app/models/Qwen3-TTS-Tokenizer-12Hz
-      - GPU_MEMORY_UTILIZATION=${TTS_GPU_MEMORY_UTILIZATION:-0.35}
+      - TTS_VRAM_BUDGET_MB=${TTS_VRAM_BUDGET_MB:-}
       - PORT=7860
       - REF_AUDIO_PATH_EN=${REF_AUDIO_PATH_EN:-/app/ref_audio/en.wav}
       - REF_TEXT_EN=${REF_TEXT_EN:-Hello I'm recording a test audio to clone my own voice um to qwen tts nano}
       - REF_AUDIO_PATH_KO=${REF_AUDIO_PATH_KO:-}
       - REF_TEXT_KO=${REF_TEXT_KO:-}
       - X_VECTOR_ONLY=${X_VECTOR_ONLY:-0}
+      - TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
       - MAX_MODEL_LEN=${MAX_MODEL_LEN:-2048}
       - DECODE_COLLECT_MS=${DECODE_COLLECT_MS:-40}
       - TTS_TALKER_TEMPERATURE=${TTS_TALKER_TEMPERATURE:-0.8}
@@ -127,10 +122,10 @@ services:
       - "${TTS_PORT:-7860}:7860"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7860/health"]
-      interval: 30s
+      interval: 10s
       timeout: 10s
-      retries: 5
-      start_period: 180s
+      retries: 30
+      start_period: 30s
     deploy:
       resources:
         reservations:
@@ -158,10 +153,5 @@ services:
       - STT_INITIAL_PROMPT_SEGMENTS=${STT_INITIAL_PROMPT_SEGMENTS:-3}
     ports:
       - "${ORCHESTRATOR_PORT:-8080}:8080"
-    depends_on:
-      stt:
-        condition: service_healthy
-      llm:
-        condition: service_healthy
-      tts:
-        condition: service_healthy
+    # No depends_on — start.sh handles startup ordering:
+    # LLM → TTS+STT (parallel) → coordinator → orchestrator

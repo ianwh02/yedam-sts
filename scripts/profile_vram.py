@@ -211,7 +211,7 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
                     "messages": messages,
                     "max_tokens": 50,
                     "temperature": 0.3,
-                    "extra_body": LLM_EXTRA_BODY,
+                    **LLM_EXTRA_BODY,
                 },
             )
             t1 = time.perf_counter()
@@ -238,7 +238,7 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
                     "max_tokens": 50,
                     "temperature": 0.3,
                     "stream": True,
-                    "extra_body": LLM_EXTRA_BODY,
+                    **LLM_EXTRA_BODY,
                 },
             ) as stream:
                 async for line in stream.aiter_lines():
@@ -373,7 +373,7 @@ async def profile_e2e_latency():
                     ],
                     "max_tokens": 50,
                     "temperature": 0.3,
-                    "extra_body": LLM_EXTRA_BODY,
+                    **LLM_EXTRA_BODY,
                 },
             )
             llm_end = time.perf_counter()
@@ -450,7 +450,7 @@ async def profile_e2e_concurrent(concurrency_levels: list[int] | None = None):
                 ],
                 "max_tokens": 50,
                 "temperature": 0.3,
-                "extra_body": LLM_EXTRA_BODY,
+                **LLM_EXTRA_BODY,
             },
         )
         translated = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
@@ -555,7 +555,7 @@ async def profile_individual_services():
                 ],
                 "max_tokens": 50,
                 "temperature": 0.3,
-                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         )
         after = get_vram_mb()

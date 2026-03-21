@@ -34,8 +34,8 @@ class PredictorModelRunner(ModelRunner):
         self.model = self.load_model(config)
         self.graphs_prefill = {}  # set before post_init; warmup_model() may call run_model()
         self.post_init(rank)
-        if not config.enforce_eager:
-            self.capture_cudagraph_prefill()
+        # KV cache + CUDA graphs deferred to complete_init() — called by worker
+        # after coordinator assigns VRAM budget.
 
     def load_model(self, config: Config):
         with open(os.path.join(config.model, "config.json"), "r") as f:

@@ -156,6 +156,9 @@ _mp_decoder_process: mp.Process = None
 # Cached warmup codec frames from startup speech generation (last N frames of real speech)
 _warmup_codec_frames: list | None = None
 
+# Two-phase startup status: "loading" → "weights_ready" → "ready"
+_server_status: str = "loading"
+
 # Per-session decoder context cache: session_id -> (last_codec_frames, last_access_time)
 _session_codec_cache: dict[str, tuple[list, float]] = {}
 SESSION_CODEC_TTL = float(os.environ.get("SESSION_CODEC_TTL", "300"))  # 5 minutes
@@ -689,43 +692,11 @@ async def lifespan(app: FastAPI):
     _decode_queue = asyncio.Queue()
     _decode_worker_task = asyncio.create_task(_decode_worker_loop())
 
-    # Warmup: batch=1 then batch=2 to compile CUDA kernels for various batch sizes.
-    # First pass also captures codec frames for decoder warmup context.
-    global _warmup_codec_frames
-
-    async def _warmup_one(capture_codes: bool = False) -> list | None:
-        codes = [] if capture_codes else None
-        try:
-            async for chunk in _generate_speech_stream("Hello, warmup.", "English", DEFAULT_SPEAKER):
-                pass
-        except Exception as e:
-            logger.warning("[warmup] error (non-fatal): %s", e)
-        # Capture codec frames via a separate non-streaming generation.
-        # Use a longer sentence so the decoder is fully warmed by the tail frames.
-        if capture_codes:
-            try:
-                gen = interface.generate_custom_voice_async(
-                    text="The quick brown fox jumps over the lazy dog near the river bank.",
-                    language="English", speaker=DEFAULT_SPEAKER,
-                )
-                async for audio_code in gen:
-                    codes.append(audio_code)
-            except Exception as e:
-                logger.warning("[warmup] codec capture error (non-fatal): %s", e)
-        return codes if capture_codes else None
-
-    logger.info("[warmup] batch=1 (capturing codec frames)...")
-    warmup_codes = await _warmup_one(capture_codes=True)
-    if warmup_codes and len(warmup_codes) > DECODER_WARMUP_FRAMES:
-        _warmup_codec_frames = warmup_codes[-DECODER_WARMUP_FRAMES:]
-        logger.info("[warmup] cached %d codec frames for decoder warmup", len(_warmup_codec_frames))
-    else:
-        logger.warning("[warmup] not enough codec frames captured, will fall back to first-frame repeat")
-
-    logger.info("[warmup] batch=2...")
-    await asyncio.gather(*[_warmup_one() for _ in range(2)])
-    logger.info("[warmup] done.")
-
+    # Phase 1 complete: weights loaded, workers spawned, waiting for KV cache allocation.
+    # Warmup inference is deferred to after /allocate_kv_cache is called.
+    global _server_status
+    _server_status = "weights_ready"
+    logger.info("Phase 1 complete: weights loaded, status=weights_ready (waiting for /allocate_kv_cache)")
 
     # Start TTL eviction for session codec cache
     async def _ttl_eviction_loop():
@@ -769,11 +740,139 @@ app = FastAPI(title="yedam-tts", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
+    if _server_status != "ready":
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={"status": _server_status, "model": MODEL_DIR, "gpu": False},
+        )
     return HealthResponse(
         status="ok",
         model=MODEL_DIR,
         gpu=True,
     )
+
+
+@app.get("/startup")
+async def startup_status():
+    """Two-phase startup status: loading → weights_ready → ready.
+    Used by the VRAM coordinator to poll for weight loading completion."""
+    return {"status": _server_status}
+
+
+@app.post("/allocate_kv_cache")
+async def allocate_kv_cache(budget_mb: int = 0):
+    """Phase 2: allocate KV cache in talker + predictor workers with explicit budget.
+
+    Called by the VRAM coordinator after all services have loaded weights.
+    budget_mb: total MB for TTS KV cache (split between talker and predictor).
+    If 0, workers use free-VRAM-based calculation (backward compat).
+    """
+    global _server_status, _warmup_codec_frames
+
+    if _server_status == "ready":
+        return {"status": "already_ready"}
+
+    if _server_status != "weights_ready":
+        raise HTTPException(status_code=409, detail=f"Cannot allocate: status={_server_status}")
+
+    interface = get_interface()
+    holder = getattr(interface, "_mp_holder", None)
+    if holder is None:
+        raise HTTPException(status_code=500, detail="Multiprocess engines not started")
+
+    # Compute per-worker budget split (talker gets ~75%, predictor gets ~25%)
+    budget_bytes = budget_mb * 1024 * 1024 if budget_mb > 0 else None
+    if budget_bytes is not None:
+        talker_budget = int(budget_bytes * 0.75)
+        predictor_budget = budget_bytes - talker_budget
+    else:
+        talker_budget = None
+        predictor_budget = None
+
+    logger.info(
+        "Allocating KV cache: total=%s MB, talker=%s MB, predictor=%s MB",
+        budget_mb or "auto",
+        talker_budget // (1024 * 1024) if talker_budget else "auto",
+        predictor_budget // (1024 * 1024) if predictor_budget else "auto",
+    )
+
+    # Send allocate commands to both workers
+    talker_fut = holder.talker_client.send_allocate_kv_cache(talker_budget or 0)
+    predictor_fut = holder.predictor_client.send_allocate_kv_cache(predictor_budget or 0)
+
+    # Wait for both acks (timeout 120s for CUDA graph capture)
+    try:
+        talker_ack, predictor_ack = await asyncio.wait_for(
+            asyncio.gather(talker_fut, predictor_fut),
+            timeout=120.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="KV cache allocation timed out (120s)")
+
+    talker_ok = talker_ack.get("success", False)
+    predictor_ok = predictor_ack.get("success", False)
+    if not (talker_ok and predictor_ok):
+        raise HTTPException(
+            status_code=500,
+            detail=f"KV cache allocation failed: talker={talker_ok}, predictor={predictor_ok}",
+        )
+
+    # Signal engine loops that KV cache is ready — they've been waiting on this event.
+    kv_event = getattr(interface, "_kv_ready_event", None)
+    if kv_event is not None:
+        kv_event.set()
+        logger.info("KV ready event set — engine loops unblocked")
+
+    # Run warmup inference now that engine loops are active and scheduler is ready.
+    logger.info("[warmup] batch=1 (capturing codec frames)...")
+
+    async def _warmup_one(capture_codes: bool = False) -> list | None:
+        codes = [] if capture_codes else None
+        try:
+            async for chunk in _generate_speech_stream("Hello, warmup.", "English", DEFAULT_SPEAKER):
+                pass
+        except Exception as e:
+            logger.warning("[warmup] error (non-fatal): %s", e)
+        if capture_codes:
+            try:
+                # Use voice clone path (same as real requests) for codec capture.
+                # generate_custom_voice_async(speaker=...) requires built-in speakers
+                # which may not be available in all models.
+                clone_prompt = _voice_clone_prompts.get("English") or _voice_clone_prompts.get(None)
+                if clone_prompt is not None:
+                    gen = interface.generate_voice_clone_async(
+                        text="The quick brown fox jumps over the lazy dog near the river bank.",
+                        language="English", voice_clone_prompt=clone_prompt,
+                    )
+                else:
+                    gen = interface.generate_custom_voice_async(
+                        text="The quick brown fox jumps over the lazy dog near the river bank.",
+                        language="English", speaker=DEFAULT_SPEAKER,
+                    )
+                async for audio_code in gen:
+                    codes.append(audio_code)
+            except Exception as e:
+                logger.warning("[warmup] codec capture error (non-fatal): %s", e)
+        return codes if capture_codes else None
+
+    warmup_codes = await _warmup_one(capture_codes=True)
+    if warmup_codes and len(warmup_codes) > DECODER_WARMUP_FRAMES:
+        _warmup_codec_frames = warmup_codes[-DECODER_WARMUP_FRAMES:]
+        logger.info("[warmup] cached %d codec frames for decoder warmup", len(_warmup_codec_frames))
+
+    logger.info("[warmup] batch=2...")
+    await asyncio.gather(*[_warmup_one() for _ in range(2)])
+    logger.info("[warmup] done.")
+
+    _server_status = "ready"
+    logger.info("Phase 2 complete: KV cache allocated, status=ready")
+
+    return {
+        "status": "ready",
+        "talker_blocks": talker_ack.get("num_blocks", 0),
+        "predictor_blocks": predictor_ack.get("num_blocks", 0),
+    }
 
 
 @app.delete("/sessions/{session_id}")

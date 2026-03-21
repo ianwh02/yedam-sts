@@ -146,10 +146,19 @@ def _compute_memory_split(
     kv_block_pred = _kv_block_bytes(pred_cfg, kvcache_block_size, dtype_bytes)
 
     total_vram = torch.cuda.get_device_properties(0).total_memory
-    effective_total = total_vram * gpu_memory_utilization
+    free_vram, _ = torch.cuda.mem_get_info(0)
+
+    # TTS_VRAM_BUDGET_MB (set by scripts/vram_budget.py) gives an absolute byte budget.
+    vram_budget_mb = os.environ.get("TTS_VRAM_BUDGET_MB")
+    if not vram_budget_mb:
+        raise RuntimeError(
+            "TTS_VRAM_BUDGET_MB not set. Start services via ./scripts/start.sh "
+            "to compute VRAM budgets automatically."
+        )
+    effective_total = int(vram_budget_mb) * 1024 * 1024
 
     # ── Reserve for main process (embeddings ~672 MB + speech tokenizer ~648 MB + CUDA graphs ~500 MB) ──
-    main_reserve = 0.15 * total_vram  # ~2.57 GB on 17.1 GB GPU
+    main_reserve = effective_total * 0.30
     worker_budget = effective_total - main_reserve
 
     # ── KV cache budget (what's left after models within worker budget) ──
@@ -170,10 +179,10 @@ def _compute_memory_split(
     talker_total = talker_fixed + talker_kv_bytes
     pred_total = pred_fixed + pred_kv_bytes
 
-    # ── Convert to fractions of total GPU, with 10% headroom per worker ──
-    talker_process_fraction = min(0.95, (talker_total / total_vram) * 1.1)
-    predictor_process_fraction = min(0.95, (pred_total / total_vram) * 1.1)
-    main_process_fraction = 0.15
+    # ── Convert to fractions of total GPU ──
+    talker_process_fraction = min(0.95, talker_total / total_vram)
+    predictor_process_fraction = min(0.95, pred_total / total_vram)
+    main_process_fraction = main_reserve / total_vram
 
     # Within each process, use 0.90 of the process budget (10% headroom for fragmentation)
     talker_util = 0.90
@@ -181,8 +190,9 @@ def _compute_memory_split(
 
     logger.info(
         f"[memory_split] GPU total={total_vram / 1e9:.1f} GB, "
-        f"user budget={gpu_memory_utilization:.2f} "
-        f"({effective_total / 1e9:.1f} GB total TTS)\n"
+        f"free={free_vram / 1e9:.1f} GB, "
+        f"user budget={gpu_memory_utilization:.2f}, "
+        f"effective={effective_total / 1e9:.1f} GB total TTS\n"
         f"  Main process: fraction={main_process_fraction:.3f} "
         f"({main_process_fraction * total_vram / 1e6:.0f} MB)\n"
         f"  Talker: weights~{talker_weight_bytes / 1e6:.0f} MB, "
@@ -369,8 +379,11 @@ class Qwen3TTSInterface:
         proc_frac = mem_cfg.get("main_process_fraction", mem_cfg["process_gpu_memory_fraction"])
 
         # Cap this process's GPU memory before any model load.
-        # Main process only holds embeddings + speech tokenizer — small fraction.
-        if torch.cuda.is_available():
+        # Disabled by default on shared GPU — the fraction is calculated against total GPU
+        # memory, not free memory, so it breaks when other services already occupy VRAM.
+        # Enable with TTS_ENABLE_PROCESS_MEMORY_CAP=1 for dedicated-GPU deployments.
+        enable_cap = os.environ.get("TTS_ENABLE_PROCESS_MEMORY_CAP", "0") == "1"
+        if enable_cap and torch.cuda.is_available():
             try:
                 set_frac = getattr(torch.cuda, "set_per_process_memory_fraction", None) or getattr(
                     getattr(torch.cuda, "memory", None), "set_per_process_memory_fraction", None
@@ -1115,11 +1128,14 @@ class Qwen3TTSInterface:
             tensor_parallel_size=self._tensor_parallel_size,
         )
         self._mp_holder = holder
+        self._kv_ready_event = asyncio.Event()
         t1 = asyncio.create_task(run_talker_loop_mp(
-            holder.talker_client, self._request_queues, self._queues_lock, holder.talker_ready
+            holder.talker_client, self._request_queues, self._queues_lock, holder.talker_ready,
+            kv_ready=self._kv_ready_event,
         ))
         t2 = asyncio.create_task(run_predictor_loop_mp(
-            holder.predictor_client, self._request_queues, self._queues_lock, holder.predictor_ready
+            holder.predictor_client, self._request_queues, self._queues_lock, holder.predictor_ready,
+            kv_ready=self._kv_ready_event,
         ))
         self._zmq_tasks.extend([t1, t2])
         await asyncio.sleep(0.2)

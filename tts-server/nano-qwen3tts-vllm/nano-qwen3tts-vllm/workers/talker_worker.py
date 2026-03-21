@@ -17,10 +17,12 @@ except ImportError:
 from nano_qwen3tts_vllm.workers.protocol import (
     deserialize_command,
     serialize_talker_result,
+    serialize_allocate_kv_cache_ack,
     CMD_ADD_REQUEST,
     CMD_RUN_STEP,
     CMD_CLEAR_REQUEST,
     CMD_SHUTDOWN,
+    CMD_ALLOCATE_KV_CACHE,
 )
 from nano_qwen3tts_vllm.llm import TalkerLLM
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
@@ -64,7 +66,9 @@ def run_talker_worker(
     proc_frac = mem_cfg.get("talker_process_fraction", mem_cfg["process_gpu_memory_fraction"])
 
     # Cap this process's GPU memory before loading the model.
-    if torch.cuda.is_available():
+    # Disabled by default on shared GPU (see interface.py for rationale).
+    enable_cap = os.environ.get("TTS_ENABLE_PROCESS_MEMORY_CAP", "0") == "1"
+    if enable_cap and torch.cuda.is_available():
         try:
             set_frac = getattr(torch.cuda, "set_per_process_memory_fraction", None) or getattr(
                 getattr(torch.cuda, "memory", None), "set_per_process_memory_fraction", None
@@ -98,7 +102,9 @@ def run_talker_worker(
     push.connect(result_connect_addr)
 
     logger.info(f"[talker_worker] connected to {command_connect_addr}, result {result_connect_addr}")
+    logger.info("[talker_worker] weights loaded, waiting for CMD_ALLOCATE_KV_CACHE")
 
+    kv_allocated = False
     step_count = 0
     try:
         while True:
@@ -108,6 +114,30 @@ def run_talker_worker(
             if cmd.get("cmd") == CMD_SHUTDOWN:
                 logger.info("[talker_worker] received shutdown")
                 break
+
+            if cmd.get("cmd") == CMD_ALLOCATE_KV_CACHE:
+                budget_bytes = cmd["budget_bytes"]
+                logger.info(f"[talker_worker] allocating KV cache (budget={budget_bytes / 1024**2:.0f} MB)")
+                try:
+                    talker_llm.model_runner.complete_init(kv_budget_bytes=budget_bytes)
+                    num_blocks = talker_llm.model_runner.config.num_kvcache_blocks
+                    # Re-create scheduler now that num_kvcache_blocks is set
+                    # (it was created with -1 during __init__ before KV allocation)
+                    from nano_qwen3tts_vllm.engine.llm_engine.talker_llm_engine import TalkerScheduler
+                    talker_llm.scheduler = TalkerScheduler(talker_llm.config)
+                    logger.info(f"[talker_worker] KV cache allocated: {num_blocks} blocks, scheduler re-created")
+                    kv_allocated = True
+                    push.send(serialize_allocate_kv_cache_ack(True, num_blocks))
+                except Exception as e:
+                    logger.exception(f"[talker_worker] KV cache allocation failed: {e}")
+                    push.send(serialize_allocate_kv_cache_ack(False))
+                continue
+
+            if not kv_allocated and cmd.get("cmd") in (CMD_ADD_REQUEST, CMD_RUN_STEP):
+                logger.warning("[talker_worker] rejecting command before KV cache allocation")
+                if cmd.get("cmd") == CMD_RUN_STEP:
+                    push.send(serialize_talker_result(cmd["step_id"], []))
+                continue
 
             if cmd.get("cmd") == CMD_ADD_REQUEST:
                 request_id = cmd["request_id"]

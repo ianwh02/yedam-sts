@@ -23,10 +23,13 @@ from nano_qwen3tts_vllm.workers.protocol import (
     serialize_talker_run_step,
     serialize_clear_request,
     serialize_shutdown,
+    serialize_allocate_kv_cache,
     deserialize_talker_result,
+    deserialize_command,
     serialize_predictor_add_request,
     serialize_predictor_run_step,
     deserialize_predictor_result,
+    CMD_ALLOCATE_KV_CACHE,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,8 @@ def _run_result_bridge_thread(
     pending_predictor_futures: dict,
     loop: asyncio.AbstractEventLoop,
     stop_event: threading.Event,
+    allocate_talker_future: list | None = None,
+    allocate_predictor_future: list | None = None,
 ) -> None:
     """Thread: poll both result PULL sockets and complete the corresponding Futures."""
     poller = zmq.Poller()
@@ -55,19 +60,35 @@ def _run_result_bridge_thread(
         if talker_result_pull in evts:
             try:
                 msg = talker_result_pull.recv()
-                step_id, outputs_all = deserialize_talker_result(msg)
-                fut = pending_talker_futures.pop(step_id, None)
-                if fut is not None and not fut.done():
-                    loop.call_soon_threadsafe(fut.set_result, ("talker", outputs_all))
+                obj = deserialize_command(msg)
+                if obj.get("cmd") == CMD_ALLOCATE_KV_CACHE:
+                    if allocate_talker_future and allocate_talker_future[0] is not None:
+                        fut = allocate_talker_future[0]
+                        allocate_talker_future[0] = None
+                        if not fut.done():
+                            loop.call_soon_threadsafe(fut.set_result, obj)
+                else:
+                    step_id, outputs_all = deserialize_talker_result(msg)
+                    fut = pending_talker_futures.pop(step_id, None)
+                    if fut is not None and not fut.done():
+                        loop.call_soon_threadsafe(fut.set_result, ("talker", outputs_all))
             except Exception as e:
                 logger.warning(f"[result_bridge] talker result: {e}")
         if predictor_result_pull in evts:
             try:
                 msg = predictor_result_pull.recv()
-                step_id, outputs_all = deserialize_predictor_result(msg)
-                fut = pending_predictor_futures.pop(step_id, None)
-                if fut is not None and not fut.done():
-                    loop.call_soon_threadsafe(fut.set_result, ("predictor", outputs_all))
+                obj = deserialize_command(msg)
+                if obj.get("cmd") == CMD_ALLOCATE_KV_CACHE:
+                    if allocate_predictor_future and allocate_predictor_future[0] is not None:
+                        fut = allocate_predictor_future[0]
+                        allocate_predictor_future[0] = None
+                        if not fut.done():
+                            loop.call_soon_threadsafe(fut.set_result, obj)
+                else:
+                    step_id, outputs_all = deserialize_predictor_result(msg)
+                    fut = pending_predictor_futures.pop(step_id, None)
+                    if fut is not None and not fut.done():
+                        loop.call_soon_threadsafe(fut.set_result, ("predictor", outputs_all))
             except Exception as e:
                 logger.warning(f"[result_bridge] predictor result: {e}")
 
@@ -102,6 +123,14 @@ class TalkerWorkerClient:
         self._pending = pending_talker_futures
         self._talker_ready = talker_ready
         self._loop = loop
+        self._allocate_future: list = [None]  # mutable container for result bridge thread
+
+    def send_allocate_kv_cache(self, budget_bytes: int) -> asyncio.Future:
+        """Send allocate_kv_cache to worker; return Future that resolves to ack dict."""
+        future = self._loop.create_future()
+        self._allocate_future[0] = future
+        self._push.send(serialize_allocate_kv_cache(budget_bytes))
+        return future
 
     def send_add_request(self, request_id: str, inputs_embeds, sampling_params) -> None:
         sp_dict = _sampling_params_to_dict(sampling_params)
@@ -151,6 +180,14 @@ class PredictorWorkerClient:
         self._pending = pending_predictor_futures
         self._predictor_ready = predictor_ready
         self._loop = loop
+        self._allocate_future: list = [None]  # mutable container for result bridge thread
+
+    def send_allocate_kv_cache(self, budget_bytes: int) -> asyncio.Future:
+        """Send allocate_kv_cache to worker; return Future that resolves to ack dict."""
+        future = self._loop.create_future()
+        self._allocate_future[0] = future
+        self._push.send(serialize_allocate_kv_cache(budget_bytes))
+        return future
 
     def send_add_request(self, request_id: str, inputs_embeds, sampling_params) -> None:
         sp_dict = _sampling_params_to_dict(sampling_params)
@@ -216,21 +253,6 @@ def start_multiprocess_engines(
     pending_predictor = {}
     talker_ready = set()
     predictor_ready = set()
-    stop_event = threading.Event()
-    bridge = threading.Thread(
-        target=_run_result_bridge_thread,
-        args=(
-            talker_result_pull,
-            predictor_result_pull,
-            pending_talker,
-            pending_predictor,
-            loop,
-            stop_event,
-        ),
-        daemon=True,
-    )
-    bridge.start()
-
     talker_client = TalkerWorkerClient(
         addrs["talker_command"],
         pending_talker,
@@ -243,6 +265,26 @@ def start_multiprocess_engines(
         predictor_ready,
         loop,
     )
+
+    # Start result bridge thread (must be after clients so we can pass allocate futures)
+    stop_event = threading.Event()
+    bridge = threading.Thread(
+        target=_run_result_bridge_thread,
+        args=(
+            talker_result_pull,
+            predictor_result_pull,
+            pending_talker,
+            pending_predictor,
+            loop,
+            stop_event,
+        ),
+        kwargs=dict(
+            allocate_talker_future=talker_client._allocate_future,
+            allocate_predictor_future=predictor_client._allocate_future,
+        ),
+        daemon=True,
+    )
+    bridge.start()
 
     from nano_qwen3tts_vllm.workers.talker_worker import run_talker_worker
     from nano_qwen3tts_vllm.workers.predictor_worker import run_predictor_worker

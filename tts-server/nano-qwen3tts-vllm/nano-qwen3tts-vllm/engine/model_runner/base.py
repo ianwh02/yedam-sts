@@ -56,14 +56,31 @@ class ModelRunner:
         torch.set_default_device("cuda")
                 
     def post_init(self, rank: int):
-        default_dtype = torch.get_default_dtype()
+        """Phase 1: warmup only. KV cache + CUDA graphs deferred to complete_init()."""
         self.sampler = Sampler()
         self.warmup_model()
-        self.allocate_kv_cache()
+        self._kv_allocated = False
+
+    def complete_init(self, rank: int = 0, kv_budget_bytes: int | None = None):
+        """Phase 2: allocate KV cache + capture CUDA graphs.
+
+        Args:
+            rank: GPU rank (for SharedMemory setup in multi-GPU).
+            kv_budget_bytes: If provided, allocate exactly this many bytes for KV cache
+                (minus graph reserve). If None, use free-VRAM-based calculation.
+        """
+        default_dtype = torch.get_default_dtype()
+        # Restore CUDA context — post_init() left default_device as cuda,
+        # but the ZMQ command loop may have changed it.
+        torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_device("cuda")
+        self.allocate_kv_cache(budget_bytes=kv_budget_bytes)
         if not self.enforce_eager:
             self.capture_cudagraph()
+            self.capture_cudagraph_prefill()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        self._kv_allocated = True
 
         if self.world_size > 1:
             if rank == 0:
@@ -76,6 +93,10 @@ class ModelRunner:
 
     def load_model(self, config: Config):
         ...
+
+    def capture_cudagraph_prefill(self):
+        """Override in subclasses that need prefill graph capture."""
+        pass
 
     def exit(self):
         if self.world_size > 1:
@@ -128,32 +149,45 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self):
+    def allocate_kv_cache(self, budget_bytes: int | None = None):
         config = self.config
         hf_config = self.model_config
         torch_dtype = torch.bfloat16
-        free, total = torch.cuda.mem_get_info()
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * torch_dtype.itemsize
 
-        if getattr(config, "process_gpu_memory_fraction", None) is not None:
-            # Multi-process on one GPU: cap this process to a fraction of total (e.g. 0.5 for 2 processes)
+        # Reserve for CUDA graph capture (decode + prefill) that runs after KV alloc.
+        graph_reserve = int(os.environ.get("TTS_GRAPH_RESERVE_MB", "256")) * 1024 * 1024
+
+        if budget_bytes is not None:
+            # Explicit budget from coordinator — use it directly.
+            raw_blocks = int(budget_bytes - graph_reserve) // block_bytes
+            logger.info(
+                f"[allocate_kv_cache] explicit budget={budget_bytes / 1024**2:.0f} MB, "
+                f"graph_reserve={graph_reserve / 1024**2:.0f} MB, "
+                f"block_bytes={block_bytes}, raw_blocks={raw_blocks}"
+            )
+        elif getattr(config, "process_gpu_memory_fraction", None) is not None:
+            # Multi-process on one GPU: cap to fraction of total, but never exceed actual free VRAM.
+            free, total = torch.cuda.mem_get_info()
             effective_total = total * config.process_gpu_memory_fraction
             used = torch.cuda.memory_allocated()
-            raw_blocks = int(effective_total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+            budget = min(effective_total * config.gpu_memory_utilization, free * 0.85)
+            raw_blocks = int(budget - used - graph_reserve) // block_bytes
         else:
+            free, total = torch.cuda.mem_get_info()
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
             used = total - free
-            raw_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+            raw_blocks = int(total * config.gpu_memory_utilization - used - peak + current - graph_reserve) // block_bytes
 
         config.num_kvcache_blocks = max(1, raw_blocks)
-        if raw_blocks <= 0 and config.gpu_memory_utilization >= 0.05:
+        if raw_blocks <= 0 and (budget_bytes is not None or config.gpu_memory_utilization >= 0.05):
             import warnings
             warnings.warn(
-                f"KV cache allocation would be 0 (gpu_memory_utilization={config.gpu_memory_utilization}, "
-                f"free~{total * config.gpu_memory_utilization - used - peak + current:.0f} bytes). Using 1 block."
+                f"KV cache allocation would be 0 (budget_bytes={budget_bytes}, "
+                f"gpu_memory_utilization={config.gpu_memory_utilization}). Using 1 block."
             )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0

@@ -64,8 +64,8 @@ class TalkerModeModelRunner(ModelRunner):
         self._build_suppress_mask()
         self._loop_streak: dict[int, int] = {}  # seq_id -> consecutive loop steps
         self.post_init(rank)
-        if not config.enforce_eager:
-            self.capture_cudagraph_prefill()
+        # KV cache + CUDA graphs deferred to complete_init() — called by worker
+        # after coordinator assigns VRAM budget.
 
     def _build_suppress_mask(self):
         """Build codec whitelist mask and EOS token ID list.
@@ -145,20 +145,24 @@ class TalkerModeModelRunner(ModelRunner):
             num_tokens = model_input.size(0)
             context = get_context()
             num_seqs = context.cu_seqlens_q.size(0) - 1
-            use_prefill_graph = (
+            # Find the next captured graph size >= num_tokens (sparse bucket)
+            graph_size = None
+            if (
                 not self.enforce_eager
-                and getattr(self, "graphs_prefill", None) is not None
+                and getattr(self, "graph_bs_prefill", None) is not None
                 and num_seqs == 1
-                and 1 <= num_tokens <= 256
-                and num_tokens in self.graphs_prefill
                 and context.block_tables is None
-            )
-            
-            use_graph = use_prefill_graph
-            if use_prefill_graph:
-                graph = self.graphs_prefill[num_tokens]
+            ):
+                graph_size = next((s for s in self.graph_bs_prefill if s >= num_tokens), None)
+
+            use_graph = graph_size is not None
+            if use_graph:
+                graph = self.graphs_prefill[graph_size]
                 graph_vars = self.graph_vars_prefill
+                # Zero the full buffer slice, then copy actual data
+                graph_vars["input_embeds"][:graph_size].zero_()
                 graph_vars["input_embeds"][:num_tokens].copy_(model_input)
+                graph_vars["positions"][:graph_size].zero_()
                 graph_vars["positions"][:num_tokens].copy_(positions)
                 graph_vars["cu_seqlens_q"][0] = 0
                 graph_vars["cu_seqlens_q"][1] = num_tokens
@@ -169,7 +173,7 @@ class TalkerModeModelRunner(ModelRunner):
                 graph.replay()
                 hidden_states = graph_vars["outputs"][:num_tokens].clone()
                 graph_latency_ms = (time.time() - start) * 1000
-                logger.info(f"[talker mode model runner] Prefill graph num_tokens={num_tokens} latency={graph_latency_ms:.4f}ms")
+                logger.info(f"[talker mode model runner] Prefill graph num_tokens={num_tokens} (bucket={graph_size}) latency={graph_latency_ms:.4f}ms")
             else:
                 hidden_states = self.model(model_input, positions)
         elif self.enforce_eager or model_input.size(0) > 512:
@@ -363,21 +367,30 @@ class TalkerModeModelRunner(ModelRunner):
         
     @torch.inference_mode()
     def capture_cudagraph_prefill(self):
-        """Capture CUDA graphs for prefill: 1 seq, token counts 1 to 512 inclusive."""
+        """Capture CUDA graphs for prefill: 1 seq, sparse token counts.
+
+        Uses a sparse set of sizes instead of every integer 1-256.
+        At runtime, inputs are padded to the next captured size.
+        This saves hundreds of MB of VRAM vs capturing all 256 sizes.
+        """
         config = self.config
         hf_config = self.model_config
-        max_num_tokens = 257  # buffer size; capture for 1..512
+        # Sparse set: fine-grained for small (1-8), then coarser buckets
+        self.graph_bs_prefill = sorted(set(
+            list(range(1, 9))  # 1-8: exact match for small prefills
+            + [12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+        ))
+        max_num_tokens = self.graph_bs_prefill[-1] + 1  # buffer size
         input_embeds = torch.zeros(max_num_tokens, hf_config.hidden_size, device="cuda")
         positions = torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda")
         slot_mapping = torch.zeros(max_num_tokens, dtype=torch.int32, device="cuda")
         cu_seqlens_q = torch.zeros(2, dtype=torch.int32, device="cuda")
         cu_seqlens_k = torch.zeros(2, dtype=torch.int32, device="cuda")
         outputs = torch.zeros(max_num_tokens, hf_config.hidden_size, device="cuda")
-        self.graph_bs_prefill = list(range(1, 257))  # 1 to 512 inclusive
         self.graphs_prefill = {}
         graph_pool = self.graph_pool
 
-        for bs in tqdm(reversed(self.graph_bs_prefill)):
+        for bs in tqdm(reversed(self.graph_bs_prefill), desc="talker prefill graphs"):
             graph = torch.cuda.CUDAGraph()
             cu_seqlens_q[0] = 0
             cu_seqlens_q[1] = bs

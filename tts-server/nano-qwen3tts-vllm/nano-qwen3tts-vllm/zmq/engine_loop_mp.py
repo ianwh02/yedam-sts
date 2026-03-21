@@ -30,12 +30,19 @@ async def run_talker_loop_mp(
     request_queues: dict,
     queues_lock: asyncio.Lock,
     talker_ready: set,
+    kv_ready: asyncio.Event | None = None,
 ) -> None:
     """
     Replacement for run_talker_loop when using multiprocess talker.
     Waits until talker_ready matches active requests (or timeout), sends run_step, awaits result,
     dispatches (engine_type, msg_type, payload) to request_queues[request_id].
     """
+    # Wait for KV cache allocation before sending any steps to the worker.
+    if kv_ready is not None:
+        logger.info("[talker_loop_mp] waiting for KV cache allocation...")
+        await kv_ready.wait()
+        logger.info("[talker_loop_mp] KV ready, starting step loop")
+
     step_count = 0
     last_batch_size = 0  # Track previous batch size for adaptive collection
     while True:
@@ -130,12 +137,18 @@ async def run_predictor_loop_mp(
     request_queues: dict,
     queues_lock: asyncio.Lock,
     predictor_ready: set,
+    kv_ready: asyncio.Event | None = None,
 ) -> None:
     """
     Replacement for run_predictor_loop when using multiprocess predictor.
     Waits until predictor_ready is non-empty (and optionally all active have sent),
     sends run_step, awaits burst result, dispatches to request_queues.
     """
+    if kv_ready is not None:
+        logger.info("[predictor_loop_mp] waiting for KV cache allocation...")
+        await kv_ready.wait()
+        logger.info("[predictor_loop_mp] KV ready, starting step loop")
+
     burst_count = 0
     while True:
         await asyncio.sleep(0.0005)

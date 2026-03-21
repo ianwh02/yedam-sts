@@ -15,6 +15,7 @@ CMD_ADD_REQUEST = "add_request"
 CMD_RUN_STEP = "run_step"
 CMD_CLEAR_REQUEST = "clear_request"
 CMD_SHUTDOWN = "shutdown"
+CMD_ALLOCATE_KV_CACHE = "allocate_kv_cache"
 
 
 def _tensor_to_numpy(x: Any) -> Any:
@@ -134,3 +135,21 @@ def deserialize_predictor_result(payload: bytes) -> tuple[str, list]:
     """Returns (step_id, outputs_all)."""
     obj = pickle.loads(payload)
     return obj["step_id"], obj["outputs_all"]
+
+
+# ---- KV Cache Allocation ----
+
+def serialize_allocate_kv_cache(budget_bytes: int) -> bytes:
+    """Serialize allocate_kv_cache command (same for talker and predictor)."""
+    return pickle.dumps(
+        {"cmd": CMD_ALLOCATE_KV_CACHE, "budget_bytes": budget_bytes},
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+
+
+def serialize_allocate_kv_cache_ack(success: bool, num_blocks: int = 0) -> bytes:
+    """Serialize acknowledgment after KV cache allocation."""
+    return pickle.dumps(
+        {"cmd": CMD_ALLOCATE_KV_CACHE, "success": success, "num_blocks": num_blocks},
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )

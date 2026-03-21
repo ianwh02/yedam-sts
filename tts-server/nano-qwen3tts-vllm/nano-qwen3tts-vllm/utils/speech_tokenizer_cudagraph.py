@@ -91,6 +91,7 @@ class SpeechTokenizerCUDAGraph:
         self.tokenizer = _Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_path,
         )
+        self.tokenizer.device = torch.device(device)
         self.tokenizer.model = self.tokenizer.model.to(device=device, dtype=dtype)
         # Decoder uses SnakeBeta with torch.exp() that overflows in bf16
         self.tokenizer.model.decoder = self.tokenizer.model.decoder.to(torch.float32)

@@ -4,6 +4,7 @@ Runs a burst of step() on run_step until no work (matching current in-process be
 """
 
 import logging
+import os
 import sys
 
 import torch
@@ -16,10 +17,12 @@ except ImportError:
 from nano_qwen3tts_vllm.workers.protocol import (
     deserialize_command,
     serialize_predictor_result,
+    serialize_allocate_kv_cache_ack,
     CMD_ADD_REQUEST,
     CMD_RUN_STEP,
     CMD_CLEAR_REQUEST,
     CMD_SHUTDOWN,
+    CMD_ALLOCATE_KV_CACHE,
 )
 from nano_qwen3tts_vllm.llm import PredictorLLM
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
@@ -60,7 +63,9 @@ def run_predictor_worker(
     proc_frac = mem_cfg.get("predictor_process_fraction", mem_cfg["process_gpu_memory_fraction"])
 
     # Cap this process's GPU memory before loading the model.
-    if torch.cuda.is_available():
+    # Disabled by default on shared GPU (see interface.py for rationale).
+    enable_cap = os.environ.get("TTS_ENABLE_PROCESS_MEMORY_CAP", "0") == "1"
+    if enable_cap and torch.cuda.is_available():
         try:
             set_frac = getattr(torch.cuda, "set_per_process_memory_fraction", None) or getattr(
                 getattr(torch.cuda, "memory", None), "set_per_process_memory_fraction", None
@@ -94,7 +99,9 @@ def run_predictor_worker(
     push.connect(result_connect_addr)
 
     logger.info(f"[predictor_worker] connected to {command_connect_addr}, result {result_connect_addr}")
+    logger.info("[predictor_worker] weights loaded, waiting for CMD_ALLOCATE_KV_CACHE")
 
+    kv_allocated = False
     burst_count = 0
     try:
         while True:
@@ -104,6 +111,29 @@ def run_predictor_worker(
             if cmd.get("cmd") == CMD_SHUTDOWN:
                 logger.info("[predictor_worker] received shutdown")
                 break
+
+            if cmd.get("cmd") == CMD_ALLOCATE_KV_CACHE:
+                budget_bytes = cmd["budget_bytes"]
+                logger.info(f"[predictor_worker] allocating KV cache (budget={budget_bytes / 1024**2:.0f} MB)")
+                try:
+                    predictor_llm.model_runner.complete_init(kv_budget_bytes=budget_bytes)
+                    num_blocks = predictor_llm.model_runner.config.num_kvcache_blocks
+                    # Re-create scheduler now that num_kvcache_blocks is set
+                    from nano_qwen3tts_vllm.engine.llm_engine.predictor_llm_engine import PredictorScheduler
+                    predictor_llm.scheduler = PredictorScheduler(predictor_llm.config)
+                    logger.info(f"[predictor_worker] KV cache allocated: {num_blocks} blocks, scheduler re-created")
+                    kv_allocated = True
+                    push.send(serialize_allocate_kv_cache_ack(True, num_blocks))
+                except Exception as e:
+                    logger.exception(f"[predictor_worker] KV cache allocation failed: {e}")
+                    push.send(serialize_allocate_kv_cache_ack(False))
+                continue
+
+            if not kv_allocated and cmd.get("cmd") in (CMD_ADD_REQUEST, CMD_RUN_STEP):
+                logger.warning("[predictor_worker] rejecting command before KV cache allocation")
+                if cmd.get("cmd") == CMD_RUN_STEP:
+                    push.send(serialize_predictor_result(cmd["step_id"], []))
+                continue
 
             if cmd.get("cmd") == CMD_ADD_REQUEST:
                 request_id = cmd["request_id"]

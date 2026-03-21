@@ -515,7 +515,20 @@ class TranscriptionServer:
             if faster_whisper_custom_model_path or whisper_tensorrt_path:
                 logging.info("Custom model option was provided. Switching to single model mode.")
                 self.single_model = True
-                # TODO: load model initially
+                # Pre-load model at startup to reserve GPU memory before TTS expands.
+                # Sets the class-level SINGLE_MODEL so clients reuse it (no lazy load OOM).
+                if faster_whisper_custom_model_path:
+                    from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
+                    compute_type = os.environ.get("WHISPER_COMPUTE_TYPE", "int8_float16")
+                    logging.info(f"Pre-loading Whisper model: {faster_whisper_custom_model_path} ({compute_type})")
+                    self.shared_model = WhisperModel(
+                        faster_whisper_custom_model_path,
+                        device="cuda",
+                        compute_type=compute_type,
+                        local_files_only=True,
+                    )
+                    ServeClientFasterWhisper.SINGLE_MODEL = self.shared_model
+                    logging.info("Whisper model pre-loaded and GPU memory reserved.")
             else:
                 logging.info("Single model mode currently only works with custom models.")
         if not BackendType.is_valid(backend):

@@ -1,0 +1,46 @@
+# VRAM Budget Configuration
+# ========================
+# Two-phase allocation model:
+#   Phase 1: All services load weights in parallel.
+#   Phase 2: Coordinator measures actual free VRAM, distributes KV cache by priority.
+#
+# LLM fixed_mb is used to compute LLM_GPU_MEMORY_UTILIZATION before startup.
+# TTS/STT fixed_mb are documentation only — the coordinator measures actual usage.
+#
+# Run: ./scripts/start.sh [--trt] [--dev]
+
+gpu:
+  reserved_mb: 800   # Desktop/Xorg (~200) + decoder scratch space (~100)
+                      # + fragmentation headroom (~500)
+                      # Set to 400 for headless servers
+
+services:
+  llm:
+    fixed_mb: 3300        # Qwen3-4B-AWQ weights (~2800) + CUDA context (~500)
+                          # Used to compute LLM_GPU_MEMORY_UTILIZATION env var
+    variable_priority: 1  # Low: short context (512 tokens), max 8 seqs — small KV cache needed
+    min_variable_mb: 200
+    # Output env: LLM_GPU_MEMORY_UTILIZATION
+
+  stt:
+    fixed_mb: 2000        # Whisper large-v3-turbo int8_float16 (~1500) + CUDA context (~500)
+                          # Documentation only — coordinator measures actual
+    variable_priority: 1
+    min_variable_mb: 50
+    # No output env needed — faster-whisper allocates what it needs
+
+  stt_trt:
+    fixed_mb: 2600        # TensorRT engines + CUDA context (measured: ~2660 MB)
+                          # Documentation only — coordinator measures actual
+    variable_priority: 1
+    min_variable_mb: 100
+    # Output env: STT_KV_CACHE_FREE_GPU_FRACTION (via coordinator)
+
+  tts:
+    fixed_mb: 5900        # Main: embeddings + tokenizer + graphs (~2550)
+                          # Predictor: weights + context + graphs (~1150)
+                          # Talker: weights + context + graphs (~4560)
+                          # Documentation only — coordinator measures actual
+    variable_priority: 3  # Highest: TTS is the bottleneck, talker KV cache determines concurrency
+    min_variable_mb: 300
+    # Output env: TTS_VRAM_BUDGET_MB (via coordinator)

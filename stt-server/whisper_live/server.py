@@ -26,6 +26,9 @@ from whisper_live.vad import VoiceActivityDetector
 from whisper_live.backend.base import ServeClientBase
 
 logging.basicConfig(level=logging.INFO)
+# Suppress noisy "connection rejected" logs from websockets for HTTP health/startup checks.
+# We log these ourselves with path + status for consistency with TTS/LLM uvicorn format.
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
 
 class ClientManager:
     def __init__(self, max_clients=4, max_connection_time=600):
@@ -629,7 +632,11 @@ class TranscriptionServer:
                     else 1
                 )
                 assets_dir = os.environ.get("ASSETS_DIR", "/app/assets")
-                logging.info("Pre-loading TensorRT model at startup...")
+                defer_kv = os.environ.get("STT_DEFER_KV_CACHE", "0") == "1"
+                logging.info(
+                    "Pre-loading TensorRT model at startup (defer_kv_cache=%s)...",
+                    defer_kv,
+                )
                 transcriber = WhisperTRTLLM(
                     whisper_tensorrt_path,
                     assets_dir=assets_dir,
@@ -640,33 +647,160 @@ class TranscriptionServer:
                     use_py_session=trt_py_session,
                     max_output_len=96,
                     max_batch_size=trt_max_batch,
+                    defer_kv_cache=defer_kv,
                 )
-                # Warmup: run inference to trigger CUDA graph capture
-                warmup_audio = os.path.join(assets_dir, "jfk.flac")
-                logging.info("Warming up TensorRT engine (10 steps)...")
-                mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
-                for _ in range(10):
-                    transcriber.transcribe(mel)
-                logging.info("TensorRT warmup complete.")
                 ServeClientTensorRT.SINGLE_MODEL = transcriber
 
-                # Start batch worker immediately if batch inference is enabled
-                if self.batch_config is not None:
-                    from whisper_live.batch_inference_trt import BatchInferenceTRTWorker
-                    worker = BatchInferenceTRTWorker(
-                        transcriber=transcriber,
-                        **self.batch_config,
-                    )
-                    worker.start()
-                    ServeClientTensorRT.BATCH_WORKER = worker
-                    logging.info("TRT batch inference worker started at startup.")
+                if not defer_kv:
+                    # Immediate mode: warmup now
+                    warmup_audio = os.path.join(assets_dir, "jfk.flac")
+                    logging.info("Warming up TensorRT engine (10 steps)...")
+                    mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
+                    for _ in range(10):
+                        transcriber.transcribe(mel)
+                    logging.info("TensorRT warmup complete.")
+
+                    # Start batch worker immediately if batch inference is enabled
+                    if self.batch_config is not None:
+                        from whisper_live.batch_inference_trt import BatchInferenceTRTWorker
+                        worker = BatchInferenceTRTWorker(
+                            transcriber=transcriber,
+                            **self.batch_config,
+                        )
+                        worker.start()
+                        ServeClientTensorRT.BATCH_WORKER = worker
+                        logging.info("TRT batch inference worker started at startup.")
             except Exception as e:
                 logging.error(f"Failed to pre-load TensorRT model: {e}", exc_info=True)
 
-        # Health check handler — intercepts HTTP requests before WebSocket upgrade
+        # Track server status for two-phase startup
+        stt_status = {"value": "ready"}  # default: ready (faster-whisper or non-deferred TRT)
+        if backend == "tensorrt" and os.environ.get("STT_DEFER_KV_CACHE", "0") == "1":
+            stt_status["value"] = "weights_ready"
+
+            # Background thread polls for /tmp/allocate_kv_cache.json signal file
+            # written by the VRAM coordinator via docker exec.
+            import threading
+
+            def _poll_allocate_signal():
+                signal_path = "/tmp/allocate_kv_cache.json"
+                logging.info("[STT] Polling for KV cache signal at %s", signal_path)
+                while stt_status["value"] == "weights_ready":
+                    if os.path.exists(signal_path):
+                        try:
+                            with open(signal_path) as f:
+                                sig = json.load(f)
+                            os.remove(signal_path)
+                            fraction = float(sig.get("fraction", 0.05))
+                            logging.info("[STT] Signal received, allocating KV cache (fraction=%.3f)", fraction)
+
+                            from whisper_live.backend.trt_backend import ServeClientTensorRT
+                            transcriber = ServeClientTensorRT.SINGLE_MODEL
+                            transcriber.allocate_kv_cache(kv_cache_fraction=fraction)
+
+                            _assets = os.environ.get("ASSETS_DIR", "/app/assets")
+                            warmup_audio = os.path.join(_assets, "jfk.flac")
+                            logging.info("Warming up TensorRT engine (10 steps)...")
+                            mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
+                            for _ in range(10):
+                                transcriber.transcribe(mel)
+                            logging.info("TensorRT warmup complete.")
+
+                            if self.batch_config is not None and ServeClientTensorRT.BATCH_WORKER is None:
+                                from whisper_live.batch_inference_trt import BatchInferenceTRTWorker
+                                worker = BatchInferenceTRTWorker(
+                                    transcriber=transcriber,
+                                    **self.batch_config,
+                                )
+                                worker.start()
+                                logging.info("TRT batch inference worker started after KV allocation.")
+
+                            stt_status["value"] = "ready"
+                            logging.info("[STT] Phase 2 complete: status=ready")
+                            return
+                        except Exception as e:
+                            logging.exception("[STT] KV cache allocation failed: %s", e)
+                            return
+                    time.sleep(1.0)
+
+            threading.Thread(target=_poll_allocate_signal, daemon=True).start()
+
+        # Health check + allocate_kv_cache handler
+        def _respond(request, status_code, body):
+            """Return HTTP response and log in uvicorn-like format."""
+            reason = "OK" if status_code == 200 else "Service Unavailable" if status_code == 503 else str(status_code)
+            # Log like: INFO: 127.0.0.1:PORT - "GET /health HTTP/1.1" 200 OK
+            try:
+                addr = getattr(connection, "remote_address", ("?", "?"))
+                host_port = f"{addr[0]}:{addr[1]}" if addr else "?"
+            except Exception:
+                host_port = "?"
+            method = getattr(request, "method", "GET") or "GET"
+            logging.info('INFO:     %s - "%s %s HTTP/1.1" %d %s',
+                         host_port, method, request.path, status_code, reason)
+            return Response(status_code, reason, Headers(), body if isinstance(body, bytes) else body.encode())
+
         def process_request(connection, request):
-            if request.path == "/health":
-                return Response(200, "OK", Headers(), b'{"status":"ok"}\n')
+            # request.path may include query string; split it
+            raw_path = str(request.path)
+            path = raw_path.split("?")[0]
+            query_string = raw_path.split("?", 1)[1] if "?" in raw_path else ""
+
+            if path == "/health":
+                if stt_status["value"] == "ready":
+                    return _respond(request, 200, b'{"status":"ok"}\n')
+                else:
+                    return _respond(request, 503, json.dumps({"status": stt_status["value"]}).encode() + b"\n")
+
+            if path == "/startup":
+                return _respond(request, 200, json.dumps({"status": stt_status["value"]}).encode() + b"\n")
+
+            if path == "/allocate_kv_cache":
+                if stt_status["value"] == "ready":
+                    return _respond(request, 200, b'{"status":"already_ready"}\n')
+                if stt_status["value"] != "weights_ready":
+                    return _respond(request, 409, json.dumps({"error": f"status={stt_status['value']}"}).encode() + b"\n")
+
+                try:
+                    import urllib.parse
+                    fraction = 0.05
+                    if query_string:
+                        params = urllib.parse.parse_qs(query_string)
+                        fraction = float(params.get("fraction", [0.05])[0])
+
+                    logging.info("[STT] allocating KV cache (fraction=%.3f)", fraction)
+                    from whisper_live.backend.trt_backend import ServeClientTensorRT
+                    transcriber = ServeClientTensorRT.SINGLE_MODEL
+                    transcriber.allocate_kv_cache(kv_cache_fraction=fraction)
+
+                    # Now do warmup
+                    _assets = os.environ.get("ASSETS_DIR", "/app/assets")
+                    warmup_audio = os.path.join(_assets, "jfk.flac")
+                    logging.info("Warming up TensorRT engine (10 steps)...")
+                    mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
+                    for _ in range(10):
+                        transcriber.transcribe(mel)
+                    logging.info("TensorRT warmup complete.")
+
+                    # Start batch worker if configured
+                    if self.batch_config is not None and ServeClientTensorRT.BATCH_WORKER is None:
+                        from whisper_live.batch_inference_trt import BatchInferenceTRTWorker
+                        worker = BatchInferenceTRTWorker(
+                            transcriber=transcriber,
+                            **self.batch_config,
+                        )
+                        worker.start()
+                        ServeClientTensorRT.BATCH_WORKER = worker
+                        logging.info("TRT batch inference worker started after KV allocation.")
+
+                    stt_status["value"] = "ready"
+                    body = b'{"status":"ready"}\n'
+                    return Response(200, "OK", Headers(), body)
+                except Exception as e:
+                    logging.exception("[STT] KV cache allocation failed: %s", e)
+                    body = json.dumps({"error": str(e)}).encode() + b"\n"
+                    return Response(500, "Internal Server Error", Headers(), body)
+
             return None  # proceed with WebSocket upgrade
 
         # Original WebSocket server (always supported)

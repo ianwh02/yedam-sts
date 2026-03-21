@@ -1,25 +1,19 @@
 # syntax=docker/dockerfile:1
 # WhisperLive TensorRT-LLM STT Server for yedam-sts
-# Target: RTX 5060 Ti 16GB (SM 120 Blackwell)
 #
-# Uses NGC release container (TRT-LLM pre-installed, sm_120 supported).
-# TRT engines are architecture-specific and built on first startup.
+# Requires the slimmed NGC base image (built once):
+#   cd stt-server && docker build -f Dockerfile.ngc-slim -t ngc-trtllm-slim:1.2.0 .
 #
 # Build: docker compose -f docker-compose.yml -f docker-compose.tensorrt.yml build stt
 # Run:   docker compose -f docker-compose.yml -f docker-compose.tensorrt.yml up
 
-FROM nvcr.io/nvidia/tensorrt-llm/release:1.2.0
+FROM ngc-trtllm-slim:1.2.0
 
 ARG DEBIAN_FRONTEND=noninteractive
-
-# Install curl for healthcheck (may already be present in NGC image)
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Whisper examples (convert_checkpoint.py + build scripts)
-# Path changed in TRT-LLM 1.x: examples/whisper -> examples/models/core/whisper
 RUN if [ -d /app/tensorrt_llm/examples/models/core/whisper ]; then \
         cp -r /app/tensorrt_llm/examples/models/core/whisper /app/trt-whisper-examples; \
     elif [ -d /opt/tensorrt_llm/examples/models/core/whisper ]; then \
@@ -40,9 +34,9 @@ RUN mkdir -p /app/assets && \
     https://raw.githubusercontent.com/openai/whisper/main/tests/jfk.flac
 
 # Python deps for WhisperLive server
-# Note: torch, tensorrt_llm already installed in NGC base image
+# Note: torch, tensorrt_llm already installed in base image
 COPY requirements.tensorrt.txt .
-RUN pip install --no-cache-dir -r requirements.tensorrt.txt
+RUN pip install --no-cache-dir --break-system-packages -r requirements.tensorrt.txt
 
 # Copy WhisperLive source
 COPY whisper_live/ ./whisper_live/

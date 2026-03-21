@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import math
 from collections import OrderedDict
@@ -245,7 +246,8 @@ class WhisperTRTLLM(object):
                  num_beams=1,
                  debug_mode=False,
                  max_output_len=96,
-                 max_batch_size=8):
+                 max_batch_size=8,
+                 defer_kv_cache=False):
         world_size = 1
         runtime_rank = tensorrt_llm.mpi_rank()
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
@@ -265,11 +267,31 @@ class WhisperTRTLLM(object):
             task=task,
         )
 
+        self.use_py_session = use_py_session
+        self.model_runner_cpp = None
+        self._kv_allocated = False
+
         if use_py_session:
             self.encoder = WhisperEncoding(engine_dir)
             self.decoder = WhisperDecoding(engine_dir,
                                         runtime_mapping,
                                         debug_mode=False)
+            self._kv_allocated = True
+        elif defer_kv_cache:
+            # Phase 1: store params for deferred ModelRunnerCpp creation.
+            # Engine files are memory-mapped by TRT at from_dir() time, so
+            # deferring this call also defers the bulk of GPU memory allocation.
+            self._deferred_runner_kwargs = dict(
+                engine_dir=engine_dir,
+                is_enc_dec=True,
+                max_batch_size=max_batch_size,
+                max_input_len=3000,
+                max_output_len=max_output_len,
+                max_beam_width=num_beams,
+                debug_mode=debug_mode,
+                cross_kv_cache_fraction=0.5,
+            )
+            logger.info("[WhisperTRTLLM] defer_kv_cache=True, ModelRunnerCpp deferred")
         else:
             json_config = GptJsonConfig.parse_file(engine_dir / 'decoder' /
                                                    'config.json')
@@ -281,11 +303,31 @@ class WhisperTRTLLM(object):
                                  max_output_len=max_output_len,
                                  max_beam_width=num_beams,
                                  debug_mode=debug_mode,
-                                 kv_cache_free_gpu_memory_fraction=0.05,
+                                 kv_cache_free_gpu_memory_fraction=float(os.environ.get("STT_KV_CACHE_FREE_GPU_FRACTION", "0.05")),
                                  cross_kv_cache_fraction=0.5)
             self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
+            self._kv_allocated = True
         self.filters = mel_filters(self.device, self.n_mels, assets_dir)
-        self.use_py_session = use_py_session
+
+    def allocate_kv_cache(self, kv_cache_fraction: float = 0.05):
+        """Phase 2: create ModelRunnerCpp with the given KV cache fraction.
+
+        Called by the VRAM coordinator after all services have loaded weights.
+        """
+        if self._kv_allocated:
+            logger.warning("[WhisperTRTLLM] KV cache already allocated")
+            return
+        if not hasattr(self, "_deferred_runner_kwargs"):
+            raise RuntimeError("allocate_kv_cache called but defer_kv_cache was not set")
+        kwargs = self._deferred_runner_kwargs
+        kwargs["kv_cache_free_gpu_memory_fraction"] = kv_cache_fraction
+        logger.info(
+            "[WhisperTRTLLM] creating ModelRunnerCpp (kv_cache_fraction=%.3f)", kv_cache_fraction
+        )
+        self.model_runner_cpp = ModelRunnerCpp.from_dir(**kwargs)
+        self._kv_allocated = True
+        del self._deferred_runner_kwargs
+        logger.info("[WhisperTRTLLM] KV cache allocated")
 
     def log_mel_spectrogram(
         self,

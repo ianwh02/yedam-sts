@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+# One-time build: slimmed NGC TensorRT-LLM base image.
+# Strips ~8GB of unused packages. Build once, reuse forever.
+#
+# Build:  docker build -f Dockerfile.ngc-slim -t ngc-trtllm-slim:1.2.0 .
+# (Only rebuild when upgrading TRT-LLM version)
+
+FROM nvcr.io/nvidia/tensorrt-llm/release:1.2.0 AS ngc-clean
+
+RUN pip uninstall -y \
+        flash-attn \
+        nvidia-dali-cuda120 \
+        apex \
+        transformer-engine \
+        torchao \
+        torchtitan \
+        lightning-thunder \
+        nvfuser \
+        pytest pytest-xdist pytest-rerunfailures pytest-shard pytest-flakefinder \
+        hypothesis xdoctest expecttest mock \
+    && rm -rf /opt/nvidia/nsight-systems* /opt/nvidia/nsight-compute* \
+              /usr/local/cuda/nsight* \
+    && rm -rf /app/tensorrt_llm/benchmarks/cpp/bertBenchmark \
+              /app/tensorrt_llm/benchmarks/cpp/gptManagerBenchmark \
+              /app/tensorrt_llm/benchmarks/cpp/disaggServerBenchmark \
+    && rm -rf /opt/pytorch /opt/transfer \
+    && rm -rf /root/.cache/pip /root/.cache/uv \
+              /usr/share/doc /usr/share/man \
+              /var/lib/apt/lists/* /var/cache/apt/*
+
+FROM scratch
+COPY --from=ngc-clean / /
+
+ENV SHELL=/bin/bash \
+    BASH_ENV=/etc/bash.bashrc \
+    PATH=/usr/local/lib/python3.12/dist-packages/torch_tensorrt/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/tensorrt/bin \
+    LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/lib/python3.12/dist-packages/torch_tensorrt/lib:/usr/local/cuda/compat/lib:/usr/local/nvidia/lib:/usr/local/nvidia/lib64 \
+    LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+    CUDA_HOME=/usr/local/cuda \
+    CUDA_MODULE_LOADING=LAZY \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_REQUIRE_CUDA="cuda>=9.0" \
+    OPAL_PREFIX=/opt/hpcx/ompi \
+    PYTHONIOENCODING=utf-8 \
+    TRT_LLM_VERSION=1.2.0

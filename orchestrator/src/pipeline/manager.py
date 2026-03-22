@@ -101,6 +101,48 @@ class PipelineManager:
         session.is_active = True
         self.sessions[session_id] = session
 
+        # Wire broadcast callbacks for listener WebSockets
+        broadcast = session.broadcast
+
+        async def _broadcast_stt_partial(text: str):
+            await broadcast.broadcast_text({"type": "stt_partial", "text": text})
+            if callbacks and callbacks.on_stt_partial:
+                await callbacks.on_stt_partial(text)
+
+        async def _broadcast_stt_final(text: str, segment_index: int):
+            await broadcast.broadcast_text({
+                "type": "stt_final", "text": text, "segment_index": segment_index,
+            })
+            if callbacks and callbacks.on_stt_final:
+                await callbacks.on_stt_final(text, segment_index)
+
+        async def _broadcast_translation_partial(token: str, segment_index: int):
+            await broadcast.broadcast_text({
+                "type": "translation_partial", "token": token, "segment_index": segment_index,
+            })
+            if callbacks and callbacks.on_processor_partial:
+                await callbacks.on_processor_partial(token, segment_index)
+
+        async def _broadcast_translation_final(text: str, segment_index: int):
+            await broadcast.broadcast_text({
+                "type": "translation_final", "text": text, "segment_index": segment_index,
+            })
+            if callbacks and callbacks.on_processor_final:
+                await callbacks.on_processor_final(text, segment_index)
+
+        async def _broadcast_tts_audio(pcm_bytes: bytes, segment_index: int, sentence_index: int):
+            await broadcast.broadcast_binary(pcm_bytes)
+            if callbacks and callbacks.on_tts_audio:
+                await callbacks.on_tts_audio(pcm_bytes, segment_index, sentence_index)
+
+        broadcast_callbacks = SessionCallbacks(
+            on_stt_partial=_broadcast_stt_partial,
+            on_stt_final=_broadcast_stt_final,
+            on_processor_partial=_broadcast_translation_partial,
+            on_processor_final=_broadcast_translation_final,
+            on_tts_audio=_broadcast_tts_audio,
+        )
+
         # Create and start the per-session orchestrator
         processor = self._processors.get(proc_type, self._processors["translation"])
         orchestrator = SessionOrchestrator(
@@ -108,7 +150,7 @@ class PipelineManager:
             preprocessor=self._preprocessor,
             processor=processor,
             tts_client=self._tts_client,
-            callbacks=callbacks,
+            callbacks=broadcast_callbacks,
             audio_encoder=self._audio_encoder,
         )
         await orchestrator.start()

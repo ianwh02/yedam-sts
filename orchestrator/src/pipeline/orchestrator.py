@@ -112,6 +112,7 @@ class SessionOrchestrator:
         self._audio_encoder = audio_encoder
         self._stt: STTClient | None = None
         self._tasks: set[asyncio.Task] = set()
+        self._previous_chunk: str | None = None  # last flushed Korean text for LLM context
 
     async def start(self):
         """Create STT client and connect to WhisperLive."""
@@ -167,7 +168,9 @@ class SessionOrchestrator:
             "target_lang": session.target_lang,
             "recent_segments": session.get_llm_context(),
             "segment_index": segment.index,
+            "previous_chunk": self._previous_chunk,
         }
+        self._previous_chunk = korean_text
 
         # Stream processor tokens
         detector = SentenceBoundaryDetector()

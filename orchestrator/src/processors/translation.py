@@ -39,6 +39,7 @@ class TranslationProcessor(BaseProcessor):
             source_lang=context.get("source_lang", "ko"),
             target_lang=context.get("target_lang", "en"),
             recent_segments=context.get("recent_segments", []),
+            previous_chunk=context.get("previous_chunk"),
         )
 
         async for token in self._llm.stream_chat(

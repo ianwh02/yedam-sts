@@ -1,3 +1,5 @@
+import os
+
 from pydantic_settings import BaseSettings
 
 
@@ -21,7 +23,7 @@ class Settings(BaseSettings):
     stt_initial_prompt_vocab: str = ""  # comma-separated domain vocabulary
 
     # LLM context
-    llm_model: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+    llm_model: str = os.environ.get("LLM_MODEL", "Qwen/Qwen3-4B-AWQ")
     llm_context_window_segments: int = 5
     llm_summary_interval_segments: int = 10
 

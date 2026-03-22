@@ -51,7 +51,7 @@ services:
       - "--gpu-memory-utilization"
       - "${LLM_GPU_MEMORY_UTILIZATION:-0.20}"
       - "--max-model-len"
-      - "${LLM_MAX_MODEL_LEN:-512}"
+      - "${LLM_MAX_MODEL_LEN:-2048}"
       - "--max-num-seqs"
       - "${LLM_MAX_NUM_SEQS:-8}"
       - "--enable-prefix-caching"

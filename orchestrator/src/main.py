@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from .api.admin import rest_router as admin_rest_router
 from .api.admin import ws_router as admin_ws_router
+from .api.listener import router as listener_router
 from .audio.opus import OpusEncoder
 from .audio.preprocess import AudioPreprocessor
 from .config import settings
@@ -67,3 +68,5 @@ async def health():
 app.include_router(admin_rest_router, prefix="/api", tags=["admin"])
 # WebSocket (admin audio input)
 app.include_router(admin_ws_router, prefix="/ws/admin", tags=["admin-ws"])
+# WebSocket (listener output: text + TTS audio)
+app.include_router(listener_router, prefix="/ws/listen", tags=["listener-ws"])

@@ -17,6 +17,7 @@ def build_translation_prompt(
     source_lang: str = "ko",
     target_lang: str = "en",
     recent_segments: list[dict] | None = None,
+    previous_chunk: str | None = None,
 ) -> list[dict]:
     """Build the LLM prompt with sliding context window.
 
@@ -26,6 +27,9 @@ def build_translation_prompt(
         target_lang: Target language code.
         recent_segments: List of recent {korean, english} segment pairs
             for translation continuity.
+        previous_chunk: The immediately preceding Korean text chunk (from
+            stable-prefix flushing). Gives the LLM sentence-level context
+            when a flush splits mid-sentence.
 
     Returns:
         OpenAI-format messages list.
@@ -46,7 +50,15 @@ def build_translation_prompt(
                 + "\n---\n".join(context_lines)
             )
 
+    if previous_chunk:
+        user_content = (
+            f"[Previous chunk for context: {previous_chunk}]\n"
+            f"Translate ONLY the following text:\n{text}"
+        )
+    else:
+        user_content = text
+
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": text},
+        {"role": "user", "content": user_content},
     ]

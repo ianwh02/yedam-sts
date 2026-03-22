@@ -26,7 +26,7 @@ class ServeClientTensorRT(ServeClientBase):
         send_last_n_segments=10,
         no_speech_thresh=0.45,
         clip_audio=False,
-        same_output_threshold=10,
+        same_output_threshold=5,
         max_batch_size=1,
     ):
         super().__init__(

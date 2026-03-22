@@ -220,7 +220,7 @@ class TranscriptionServer:
                     send_last_n_segments=options.get("send_last_n_segments", 10),
                     no_speech_thresh=options.get("no_speech_thresh", 0.45),
                     clip_audio=options.get("clip_audio", False),
-                    same_output_threshold=options.get("same_output_threshold", 10),
+                    same_output_threshold=options.get("same_output_threshold", 5),
                     max_batch_size=trt_max_batch,
                 )
                 logging.info("Running TensorRT backend.")
@@ -260,7 +260,7 @@ class TranscriptionServer:
                     send_last_n_segments=options.get("send_last_n_segments", 10),
                     no_speech_thresh=options.get("no_speech_thresh", 0.45),
                     clip_audio=options.get("clip_audio", False),
-                    same_output_threshold=options.get("same_output_threshold", 10),
+                    same_output_threshold=options.get("same_output_threshold", 5),
                 )
                 logging.info("Running OpenVINO backend.")
             except Exception as e:
@@ -294,7 +294,7 @@ class TranscriptionServer:
                     send_last_n_segments=options.get("send_last_n_segments", 10),
                     no_speech_thresh=options.get("no_speech_thresh", 0.45),
                     clip_audio=options.get("clip_audio", False),
-                    same_output_threshold=options.get("same_output_threshold", 10),
+                    same_output_threshold=options.get("same_output_threshold", 5),
                     cache_path=self.cache_path,
                     translation_queue=translation_queue
                 )
@@ -349,6 +349,12 @@ class TranscriptionServer:
                     client = self.client_manager.get_client(websocket)
                     if client:
                         client.clear_buffer()
+                    return "CONTROL"
+                if msg.get("type") == "trim_buffer":
+                    client = self.client_manager.get_client(websocket)
+                    if client:
+                        trim_s = float(msg.get("trim_seconds", 0))
+                        client.trim_buffer(trim_s)
                     return "CONTROL"
             except (json.JSONDecodeError, AttributeError):
                 pass

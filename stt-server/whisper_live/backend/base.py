@@ -331,6 +331,49 @@ class ServeClientBase(object):
         except Exception as e:
             logging.error(f"[ERROR]: Sending buffer_cleared to client: {e}")
 
+    def trim_buffer(self, trim_seconds: float):
+        """Trim the first N seconds of audio from the buffer.
+
+        Unlike clear_buffer which wipes everything, this preserves recent
+        audio. Used by stable-prefix flushing to remove already-transcribed
+        audio without losing speech that arrived after the flush point.
+
+        Sends a buffer_trimmed acknowledgment with the new offset.
+        """
+        with self.lock:
+            if self.frames_np is None or trim_seconds <= 0:
+                return
+
+            trim_samples = int(trim_seconds * self.RATE)
+            if trim_samples >= self.frames_np.shape[0]:
+                # Trim would remove everything — fall back to clear
+                self.frames_np = None
+                self.frames_offset = 0.0
+                self.timestamp_offset = 0.0
+            else:
+                self.frames_np = self.frames_np[trim_samples:]
+                self.frames_offset += trim_seconds
+                if self.timestamp_offset < self.frames_offset:
+                    self.timestamp_offset = self.frames_offset
+
+            self.buffer_epoch += 1
+            self.transcript = []
+            self.text = []
+            self.current_out = ""
+            self.prev_out = ""
+            self.same_output_count = 0
+            self.end_time_for_same_output = None
+
+        logging.info(f"[{self.client_uid}] Buffer trimmed by {trim_seconds:.1f}s")
+        try:
+            self.websocket.send(json.dumps({
+                "uid": self.client_uid,
+                "type": "buffer_trimmed",
+                "trimmed_seconds": trim_seconds,
+            }))
+        except Exception as e:
+            logging.error(f"[ERROR]: Sending buffer_trimmed to client: {e}")
+
     def cleanup(self):
         """
         Perform cleanup tasks before exiting the transcription service.

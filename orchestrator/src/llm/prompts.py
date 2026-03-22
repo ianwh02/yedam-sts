@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-TRANSLATION_SYSTEM_PROMPT = """You are a real-time Korean to English translator for a church sermon. Translate the following Korean text into natural, fluent English. Maintain the spiritual and pastoral tone.
+TRANSLATION_SYSTEM_PROMPT = """/no_think
+You are a real-time Korean to English translator for a church sermon. Translate the following Korean text into natural, fluent English. Maintain the spiritual and pastoral tone.
 
 Rules:
 - Output ONLY the English translation, no explanations or notes

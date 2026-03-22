@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import AsyncGenerator
 
 import httpx
+
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 from ..config import settings
 
@@ -51,6 +54,8 @@ class LLMClient:
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
+        in_think = False
+        think_buf = ""
         async with self._client.stream(
             "POST", "/chat/completions", json=payload
         ) as response:
@@ -70,4 +75,17 @@ class LLMClient:
                     delta = choices[0].get("delta", {})
                     content = delta.get("content", "")
                     if content:
-                        yield content
+                        # Strip Qwen3 <think>...</think> blocks from stream
+                        if in_think:
+                            think_buf += content
+                            if "</think>" in think_buf:
+                                after = think_buf.split("</think>", 1)[1].lstrip()
+                                in_think = False
+                                think_buf = ""
+                                if after:
+                                    yield after
+                        elif "<think>" in content:
+                            in_think = True
+                            think_buf = content
+                        else:
+                            yield content

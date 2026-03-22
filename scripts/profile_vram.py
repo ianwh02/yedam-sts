@@ -196,7 +196,7 @@ async def profile_llm_latency(n_runs: int = 3) -> list[LatencyResult]:
     """Measure LLM latency: time to first token (TTFT) and total completion."""
     results = []
     messages = [
-        {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
+        {"role": "system", "content": "/no_think\nYou are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
         {"role": "user", "content": "오늘 날씨가 정말 좋습니다. 공원에 가서 산책하고 싶습니다."},
     ]
 
@@ -368,7 +368,7 @@ async def profile_e2e_latency():
                 json={
                     "model": LLM_MODEL,
                     "messages": [
-                        {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
+                        {"role": "system", "content": "/no_think\nYou are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                         {"role": "user", "content": text_ko},
                     ],
                     "max_tokens": 50,
@@ -445,7 +445,7 @@ async def profile_e2e_concurrent(concurrency_levels: list[int] | None = None):
             json={
                 "model": LLM_MODEL,
                 "messages": [
-                    {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
+                    {"role": "system", "content": "/no_think\nYou are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                     {"role": "user", "content": text_ko},
                 ],
                 "max_tokens": 50,
@@ -550,7 +550,7 @@ async def profile_individual_services():
             json={
                 "model": LLM_MODEL,
                 "messages": [
-                    {"role": "system", "content": "You are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
+                    {"role": "system", "content": "/no_think\nYou are a Korean to English translator. Translate the Korean text into natural English. Output ONLY the English translation, nothing else."},
                     {"role": "user", "content": "오늘 날씨가 정말 좋습니다. 공원에 가서 산책하고 싶습니다."},
                 ],
                 "max_tokens": 50,

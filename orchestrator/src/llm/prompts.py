@@ -9,7 +9,14 @@ Rules:
 - Use standard Christian theological terms in English
 - Bible verse references should use standard English notation (e.g., Romans 8:28)
 - Maintain the speaker's style (questions, exclamations, pauses)
-- Keep proper nouns in their standard English forms (e.g., 예수님 → Jesus, 하나님 → God)"""
+- Keep proper nouns in their standard English forms (e.g., 예수님 → Jesus, 하나님 → God)
+- Consistent terminology: 청년 = young adult/youth, 집사님 = deacon, 장로님 = elder, 목사님 = pastor
+
+STT error correction:
+The input comes from live speech recognition and may contain errors.
+- The speaker frequently code-switches to English. Garbled Korean that sounds like English should be interpreted as English (e.g. 에이블 = able, 히미 = Him, 나와 투 = now to, 후이즈 = who is).
+- 능히 하신다 = He is able (key sermon phrase).
+- Fix obvious mishearings based on sermon context."""
 
 
 def build_translation_prompt(

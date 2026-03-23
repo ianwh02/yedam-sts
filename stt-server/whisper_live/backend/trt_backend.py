@@ -162,6 +162,8 @@ class ServeClientTensorRT(ServeClientBase):
     def handle_transcription_output(self, last_segment, duration):
         if self._detector is not None:
             self._handle_korean_flush(last_segment, duration)
+        elif self.flush_mode == "turn_based":
+            self._handle_turn_based(last_segment, duration)
         else:
             segments = self.prepare_segments({"text": last_segment})
             self.send_transcription_to_client(segments)
@@ -250,6 +252,52 @@ class ServeClientTensorRT(ServeClientBase):
 
         if self.eos:
             self.update_timestamp_offset(last_segment, duration)
+
+    def _handle_turn_based(self, last_segment, duration):
+        """Handle transcription for turn-based chat mode.
+
+        Sends partials while the speaker talks. When EOS (end of speech)
+        is detected via server-side VAD, marks the full text as completed
+        and clears the buffer for the next turn.
+        """
+        full_text = last_segment.strip() if isinstance(last_segment, str) else ""
+        if not full_text:
+            return
+
+        if self.eos:
+            # Speaker stopped — flush entire transcript as completed
+            segment = self.format_segment(
+                self.timestamp_offset,
+                self.timestamp_offset + duration,
+                full_text,
+                completed=True,
+            )
+            segment["flush_type"] = "turn"
+            try:
+                self.websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "segments": [segment],
+                }))
+            except Exception as e:
+                logging.error(f"[ERROR]: Sending turn segment: {e}")
+            self.update_timestamp_offset(last_segment, duration)
+            self._internal_trim()
+            logging.info(f"[{self.client_uid}] Turn flush ({len(full_text)} chars)")
+        else:
+            # Still speaking — send as partial
+            segment = self.format_segment(
+                self.timestamp_offset,
+                self.timestamp_offset + duration,
+                full_text,
+                completed=False,
+            )
+            try:
+                self.websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "segments": [segment],
+                }))
+            except Exception as e:
+                logging.error(f"[ERROR]: Sending partial segment: {e}")
 
     def _internal_trim(self):
         """Trim already-processed audio after a sentence flush.

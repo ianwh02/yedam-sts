@@ -372,6 +372,15 @@ python scripts/profile_vram.py
 - [ ] Legacy GPU compatibility (SM75 / T4 — TTS needs CUDA compute cap rebuild, vLLM needs `--dtype float16`)
 - [ ] Punctuation-based flush detector for non-Korean languages
 
+## Acknowledgements
+
+- [WhisperLive](https://github.com/collabora/WhisperLive) by Collabora — STT server foundation
+- [nano-qwen3tts-vllm](https://github.com/tsdocode/nano-qwen3tts-vllm) by tsdocode — TTS inference engine
+- [vLLM](https://github.com/vllm-project/vllm) — LLM serving with continuous batching
+- [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS) by Alibaba — TTS model
+- [Qwen3-TTS-Tokenizer-12Hz-48kHz](https://huggingface.co/tsdocode/Qwen3-TTS-Tokenizer-12Hz-48kHz) by tsdocode — 48kHz decoder
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) by SYSTRAN — CTranslate2 Whisper backend
+
 ## License
 
 MIT

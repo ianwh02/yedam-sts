@@ -49,9 +49,6 @@ def prepare_custom_voice_prompt(
     texts = _ensure_list(text)
     languages = _ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
     speakers = _ensure_list(speaker)
-    # Only disable instruct for 0.6B model (which doesn't support it)
-    if model_size == "0b6" or model_size == "0.6b":
-        instruct = None
     instructs = _ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
 
     if len(languages) == 1 and len(texts) > 1:

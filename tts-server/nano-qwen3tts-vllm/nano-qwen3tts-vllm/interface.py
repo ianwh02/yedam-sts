@@ -456,7 +456,12 @@ class Qwen3TTSInterface:
         try:
             # Try to load speech tokenizer
             if HAS_SPEECH_TOKENIZER:
-                self.speech_tokenizer = SpeechTokenizer("Qwen/Qwen3-TTS-Tokenizer-12Hz", dtype=torch.bfloat16)
+                # Skip loading if SHARE_SPEECH_TOKENIZER=1 (server.py will inject the shared one)
+                if os.environ.get("SHARE_SPEECH_TOKENIZER", "0") == "1":
+                    self.speech_tokenizer = None
+                else:
+                    tokenizer_dir = os.environ.get("TOKENIZER_DIR", "Qwen/Qwen3-TTS-Tokenizer-12Hz")
+                    self.speech_tokenizer = SpeechTokenizer(tokenizer_dir, dtype=torch.bfloat16)
             
             # Try to load speaker encoder from model
             # Check if speaker_encoder exists in the model
@@ -1111,6 +1116,31 @@ class Qwen3TTSInterface:
             SamplingParams(temperature=self.TTS_PREDICTOR_TEMPERATURE, max_tokens=17),
         )
     
+    async def generate_voice_design_async(
+        self, text: str, instruct: str, language: str = "Auto",
+    ):
+        """Async generator of codebook_id chunks for voice design mode."""
+        if not (self._use_mp_engines and self._mp_holder is not None):
+            raise RuntimeError("generate_voice_design_async requires start_zmq_tasks() to be called first")
+
+        input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
+            text=text, language=language, speaker="",
+            instruct=instruct,
+            processor=self.processor, device=self.device,
+        )
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = prepare_inputs(
+            config=self.model_config,
+            input_ids=input_ids, instruct_ids=instruct_ids,
+            languages=languages, speakers=None,
+            non_streaming_mode=True,
+            text_embedding=self.text_embedding, input_embedding=self.input_embedding,
+            text_projection=self.text_projection, device=self.device,
+        )
+        async for chunk in self.generate_async(
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask
+        ):
+            yield chunk
+
     async def start_zmq_tasks(self) -> None:
         """Start multiprocess engines (talker + predictor workers) and asyncio orchestrator loops."""
         if self._zmq_tasks_started:
@@ -1179,7 +1209,8 @@ class Qwen3TTSInterface:
         )
 
     async def generate_custom_voice_async(
-        self, text: str, language: str = "English", speaker: str = "Vivian"
+        self, text: str, language: str = "English", speaker: str = "Vivian",
+        instruct: str | None = None,
     ):
         """Async generator of codebook_id chunks. Call await start_zmq_tasks() first."""
         if not (self._use_mp_engines and self._mp_holder is not None):
@@ -1189,6 +1220,7 @@ class Qwen3TTSInterface:
             """CPU/GPU prep work (run inside executor)."""
             input_ids, instruct_ids, speakers, languages = prepare_custom_voice_prompt(
                 text=text, language=language, speaker=speaker,
+                instruct=instruct,
                 processor=self.processor, device=self.device,
             )
             return prepare_inputs(

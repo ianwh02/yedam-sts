@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -131,6 +132,8 @@ def get_free_vram_mb() -> int:
     return int(result.stdout.strip().split("\n")[0])
 
 
+
+
 def get_service_status(name: str) -> str | None:
     """Get startup status. Uses /startup for TTS/STT, /health for vLLM."""
     container, port = SERVICE_CONTAINERS[name]
@@ -216,33 +219,40 @@ def allocate_kv_caches(
         log.info("No services need KV cache allocation (all already ready)")
         return
 
-    # Subtract fixed costs (engine weights) that must be loaded during allocation.
-    # STT TRT's from_dir() loads engines + allocates KV cache in one call, so
-    # engine weight cost must come from the available pool before KV distribution.
-    fixed_costs = sum(
-        s["fixed_mb"] for s in services_to_allocate.values() if s["needs_engine_load"]
+    cache_path = os.path.join(os.path.dirname(__file__), "..", ".vram_cache.json")
+
+    # Partial restart = some services already ready, only some need allocation.
+    # Full start = all GPU services need allocation.
+    is_partial_restart = any(
+        s == "ready" for s in statuses.values()
     )
-    kv_pool_mb = max(0, available_mb - fixed_costs)
 
-    log.info("Fixed costs (engine loading): %d MB, KV pool: %d MB", fixed_costs, kv_pool_mb)
+    # Load cache only on partial restarts — full starts always recalculate
+    cached = {}
+    if is_partial_restart and os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                cached = json.load(f)
+            log.info("Partial restart detected — using cached allocations")
+        except Exception:
+            pass
+    elif not is_partial_restart:
+        log.info("Full start — recalculating allocations")
 
-    # Distribute KV pool by priority weights
+    kv_pool_mb = available_mb
     total_priority = sum(s["priority"] for s in services_to_allocate.values())
+
     allocations = {}
     for svc_name, svc_info in services_to_allocate.items():
-        kv_share_mb = int(kv_pool_mb * svc_info["priority"] / total_priority)
-        kv_share_mb = max(svc_info["min_mb"], kv_share_mb)
-
-        if svc_info["needs_engine_load"]:
-            # STT TRT: total = engine weights (fixed) + KV cache (variable)
-            total_mb = svc_info["fixed_mb"] + kv_share_mb
-            allocations[svc_name] = {"total_mb": total_mb, "kv_mb": kv_share_mb}
-            log.info("  %s: engines=%d MB + kv=%d MB = %d MB total",
-                     svc_name, svc_info["fixed_mb"], kv_share_mb, total_mb)
+        if svc_name in cached:
+            kv_mb = cached[svc_name]
+            log.info("  %s: kv=%d MB (cached)", svc_name, kv_mb)
         else:
-            # TTS: weights already loaded, full share goes to KV cache
-            allocations[svc_name] = {"total_mb": kv_share_mb, "kv_mb": kv_share_mb}
-            log.info("  %s: kv=%d MB", svc_name, kv_share_mb)
+            kv_mb = int(kv_pool_mb * svc_info["priority"] / total_priority)
+            kv_mb = max(svc_info["min_mb"], kv_mb)
+            log.info("  %s: kv=%d MB (computed)", svc_name, kv_mb)
+
+        allocations[svc_name] = {"total_mb": kv_mb, "kv_mb": kv_mb}
 
     # Send allocate commands
     for svc_name, alloc in allocations.items():
@@ -252,7 +262,7 @@ def allocate_kv_caches(
             budget_mb = alloc["kv_mb"]
             log.info("  POST %s /allocate_kv_cache (budget_mb=%d)", container, budget_mb)
             code, body = _docker_curl(container, f"/allocate_kv_cache?budget_mb={budget_mb}",
-                                       method="POST", timeout=180)
+                                       method="POST", timeout=360)
         elif svc_name == "stt":
             # STT TRT: from_dir() loads engines then allocates KV from remaining free VRAM.
             # fraction = total_share / free_vram. This tells TRT how much of the free VRAM
@@ -288,6 +298,13 @@ def allocate_kv_caches(
 
         if code == 200:
             log.info("  %s: allocated successfully — %s", svc_name, body)
+            # Cache successful allocation for future restarts
+            cached[svc_name] = alloc["kv_mb"]
+            try:
+                with open(cache_path, "w") as f:
+                    json.dump(cached, f)
+            except Exception:
+                pass
         else:
             log.error("  %s: allocation FAILED (code=%d): %s", svc_name, code, body)
             sys.exit(1)

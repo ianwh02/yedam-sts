@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """E2E pipeline test — Audio → STT → LLM → TTS → Speaker.
 
-Tests the full speech-to-speech pipeline by connecting directly to each service.
-Uses client-side VAD for flush timing, with window fallback for continuous speech.
+Uses rule-based Korean grammar detection (phrase/sentence endings) for flushing
+instead of VAD-only. VAD is demoted to a fallback for English code-switching.
+
+Phrase endings → flush to LLM, keep STT buffer (Whisper retains context)
+Sentence endings → flush to LLM + clear STT buffer (safe, sentence complete)
 
 Usage:
-  python scripts/test_e2e.py --desktop              # desktop audio capture
-  python scripts/test_e2e.py                         # mic input
-  python scripts/test_e2e.py --desktop --no-tts      # skip TTS (text only)
-  python scripts/test_e2e.py --list-devices
+  python scripts/test_e2e_grammar.py --desktop              # desktop audio
+  python scripts/test_e2e_grammar.py                         # mic input
+  python scripts/test_e2e_grammar.py --desktop --no-tts      # text only
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import time
 import httpx
 import numpy as np
 
-logger = logging.getLogger("test_e2e")
+logger = logging.getLogger("test_e2e_grammar")
 
 STT_WS_URL = os.environ.get("STT_WS_URL", "ws://localhost:9090")
 LLM_URL = os.environ.get("LLM_URL", "http://localhost:8000")
@@ -36,7 +38,7 @@ LLM_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 SAMPLE_RATE = 16000
-SAMPLE_RATE_TTS = 24000
+SAMPLE_RATE_TTS = 48000
 SAMPLE_RATE_OUT = 48000
 CHUNK_DURATION_S = 0.1
 CHANNELS = 1
@@ -69,7 +71,7 @@ def _create_audio_source(args) -> tuple:
     chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION_S)
 
     if args.desktop:
-        source = None
+        source = getattr(args, 'monitor_source', None)
         if not source:
             try:
                 result = subprocess.run(
@@ -150,33 +152,24 @@ def _create_audio_source(args) -> tuple:
 
 
 async def run_e2e(args):
-    """Full E2E: Audio → STT → LLM → TTS → Speaker."""
+    """Full E2E: Audio → STT (server-side Korean flush) → LLM → TTS → Speaker."""
     import websockets
-    import torch
 
     start_audio, stop_audio, audio_queue, source_desc = _create_audio_source(args)
 
-    print("=== E2E Pipeline Test: Audio → STT → LLM → TTS → Speaker ===")
+    print("=== E2E Pipeline Test: Server-Side Korean Grammar Flushing ===")
     print(f"STT: {STT_WS_URL}")
     print(f"LLM: {LLM_URL} ({LLM_MODEL})")
     print(f"TTS: {TTS_URL}" if not args.no_tts else "TTS: disabled")
     print(f"Source: {source_desc}")
     print(f"Language: {args.source} → {args.target}")
-    print(f"VAD pause: {args.vad_pause}s, Min speech: {args.min_speech}s, Max speech: {args.max_speech}s")
+    print(f"Flush mode: korean_sermon (server-side)")
     print("─" * 50)
     print("Press Ctrl+C to stop.\n")
-
-    # ── Load Silero VAD ──
-    vad_model, _ = torch.hub.load(
-        repo_or_dir='snakers4/silero-vad', model='silero_vad',
-        trust_repo=True, verbose=False,
-    )
-    vad_model.eval()
 
     loop = asyncio.get_event_loop()
     last_partial = ""
     flush_num = 0
-    flushed_len = 0
     send_seq = 0
     recent_pairs: list[dict] = []
     completed_count = 0
@@ -185,12 +178,6 @@ async def run_e2e(args):
     audio_out_queue: asyncio.Queue[bytes] = asyncio.Queue()
     llm_client = httpx.AsyncClient(timeout=30.0)
     tts_client = httpx.AsyncClient(timeout=60.0)
-
-    # VAD state
-    is_speaking = False
-    speech_start_time = 0.0
-    silence_start_time = 0.0
-    window_flush_pending = False  # set when max_speech exceeded, flush on next partial
 
     transcript_path = f"stt_transcript_{time.strftime('%Y%m%d_%H%M%S')}.txt"
     transcript_file = open(transcript_path, "w", encoding="utf-8")
@@ -211,12 +198,10 @@ async def run_e2e(args):
             return
         flush_num += 1
         clear_line()
-        print(f"  [{args.source}] {text}")
-        transcript_file.write(f"[{args.source}] {text}\n")
-        transcript_file.flush()
+        # Show flush type indicator
+        marker = "★ SENTENCE" if "sentence" in reason else "★ PHRASE" if "phrase" in reason else "★"
+        print(f"  {marker} {reason}: {text}")
         translate_queue.put_nowait((flush_num, text))
-
-    flush_signal: asyncio.Queue[str] = asyncio.Queue()
 
     async with websockets.connect(STT_WS_URL) as ws:
         config = {
@@ -226,6 +211,7 @@ async def run_e2e(args):
             "model": "large-v3",
             "use_vad": True,
             "initial_prompt": args.initial_prompt,
+            "flush_mode": "korean_sermon",
         }
         await ws.send(json.dumps(config))
         ready = await ws.recv()
@@ -236,49 +222,20 @@ async def run_e2e(args):
         print("Server ready.\n")
 
         async def send_audio():
-            """Send audio to Whisper + run client-side VAD."""
-            nonlocal is_speaking, speech_start_time, silence_start_time, window_flush_pending, send_seq
-
+            """Send audio to Whisper — no client-side flushing needed."""
+            nonlocal send_seq
             while True:
                 pcm = await audio_queue.get()
                 await ws.send(pcm)
                 send_seq += 1
 
-                audio_tensor = torch.frombuffer(pcm, dtype=torch.float32).clone()
-                chunk_has_speech = False
-                for offset in range(0, len(audio_tensor) - 511, 512):
-                    window = audio_tensor[offset:offset + 512]
-                    confidence = vad_model(window, SAMPLE_RATE).item()
-                    if confidence > 0.5:
-                        chunk_has_speech = True
-                        break
-
-                now = time.monotonic()
-
-                if chunk_has_speech:
-                    if not is_speaking:
-                        is_speaking = True
-                        speech_start_time = now
-                    silence_start_time = 0.0
-
-                    speech_duration = now - speech_start_time
-                    if speech_duration >= args.max_speech and not window_flush_pending:
-                        window_flush_pending = True
-                else:
-                    if is_speaking and silence_start_time == 0.0:
-                        silence_start_time = now
-                    elif is_speaking and silence_start_time > 0:
-                        silence_duration = now - silence_start_time
-                        speech_duration = silence_start_time - speech_start_time
-
-                        if silence_duration >= args.vad_pause and speech_duration >= args.min_speech:
-                            is_speaking = False
-                            silence_start_time = 0.0
-                            await flush_signal.put(f"pause {silence_duration:.1f}s")
-
         async def receive_transcripts():
-            nonlocal completed_count, last_partial, send_seq
-            nonlocal window_flush_pending, speech_start_time
+            """Receive segments from server. Server handles phrase/sentence detection.
+
+            completed=true segments are flushed to LLM.
+            completed=false segments are displayed as partials.
+            """
+            nonlocal completed_count, last_partial
             async for message in ws:
                 if isinstance(message, bytes):
                     continue
@@ -286,61 +243,50 @@ async def run_e2e(args):
                 data = json.loads(message)
 
                 msg_type = data.get("type", data.get("message", ""))
-
                 if msg_type in ("buffer_cleared", "buffer_trimmed", "final_before_clear"):
-                    if msg_type == "buffer_cleared":
-                        completed_count = 0
+                    completed_count = 0
+                    last_partial = ""
                     continue
 
                 segments = data.get("segments", [])
-                for i, seg in enumerate(segments):
+                for seg in segments:
                     text = seg.get("text", "").strip()
                     completed = seg.get("completed", False)
+                    flush_type = seg.get("flush_type", "")
                     if not text:
                         continue
 
-                    if completed and i >= completed_count:
-                        completed_count = i + 1
-                        do_flush(text, "whisper completed")
+                    if completed:
+                        reason = f"{flush_type}" if flush_type else "completed"
+                        do_flush(text, reason)
                         last_partial = ""
                     else:
                         last_partial = text
-
-                        # Window flush: max_speech exceeded, flush on this partial
-                        if window_flush_pending:
-                            window_flush_pending = False
-                            speech_start_time = time.monotonic()
-                            do_flush(text, "window")
-                            last_partial = ""
-                            await ws.send(json.dumps({"type": "clear_buffer", "seq": send_seq}))
-                        else:
-                            max_display = terminal_width - 12
-                            display = text if len(text) <= max_display else text[:max_display - 3] + "..."
-                            clear_line()
-                            print(f"  partial: {display}", end="", flush=True)
-
-        async def flush_on_vad():
-            """Wait for VAD flush signals — flush last_partial then clear_buffer.
-
-            VAD fires after silence, so Whisper has already transcribed trailing
-            words into last_partial by this point.
-            """
-            nonlocal last_partial, send_seq
-            while True:
-                reason = await flush_signal.get()
-                if last_partial:
-                    do_flush(last_partial, reason)
-                    last_partial = ""
-                    await ws.send(json.dumps({"type": "clear_buffer", "seq": send_seq}))
+                        max_display = terminal_width - 12
+                        display = text if len(text) <= max_display else text[:max_display - 3] + "..."
+                        clear_line()
+                        print(f"  partial: {display}", end="", flush=True)
 
         # Sentence boundary regex for splitting LLM streaming output
         _SENTENCE_END = re.compile(r'[.!?;:]\s|[.!?]$')
 
+        MIN_TRANSLATE_CHARS = 12  # buffer short chunks with next flush
+
         async def translate_worker():
             """Stream LLM translation tokens, split at sentence boundaries, send to TTS."""
+            pending_buffer = ""
             while True:
                 num, korean_text = await translate_queue.get()
                 try:
+                    # Buffer short chunks — prepend to next flush
+                    combined = (pending_buffer + " " + korean_text).strip() if pending_buffer else korean_text
+                    if len(combined) < MIN_TRANSLATE_CHARS and not any(
+                        combined.endswith(m) for m in ("아멘", "할렐루야")
+                    ):
+                        pending_buffer = combined
+                        continue
+                    korean_text = combined
+                    pending_buffer = ""
                     system = (
                         "/no_think\n"
                         "You are a real-time Korean to English translator for a church sermon. "
@@ -440,6 +386,7 @@ async def run_e2e(args):
                     if translation:
                         clear_line()
                         print(f"  [{args.target}] {translation}  ({elapsed:.0f}ms)")
+                        transcript_file.write(f"[{args.source}] {korean_text}\n")
                         transcript_file.write(f"[{args.target}] {translation}\n")
                         transcript_file.flush()
                         recent_pairs.append({"ko": korean_text, "en": translation})
@@ -458,10 +405,13 @@ async def run_e2e(args):
                     t0 = time.monotonic()
                     total_bytes = 0
 
+                    tts_payload = {"text": english_text, "language": args.target, "session_id": "e2e-test"}
+                    if args.instruct:
+                        tts_payload["instruct"] = args.instruct
                     async with tts_client.stream(
                         "POST",
                         f"{TTS_URL}/synthesize/stream",
-                        json={"text": english_text, "language": args.target, "session_id": "e2e-test"},
+                        json=tts_payload,
                     ) as response:
                         if response.status_code == 404:
                             # Streaming not available — fall back to non-streaming
@@ -487,9 +437,12 @@ async def run_e2e(args):
                             continue
 
                     # Fallback: non-streaming
+                    fallback_payload = {"text": english_text, "language": args.target, "session_id": "e2e-test"}
+                    if args.instruct:
+                        fallback_payload["instruct"] = args.instruct
                     resp = await tts_client.post(
                         f"{TTS_URL}/synthesize",
-                        json={"text": english_text, "language": args.target, "session_id": "e2e-test"},
+                        json=fallback_payload,
                         headers={"Accept": "application/octet-stream"},
                     )
                     resp.raise_for_status()
@@ -510,10 +463,17 @@ async def run_e2e(args):
 
         async def play_audio():
             """Play TTS audio through speaker (or virtual sink for Discord)."""
+            import wave
+            wav_path = f"tts_output_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+            wav_file = wave.open(wav_path, 'wb')
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(SAMPLE_RATE_TTS)
+
             if args.tts_sink:
                 # Use paplay to route to specific PipeWire/PulseAudio sink
                 proc = await asyncio.create_subprocess_exec(
-                    "paplay", "--raw", "--rate=24000", "--channels=1",
+                    "paplay", "--raw", f"--rate={SAMPLE_RATE_TTS}", "--channels=1",
                     "--format=s16le", f"--device={args.tts_sink}",
                     stdin=asyncio.subprocess.PIPE,
                 )
@@ -521,6 +481,7 @@ async def run_e2e(args):
                     while True:
                         chunk = await audio_out_queue.get()
                         if proc.stdin and len(chunk) > 0:
+                            wav_file.writeframes(chunk)
                             proc.stdin.write(chunk)
                             await proc.stdin.drain()
                 except asyncio.CancelledError:
@@ -529,6 +490,8 @@ async def run_e2e(args):
                     if proc.stdin:
                         proc.stdin.close()
                     await proc.wait()
+                    wav_file.close()
+                    print(f"  TTS audio saved to {wav_path}")
             else:
                 import sounddevice as sd
 
@@ -543,24 +506,25 @@ async def run_e2e(args):
                 try:
                     while True:
                         chunk = await audio_out_queue.get()
-                        # TTS sends s16le at 24kHz → float32 at 48kHz
                         samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
                         if len(samples) > 0:
-                            # 2x upsample (24kHz → 48kHz) via linear interpolation
-                            indices = np.linspace(0, len(samples) - 1, len(samples) * 2)
-                            resampled = np.interp(indices, np.arange(len(samples)), samples)
-                            stream.write(resampled.reshape(-1, 1).astype(np.float32))
+                            wav_file.writeframes(chunk)
+                            # Run blocking write in thread to avoid stalling event loop
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, stream.write, samples.reshape(-1, 1).astype(np.float32)
+                            )
                 except asyncio.CancelledError:
                     pass
                 finally:
                     stream.stop()
                     stream.close()
+                    wav_file.close()
+                    print(f"  TTS audio saved to {wav_path}")
 
         # ── Build task list ──
         tasks = [
             asyncio.create_task(send_audio()),
             asyncio.create_task(receive_transcripts()),
-            asyncio.create_task(flush_on_vad()),
             asyncio.create_task(translate_worker()),
         ]
         if not args.no_tts:
@@ -590,18 +554,23 @@ def main():
     parser.add_argument("--input-device", type=int, default=None, help="Input device index (mic mode)")
     parser.add_argument("--output-device", type=int, default=None, help="Output device index (speaker)")
     parser.add_argument("--desktop", action="store_true", help="Capture desktop/system audio instead of mic")
+    parser.add_argument("--monitor-source", type=str, default=None, help="PulseAudio monitor source name (e.g. firefox_capture.monitor)")
     parser.add_argument("--no-tts", action="store_true", help="Skip TTS — text output only")
     parser.add_argument("--tts-sink", type=str, default=None, help="PipeWire/PulseAudio sink name for TTS output (e.g. tts_virtual_mic)")
+    parser.add_argument("--instruct", type=str, default=None, help="Voice design instruction (e.g. 'Male, 25 years old, warm and friendly')")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices")
-    parser.add_argument("--vad-pause", type=float, default=0.3, help="Seconds of silence to trigger flush (default: 0.3)")
-    parser.add_argument("--min-speech", type=float, default=0.5, help="Min speech duration before flush (default: 0.5)")
-    parser.add_argument("--max-speech", type=float, default=10.0, help="Max continuous speech before window flush (default: 10.0)")
     parser.add_argument("--initial-prompt", type=str,
                         default="다음은 한국어 기독교 교회 설교 음성입니다. "
-                                "주요 단어: 능히 하신다, 하나님, 예수 그리스도, 성령님, 교회, 예담교회, 청년부, "
+                                "주요 단어: 능히 하신다, 하나님, 예수 그리스도, 성령님, 주님, 아버지 하나님, "
+                                "교회, 예담교회, 청년부, 청년교회, 에베소, 에베소 교회, "
                                 "말씀, 은혜, 구원, 십자가, 부활, 사명, 소명, 넘치도록, 역사하신다, "
-                                "에베소서, 빌립보서, 로마서, 시편, 정체성, 헌신, 순종, "
-                                "바울, 베드로, 모세, 다윗, 고난, 회복, 광야.",
+                                "에베소서, 빌립보서, 로마서, 시편, 고린도서, "
+                                "바울, 바울의 기도, 베드로, 모세, 다윗, 아브라함, "
+                                "정체성, 헌신, 순종, 고난, 회복, 광야, 성장주기, "
+                                "집사님, 목사님, 장로님, 전도사님, 성도, "
+                                "교회 성장주기, 청년기, 어린이 시절, 청소년 시절, "
+                                "무릎을 꿇다, 간절한 기도, 절박한 기도, "
+                                "He is able, who is able, now to Him, amen.",
                         help="Whisper initial prompt for domain vocabulary")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()

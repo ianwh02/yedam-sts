@@ -34,7 +34,7 @@ TTS_URL = "http://localhost:7860"
 SAVE_AUDIO = os.environ.get("SAVE_AUDIO", "1").lower() not in ("0", "false", "no")
 AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", "debug_audio"))
 
-def _save_wav(pcm_bytes: bytes, label: str, sample_rate: int = 24000, sample_format: str = "s16le"):
+def _save_wav(pcm_bytes: bytes, label: str, sample_rate: int = 48000, sample_format: str = "s16le"):
     """Save raw PCM bytes as a WAV file for inspection."""
     if not SAVE_AUDIO or not pcm_bytes:
         return
@@ -73,7 +73,7 @@ TEST_SENTENCES = [
     ("가장 가까운 지하철역을 찾아주시겠습니까?", "ko"),
 ]
 
-SAMPLE_RATE = 24000  # Qwen3-TTS output sample rate
+SAMPLE_RATE = 48000  # Qwen3-TTS output sample rate (48kHz decoder)
 
 
 @dataclass

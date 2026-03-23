@@ -43,7 +43,7 @@ AUDIO_DIR = Path("debug_audio")
 _audio_counter = 0
 
 
-def save_tts_wav(pcm_bytes: bytes, text: str, label: str, sample_rate: int = 24000):
+def save_tts_wav(pcm_bytes: bytes, text: str, label: str, sample_rate: int = 48000):
     """Save raw s16le PCM response as a WAV file for listening."""
     global _audio_counter
     if not SAVE_AUDIO or not pcm_bytes:
@@ -280,7 +280,7 @@ async def profile_tts_latency(n_runs: int = 3) -> list[LatencyResult]:
 
             latency_s = t1 - t0
             latency = latency_s * 1000
-            audio_dur_s = len(resp.content) / 2 / 24000
+            audio_dur_s = len(resp.content) / 2 / 48000
             duration_ms = int(audio_dur_s * 1000)
             rtf = latency_s / audio_dur_s if audio_dur_s > 0 else 0
             audio_kb = len(resp.content) / 1024
@@ -393,7 +393,7 @@ async def profile_e2e_latency():
             tts_s = tts_end - tts_start
             tts_ms = tts_s * 1000
 
-            audio_dur_s = len(resp.content) / 2 / 24000
+            audio_dur_s = len(resp.content) / 2 / 48000
             duration_ms = int(audio_dur_s * 1000)
             rtf = tts_s / audio_dur_s if audio_dur_s > 0 else 0
             save_tts_wav(resp.content, translated, f"e2e_run{i+1}")
@@ -464,7 +464,7 @@ async def profile_e2e_concurrent(concurrency_levels: list[int] | None = None):
             headers={"Accept": "application/octet-stream"},
         )
         tts_s = time.perf_counter() - tts_t0
-        audio_dur_s = len(resp.content) / 2 / 24000
+        audio_dur_s = len(resp.content) / 2 / 48000
         rtf = tts_s / audio_dur_s if audio_dur_s > 0 else 0
         save_tts_wav(resp.content, translated, f"e2e_conc_req{idx+1}")
 
@@ -580,7 +580,7 @@ async def profile_individual_services():
         tts_elapsed = time.perf_counter() - tts_t0
         after = get_vram_mb()
         delta = after["used_mb"] - before["used_mb"]
-        audio_dur_s = len(resp.content) / 2 / 24000
+        audio_dur_s = len(resp.content) / 2 / 48000
         duration_ms = int(audio_dur_s * 1000)
         rtf = tts_elapsed / audio_dur_s if audio_dur_s > 0 else 0
         save_tts_wav(resp.content, "The weather is really nice today I want to go for a walk", "vram_baseline")

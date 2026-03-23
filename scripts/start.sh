@@ -54,6 +54,32 @@ if $DEV_MODE; then
     COMPOSE_CMD+=(-f docker-compose.dev.yml)
 fi
 
+# Stop GPU services whose config/image changed to ensure clean CUDA context release.
+# docker compose up -d recreates changed containers, but the old CUDA context may
+# not fully release before the new process allocates. Explicit stop avoids this.
+# Detect which GPU services need recreating
+CHANGED_SERVICES=()
+DRY_OUTPUT=$("${COMPOSE_CMD[@]}" up -d --no-deps --dry-run tts stt llm 2>&1 || true)
+echo "$DRY_OUTPUT" | grep -q "yedam-tts.*Recreate" && CHANGED_SERVICES+=(tts)
+echo "$DRY_OUTPUT" | grep -q "yedam-llm.*Recreate" && CHANGED_SERVICES+=(llm)
+echo "$DRY_OUTPUT" | grep -q "yedam-stt.*Recreate" && CHANGED_SERVICES+=(stt)
+
+# LLM must start first (vLLM measures free VRAM at boot). If LLM changed,
+# all GPU services must restart so VRAM is allocated cleanly.
+LLM_CHANGED=false
+for svc in "${CHANGED_SERVICES[@]}"; do
+    [ "$svc" = "llm" ] && LLM_CHANGED=true
+done
+if $LLM_CHANGED; then
+    CHANGED_SERVICES=(llm tts stt)
+fi
+
+if [ ${#CHANGED_SERVICES[@]} -gt 0 ]; then
+    echo "=== Stopping changed services for clean VRAM state: ${CHANGED_SERVICES[*]} ==="
+    "${COMPOSE_CMD[@]}" stop "${CHANGED_SERVICES[@]}" 2>/dev/null || true
+    sleep 2  # allow CUDA contexts to fully release
+fi
+
 # Phase 1a: start LLM first (vLLM checks free VRAM at startup — must run before others)
 echo "=== Phase 1a: Starting LLM ==="
 "${COMPOSE_CMD[@]}" up -d --no-deps llm

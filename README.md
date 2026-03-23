@@ -40,13 +40,13 @@ Audio In → [STT] → confirmed text → [Processor] → translated text → [T
 
 ### Services
 
-| Service | Model | VRAM | Role |
+| Service | Model | VRAM (weights + KV cache + CUDA overhead) | Role |
 |---------|-------|------|------|
-| **STT** | Whisper large-v3-turbo (int8_float16) | ~1.5 GB | Speech recognition |
+| **STT** | Whisper large-v3-turbo (int8_float16) | ~2.0 GB | Speech recognition |
 | **LLM** | Qwen3-4B-AWQ (4-bit) | ~3.3 GB | Translation / processing |
-| **TTS** | Qwen3-TTS 0.6B (FP16) | ~5.9 GB | Speech synthesis |
+| **TTS** | Qwen3-TTS 0.6B (FP16) + tokenizer + CUDA graphs | ~5.9 GB | Speech synthesis |
 | **Orchestrator** | — (CPU only) | 0 | Session management |
-| **Total** | | **~10-12 GB** | Fits 16GB with headroom |
+| **Total** | | **~11.2 GB** | Fits 16GB with ~4 GB headroom |
 
 ### Source Repos and Modifications
 

@@ -108,29 +108,17 @@ class TTSClient:
         )
         await queue.put(item)
 
+    def _make_silence(self, duration_ms: int, sample_rate: int = 48000) -> bytes:
+        """Generate s16le silence of the given duration."""
+        n_samples = int(sample_rate * duration_ms / 1000)
+        return np.zeros(n_samples, dtype=np.int16).tobytes()
+
     async def _consume_loop(self, session_id: str, queue: asyncio.Queue):
         """Process TTS queue items for a single session."""
         while True:
             item = await queue.get()
             if item is None:
                 break
-
-            # Staleness check: queue depth
-            if queue.qsize() > settings.tts_stale_threshold:
-                logger.warning(
-                    "Dropping stale TTS (queue=%d, session=%s): %s...",
-                    queue.qsize(), session_id, item.text[:50],
-                )
-                continue
-
-            # Staleness check: age
-            age = time.time() - item.enqueued_at
-            if age > settings.tts_stale_max_age_seconds:
-                logger.warning(
-                    "Dropping aged TTS (%.1fs old, session=%s): %s...",
-                    age, session_id, item.text[:50],
-                )
-                continue
 
             # Acquire semaphore to limit total concurrent TTS requests
             async with self._semaphore:
@@ -142,6 +130,13 @@ class TTSClient:
                         callbacks = self._on_audio.get(item.session_id, [])
                         for cb in callbacks:
                             await cb(audio_bytes, item)
+
+                    # Append consistent inter-segment silence
+                    if settings.tts_inter_segment_pause_ms > 0:
+                        pause = self._make_silence(settings.tts_inter_segment_pause_ms)
+                        callbacks = self._on_audio.get(item.session_id, [])
+                        for cb in callbacks:
+                            await cb(pause, item)
                 except Exception:
                     logger.exception("TTS synthesis failed for: %s...", item.text[:50])
 

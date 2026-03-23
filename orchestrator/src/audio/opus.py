@@ -16,7 +16,7 @@ class OpusEncoder:
     (encode once, send many).
     """
 
-    def __init__(self, sample_rate: int = 24000, channels: int = 1):
+    def __init__(self, sample_rate: int = 48000, channels: int = 1):
         self._sample_rate = sample_rate
         self._channels = channels
         self._encoder = None

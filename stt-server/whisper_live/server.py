@@ -222,6 +222,11 @@ class TranscriptionServer:
                     clip_audio=options.get("clip_audio", False),
                     same_output_threshold=options.get("same_output_threshold", 5),
                     max_batch_size=trt_max_batch,
+                    initial_prompt=options.get("initial_prompt"),
+                    flush_mode=options.get("flush_mode", "default"),
+                    min_phrase_chars=options.get("min_phrase_chars", 12),
+                    min_sentence_chars=options.get("min_sentence_chars", 6),
+                    stability_count=options.get("stability_count", 2),
                 )
                 logging.info("Running TensorRT backend.")
 
@@ -348,7 +353,8 @@ class TranscriptionServer:
                 if msg.get("type") == "clear_buffer":
                     client = self.client_manager.get_client(websocket)
                     if client:
-                        client.clear_buffer()
+                        seq = msg.get("seq")  # None if not provided (backward compat)
+                        client.clear_buffer(seq=seq)
                     return "CONTROL"
                 if msg.get("type") == "trim_buffer":
                     client = self.client_manager.get_client(websocket)

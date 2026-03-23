@@ -52,6 +52,7 @@ class TRTBatchRequest:
     task: str = "transcribe"
     use_vad: bool = True
     vad_parameters: Optional[Dict] = None
+    text_prefix_override: Optional[str] = None  # custom decoder prompt (e.g. with prev transcript context)
     # Signaling
     future: threading.Event = field(default_factory=threading.Event)
     # Results (filled by batch worker)
@@ -200,10 +201,13 @@ class BatchInferenceTRTWorker:
         try:
             prompt_tensors = []
             for req, mel, duration in preprocessed:
-                text_prefix = (
-                    f"<|startoftranscript|><|{req.language}|>"
-                    f"<|{req.task}|><|notimestamps|>"
-                )
+                if req.text_prefix_override:
+                    text_prefix = req.text_prefix_override
+                else:
+                    text_prefix = (
+                        f"<|startoftranscript|><|{req.language}|>"
+                        f"<|{req.task}|><|notimestamps|>"
+                    )
                 prompt_id = self.transcriber.tokenizer.encode(
                     text_prefix,
                     allowed_special=set(

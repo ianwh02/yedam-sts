@@ -62,6 +62,12 @@ class ServeClientBase(object):
         # to discard stale results processed from pre-clear audio data.
         self.buffer_epoch = 0
 
+        # Sequence-numbered chunk tracking for zero-loss clear_buffer.
+        # Each audio chunk gets a seq number; clear_buffer(seq=N) preserves
+        # chunks with seq > N ("spillover") instead of wiping everything.
+        self._chunk_seq = 0
+        self._chunk_boundaries: list[tuple[int, int]] = []  # [(seq, sample_offset), ...]
+
         # threading
         self.lock = threading.Lock()
 
@@ -165,35 +171,50 @@ class ServeClientBase(object):
             'completed': completed
         }
 
-    def add_frames(self, frame_np):
+    def add_frames(self, frame_np, seq=None):
         """
         Add audio frames to the ongoing audio stream buffer.
 
-        This method is responsible for maintaining the audio stream buffer, allowing the continuous addition
-        of audio frames as they are received. It also ensures that the buffer does not exceed a specified size
-        to prevent excessive memory usage.
-
-        If the buffer size exceeds a threshold (45 seconds of audio data), it discards the oldest 30 seconds
-        of audio data to maintain a reasonable buffer size. If the buffer is empty, it initializes it with the provided
-        audio frame. The audio stream buffer is used for real-time processing of audio data for transcription.
+        Maintains a rolling buffer (max 45s, trims oldest 30s on overflow).
+        Tracks chunk sequence numbers for zero-loss clear_buffer.
 
         Args:
             frame_np (numpy.ndarray): The audio frame data as a NumPy array.
-
+            seq (int, optional): Chunk sequence number from the client.
         """
         self.lock.acquire()
-        if self.frames_np is not None and self.frames_np.shape[0] > 45*self.RATE:
+
+        # Auto-increment seq if not provided (backward compat)
+        if seq is None:
+            self._chunk_seq += 1
+            seq = self._chunk_seq
+        else:
+            self._chunk_seq = seq
+
+        # Overflow trim: discard oldest 30s if buffer exceeds 45s
+        if self.frames_np is not None and self.frames_np.shape[0] > 45 * self.RATE:
+            trim_samples = int(30 * self.RATE)
             self.frames_offset += 30.0
-            self.frames_np = self.frames_np[int(30*self.RATE):]
-            # check timestamp offset(should be >= self.frame_offset)
-            # this basically means that there is no speech as timestamp offset hasnt updated
-            # and is less than frame_offset
+            self.frames_np = self.frames_np[trim_samples:]
             if self.timestamp_offset < self.frames_offset:
                 self.timestamp_offset = self.frames_offset
+            # Prune chunk boundaries that fall within trimmed region
+            self._chunk_boundaries = [
+                (s, off - trim_samples)
+                for s, off in self._chunk_boundaries
+                if off >= trim_samples
+            ]
+
+        # Record boundary before appending
+        current_len = self.frames_np.shape[0] if self.frames_np is not None else 0
+        self._chunk_boundaries.append((seq, current_len))
+
+        # Append audio
         if self.frames_np is None:
             self.frames_np = frame_np.copy()
         else:
             self.frames_np = np.concatenate((self.frames_np, frame_np), axis=0)
+
         self.lock.release()
 
     def clip_audio_if_no_valid_segment(self):
@@ -299,35 +320,58 @@ class ServeClientBase(object):
             "message": self.DISCONNECT
         }))
 
-    def clear_buffer(self):
+    def clear_buffer(self, seq=None):
         """
         Clear the audio buffer and reset transcription state.
 
-        Called when the client sends a clear_buffer control message. This allows
-        the client to discard accumulated audio after an early flush, preventing
-        the server from re-sending stale transcript segments for already-processed
-        speech. Modeled after Deepgram's Finalize / OpenAI's input_audio_buffer.clear.
+        If ``seq`` is provided, only audio from chunks with sequence <= seq is
+        discarded; chunks that arrived after (seq > target) are preserved in the
+        buffer ("spillover").  This eliminates the race condition where audio
+        in-flight during the clear gets lost.
 
-        Sends a buffer_cleared acknowledgment so the client knows all stale
-        messages have been drained (WebSocket ordering guarantees this).
+        If ``seq`` is None, falls back to a full wipe (backward compat).
         """
+        # Send current transcript as finalized before clearing
+        with self.lock:
+            final_text = self.current_out.strip() if self.current_out else ""
+            if not final_text and self.text:
+                final_text = " ".join(self.text).strip()
+
+        if final_text:
+            try:
+                self.websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "segments": [{
+                        "text": final_text,
+                        "start": 0.0,
+                        "end": 0.0,
+                        "completed": True,
+                    }],
+                    "type": "final_before_clear",
+                }))
+                logging.info(f"[{self.client_uid}] Sent final transcript before clear: {final_text[:60]}")
+            except Exception as e:
+                logging.error(f"[ERROR]: Sending final_before_clear: {e}")
+
         with self.lock:
             self.buffer_epoch += 1
             self.frames_np = None
             self.frames_offset = 0.0
             self.timestamp_offset = 0.0
+            self._chunk_boundaries = []
             self.transcript = []
             self.text = []
             self.current_out = ""
             self.prev_out = ""
             self.same_output_count = 0
             self.end_time_for_same_output = None
-        logging.info(f"[{self.client_uid}] Buffer cleared")
+            logging.info(f"[{self.client_uid}] Buffer cleared")
+
         try:
-            self.websocket.send(json.dumps({
-                "uid": self.client_uid,
-                "type": "buffer_cleared",
-            }))
+            ack = {"uid": self.client_uid, "type": "buffer_cleared"}
+            if seq is not None:
+                ack["seq"] = seq
+            self.websocket.send(json.dumps(ack))
         except Exception as e:
             logging.error(f"[ERROR]: Sending buffer_cleared to client: {e}")
 
@@ -346,15 +390,21 @@ class ServeClientBase(object):
 
             trim_samples = int(trim_seconds * self.RATE)
             if trim_samples >= self.frames_np.shape[0]:
-                # Trim would remove everything — fall back to clear
                 self.frames_np = None
                 self.frames_offset = 0.0
                 self.timestamp_offset = 0.0
+                self._chunk_boundaries = []
             else:
                 self.frames_np = self.frames_np[trim_samples:]
                 self.frames_offset += trim_seconds
                 if self.timestamp_offset < self.frames_offset:
                     self.timestamp_offset = self.frames_offset
+                # Prune chunk boundaries
+                self._chunk_boundaries = [
+                    (s, off - trim_samples)
+                    for s, off in self._chunk_boundaries
+                    if off >= trim_samples
+                ]
 
             self.buffer_epoch += 1
             self.transcript = []

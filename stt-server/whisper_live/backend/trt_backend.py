@@ -28,6 +28,11 @@ class ServeClientTensorRT(ServeClientBase):
         clip_audio=False,
         same_output_threshold=5,
         max_batch_size=1,
+        initial_prompt=None,
+        flush_mode="default",
+        min_phrase_chars=12,
+        min_sentence_chars=6,
+        stability_count=2,
     ):
         super().__init__(
             client_uid,
@@ -40,9 +45,25 @@ class ServeClientTensorRT(ServeClientBase):
 
         self.language = language if multilingual else "en"
         self.task = task
+        self.initial_prompt = initial_prompt or ""
+        self.prev_transcript = ""  # updated after each clear_buffer for context continuity
         self.eos = False
         self.max_new_tokens = max_new_tokens
         self.max_batch_size = max_batch_size
+
+        # Flush mode: "default" = standard WhisperLive, "korean_sermon" = grammar-based
+        self.flush_mode = flush_mode
+        self._detector = None
+        if flush_mode == "korean_sermon":
+            from whisper_live.korean_endings import KoreanEndingDetector
+            self._detector = KoreanEndingDetector(
+                min_phrase_chars=min_phrase_chars,
+                min_sentence_chars=min_sentence_chars,
+                stability_count=stability_count,
+            )
+            self._last_sentence_text = ""  # dedup: skip re-transcription of just-flushed sentence
+            self._last_flush_was_phrase = False  # track consecutive phrases for trimming
+            logging.info(f"[{client_uid}] Korean sermon flush mode enabled")
 
         if single_model:
             if ServeClientTensorRT.SINGLE_MODEL is None:
@@ -95,26 +116,193 @@ class ServeClientTensorRT(ServeClientBase):
         for i in range(warmup_steps):
             self.transcriber.transcribe(mel)
 
+    def _build_text_prefix(self):
+        """Build decoder prompt with optional previous transcript context.
+
+        Whisper's initial_prompt mechanism: previous text is prepended with
+        <|startofprev|> token so the decoder has linguistic context after
+        a buffer clear. Limited to ~200 chars to stay within decoder limits.
+        """
+        task_tokens = f"<|startoftranscript|><|{self.language}|><|{self.task}|><|notimestamps|>"
+
+        # Combine initial_prompt + prev_transcript for context
+        context = ""
+        if self.prev_transcript:
+            context = self.prev_transcript[-200:]  # last ~200 chars
+        elif self.initial_prompt:
+            context = self.initial_prompt[:200]
+
+        if context:
+            return f"<|startofprev|>{context}{task_tokens}"
+        return task_tokens
+
+    def clear_buffer(self, seq=None, context=None):
+        """Override to save transcript context before clearing.
+
+        If context is provided by the client, use it (more accurate than
+        current_out which may already be stale). Otherwise fall back to
+        current_out.
+        """
+        with self.lock:
+            if context:
+                self.prev_transcript = context
+            else:
+                self.prev_transcript = self.current_out.strip() if self.current_out else ""
+                if not self.prev_transcript and self.text:
+                    self.prev_transcript = " ".join(self.text).strip()
+        if self._detector:
+            self._detector.reset()
+        super().clear_buffer(seq=seq)
+
     def set_eos(self, eos):
         self.lock.acquire()
         self.eos = eos
         self.lock.release()
 
     def handle_transcription_output(self, last_segment, duration):
-        segments = self.prepare_segments({"text": last_segment})
-        self.send_transcription_to_client(segments)
+        if self._detector is not None:
+            self._handle_korean_flush(last_segment, duration)
+        else:
+            segments = self.prepare_segments({"text": last_segment})
+            self.send_transcription_to_client(segments)
+            if self.eos:
+                self.update_timestamp_offset(last_segment, duration)
+
+    def _handle_korean_flush(self, last_segment, duration):
+        """Handle transcription output with Korean phrase/sentence detection.
+
+        Uses last_segment directly as the full transcript text (TRT backend
+        re-transcribes the entire buffer each pass). The detector tracks
+        flushed_len to only flush new text.
+        """
+        full_text = last_segment.strip() if isinstance(last_segment, str) else ""
+        if not full_text:
+            return
+
+        # After _internal_trim, Whisper re-transcribes remaining audio which may
+        # reproduce the just-flushed sentence ending. Skip if unflushed portion
+        # is just the old sentence text being re-transcribed.
+        if self._last_sentence_text:
+            unflushed_check = full_text[self._detector.flushed_len:].strip()
+            last_clean = self._last_sentence_text.rstrip(".!? ")
+            if not unflushed_check or unflushed_check.rstrip(".!? ") == last_clean:
+                return
+            # Genuinely new content — clear dedup
+            self._last_sentence_text = ""
+
+        decision = self._detector.check(full_text)
+
+        if decision.flush_type in ("phrase", "sentence"):
+            flush_text = decision.text.strip()
+            if flush_text:
+                segment = self.format_segment(
+                    self.timestamp_offset,
+                    self.timestamp_offset + duration,
+                    flush_text,
+                    completed=True,
+                )
+                segment["flush_type"] = decision.flush_type
+                try:
+                    self.websocket.send(json.dumps({
+                        "uid": self.client_uid,
+                        "segments": [segment],
+                    }))
+                except Exception as e:
+                    logging.error(f"[ERROR]: Sending flushed segment: {e}")
+
+                self._detector.on_flushed(decision.flush_type, decision.end_pos)
+                logging.info(
+                    f"[{self.client_uid}] {decision.flush_type} flush: "
+                    f"{decision.reason} ({len(flush_text)} chars)"
+                )
+
+                # Trim processed audio to prevent unbounded buffer growth.
+                # Sentence: always trim (sentence is complete)
+                # Phrase: trim if previous was also a phrase (consecutive phrases)
+                if decision.flush_type == "sentence":
+                    self.timestamp_offset += duration
+                    self._internal_trim()
+                    self._last_flush_was_phrase = False
+                elif decision.flush_type == "phrase":
+                    if self._last_flush_was_phrase:
+                        # Consecutive phrase — trim up to previous phrase
+                        self.timestamp_offset += duration
+                        self._internal_trim()
+                    self._last_flush_was_phrase = True
+                    self._last_sentence_text = flush_text
+
+        # Send the unflushed portion as a partial
+        unflushed = full_text[self._detector.flushed_len:].strip()
+        if unflushed:
+            segment = self.format_segment(
+                self.timestamp_offset,
+                self.timestamp_offset + duration,
+                unflushed,
+                completed=False,
+            )
+            try:
+                self.websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "segments": [segment],
+                }))
+            except Exception as e:
+                logging.error(f"[ERROR]: Sending partial segment: {e}")
+
         if self.eos:
             self.update_timestamp_offset(last_segment, duration)
+
+    def _internal_trim(self):
+        """Trim already-processed audio after a sentence flush.
+
+        Zero audio loss — only removes audio before timestamp_offset.
+        No epoch increment so in-flight inference results stay valid.
+        Dedup in _handle_korean_flush prevents re-flushing the same text.
+        """
+        with self.lock:
+            if self.frames_np is None:
+                return
+            processed_samples = int((self.timestamp_offset - self.frames_offset) * self.RATE)
+            if processed_samples > 0 and processed_samples < self.frames_np.shape[0]:
+                kept_duration = (self.frames_np.shape[0] - processed_samples) / self.RATE
+                self.frames_np = self.frames_np[processed_samples:]
+                self.frames_offset = self.timestamp_offset
+                self._chunk_boundaries = [
+                    (s, off - processed_samples)
+                    for s, off in self._chunk_boundaries
+                    if off >= processed_samples
+                ]
+                logging.info(
+                    f"[{self.client_uid}] Internal trim: kept {kept_duration:.1f}s"
+                )
+            elif processed_samples >= self.frames_np.shape[0]:
+                self.frames_np = None
+                self.frames_offset = 0.0
+                self.timestamp_offset = 0.0
+                self._chunk_boundaries = []
+
+            # Reset transcript state — next pass builds fresh text
+            self.transcript = []
+            self.text = []
+            self.current_out = ""
+            self.prev_out = ""
+            self.same_output_count = 0
+            self.end_time_for_same_output = None
+
+        # Reset detector — trimmed buffer produces new text from position 0
+        self._detector.flushed_len = 0
+        self._detector._reset_stability()
 
     def transcribe_audio(self, input_bytes):
         # Batch inference path: submit to central queue and wait
         if ServeClientTensorRT.BATCH_WORKER is not None:
             from whisper_live.batch_inference_trt import TRTBatchRequest
+            text_prefix = self._build_text_prefix()
             request = TRTBatchRequest(
                 audio=input_bytes,
                 language=self.language,
                 task=self.task,
                 use_vad=False,  # VAD already handled in speech_to_text loop
+                text_prefix_override=text_prefix,
             )
             ServeClientTensorRT.BATCH_WORKER.submit(request)
             request.future.wait(timeout=30)
@@ -129,9 +317,10 @@ class ServeClientTensorRT(ServeClientBase):
             ServeClientTensorRT.SINGLE_MODEL_LOCK.acquire()
         logging.info(f"[WhisperTensorRT:] Processing audio with duration: {input_bytes.shape[0] / self.RATE}")
         mel, duration = self.transcriber.log_mel_spectrogram(input_bytes)
+        text_prefix = self._build_text_prefix()
         last_segment = self.transcriber.transcribe(
             mel,
-            text_prefix=f"<|startoftranscript|><|{self.language}|><|{self.task}|><|notimestamps|>",
+            text_prefix=text_prefix,
         )
         if ServeClientTensorRT.SINGLE_MODEL:
             ServeClientTensorRT.SINGLE_MODEL_LOCK.release()

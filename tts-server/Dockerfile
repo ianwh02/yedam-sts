@@ -45,22 +45,17 @@ ARG HF_TOKEN=
 ENV HF_TOKEN=${HF_TOKEN}
 
 # CustomVoice model (preset speakers: ryan, sohee, etc.)
-RUN python3 -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', \
-local_dir='/app/models/Qwen3-TTS-12Hz-0.6B-CustomVoice')"
-
 # Base model (voice clone mode with reference audio)
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-Base', \
 local_dir='/app/models/Qwen3-TTS-12Hz-0.6B-Base')"
 
-# Download speech tokenizer model at build time
+# 48kHz decoder: drop-in replacement, same codec, higher-fidelity waveform reconstruction
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz', \
-local_dir='/app/models/Qwen3-TTS-Tokenizer-12Hz')"
+snapshot_download('takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz', \
+local_dir='/app/models/Qwen3-TTS-Tokenizer-12Hz-48kHz')"
 
 # ── Source code (changes frequently → last layers for fast rebuilds) ──
 # nano-qwen3tts-vllm from local source (editable install so Python reads
@@ -77,7 +72,7 @@ COPY server.py .
 EXPOSE 7860
 
 ENV MODEL_DIR=/app/models/Qwen3-TTS-12Hz-0.6B-CustomVoice
-ENV TOKENIZER_DIR=/app/models/Qwen3-TTS-Tokenizer-12Hz
+ENV TOKENIZER_DIR=/app/models/Qwen3-TTS-Tokenizer-12Hz-48kHz
 ENV PORT=7860
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=5 --start-period=180s \

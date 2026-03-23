@@ -25,7 +25,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import multiprocessing as mp
-from scipy.signal import butter, sosfilt
+from math import gcd
+from scipy.signal import butter, resample_poly, sosfilt
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
@@ -51,7 +52,7 @@ PORT = int(os.environ.get("PORT", "7860"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.15"))
 
 # Output format
-TARGET_SAMPLE_RATE = 24000
+TARGET_SAMPLE_RATE = int(os.environ.get("TARGET_SAMPLE_RATE", "48000"))
 
 # Streaming decode config
 STREAMING_CHUNK_SIZE = int(os.environ.get("STREAMING_CHUNK_SIZE", "4"))
@@ -65,8 +66,8 @@ _first_codes_threshold = FIRST_CHUNK_COUNT * FIRST_CHUNK_SIZE
 SILENCE_MS = int(os.environ.get("STREAM_LEADING_SILENCE_MS", "50"))
 _SILENCE_PCM16: np.ndarray | None = None
 
-# Hann crossfade between streaming chunks (~21ms at 24kHz)
-BLEND_SAMPLES = int(os.environ.get("STREAM_BLEND_SAMPLES", "512"))
+# Hann crossfade between streaming chunks (~21ms at 48kHz)
+BLEND_SAMPLES = int(os.environ.get("STREAM_BLEND_SAMPLES", "1024"))
 _HANN_FADE_IN: np.ndarray | None = None
 _HANN_FADE_OUT: np.ndarray | None = None
 
@@ -76,7 +77,17 @@ DECODER_WARMUP_FRAMES = int(os.environ.get("DECODER_WARMUP_FRAMES", "4"))
 
 # Audio post-processing
 HIGHPASS_FREQ = int(os.environ.get("TTS_HIGHPASS_HZ", "80"))
-_HP_SOS = butter(2, HIGHPASS_FREQ, btype='high', fs=TARGET_SAMPLE_RATE, output='sos') if HIGHPASS_FREQ > 0 else None
+_HP_SOS = butter(4, HIGHPASS_FREQ, btype='high', fs=TARGET_SAMPLE_RATE, output='sos') if HIGHPASS_FREQ > 0 else None
+
+# Loudness normalization: normalize TTS output to consistent RMS level
+TARGET_RMS = float(os.environ.get("TTS_TARGET_RMS", "0.0"))  # target RMS (0.0 = disable)
+MAX_GAIN_DB = float(os.environ.get("TTS_MAX_GAIN_DB", "20"))  # cap gain to prevent amplifying noise
+
+# Trailing silence trimming: remove low-energy tail after speech ends
+TRIM_SILENCE_THRESHOLD = float(os.environ.get("TTS_TRIM_SILENCE_THRESHOLD", "0.03"))  # RMS threshold (catches breaths)
+TRIM_SILENCE_WINDOW_MS = int(os.environ.get("TTS_TRIM_SILENCE_WINDOW_MS", "20"))  # analysis window
+TRIM_SILENCE_MIN_MS = int(os.environ.get("TTS_TRIM_SILENCE_MIN_MS", "50"))  # keep at least this much trailing
+
 
 SUPPORTED_LANGUAGES = {
     "en": "English",
@@ -214,22 +225,55 @@ def _float_to_pcm16(wav: np.ndarray) -> np.ndarray:
     return (wav * 32767).astype(np.int16)
 
 
-def _resample_to_24k(wav: np.ndarray, orig_sr: int) -> np.ndarray:
+def _resample(wav: np.ndarray, orig_sr: int) -> np.ndarray:
+    """Anti-aliased polyphase resampling from orig_sr to TARGET_SAMPLE_RATE."""
     if orig_sr == TARGET_SAMPLE_RATE:
         return wav
-    n_orig = len(wav)
-    n_new = int(round(n_orig * TARGET_SAMPLE_RATE / orig_sr))
-    if n_new == 0:
-        return wav
-    indices = np.linspace(0, n_orig - 1, n_new, dtype=np.float64)
-    return np.interp(indices, np.arange(n_orig), wav).astype(np.float32)
+    up = TARGET_SAMPLE_RATE // gcd(TARGET_SAMPLE_RATE, orig_sr)
+    down = orig_sr // gcd(TARGET_SAMPLE_RATE, orig_sr)
+    return resample_poly(wav, up, down).astype(np.float32)
 
 
 def _postprocess_audio(wav: np.ndarray) -> np.ndarray:
-    """High-pass filter on decoded float32 audio."""
-    if len(wav) == 0 or _HP_SOS is None:
+    """High-pass filter + loudness normalization on decoded float32 audio."""
+    if len(wav) == 0:
         return wav
-    return sosfilt(_HP_SOS, wav).astype(np.float32)
+    if _HP_SOS is not None:
+        wav = sosfilt(_HP_SOS, wav).astype(np.float32)
+    # RMS loudness normalization
+    if TARGET_RMS > 0:
+        rms = np.sqrt(np.mean(wav ** 2))
+        if rms > 1e-6:
+            gain = TARGET_RMS / rms
+            max_gain = 10 ** (MAX_GAIN_DB / 20)
+            gain = min(gain, max_gain)
+            wav = wav * gain
+            # Soft clip to prevent harsh distortion
+            peak = np.max(np.abs(wav))
+            if peak > 0.95:
+                wav = wav * (0.95 / peak)
+    return wav.astype(np.float32)
+
+
+def _trim_trailing_silence(wav: np.ndarray) -> np.ndarray:
+    """Remove low-energy trailing audio (silence/artifacts after speech)."""
+    if len(wav) == 0 or TRIM_SILENCE_THRESHOLD <= 0:
+        return wav
+    window = int(TARGET_SAMPLE_RATE * TRIM_SILENCE_WINDOW_MS / 1000)
+    min_samples = int(TARGET_SAMPLE_RATE * TRIM_SILENCE_MIN_MS / 1000)
+    if len(wav) <= min_samples:
+        return wav
+    # Walk backwards in windows, find last window above threshold
+    end = len(wav)
+    while end > min_samples:
+        start = max(end - window, 0)
+        rms = np.sqrt(np.mean(wav[start:end] ** 2))
+        if rms >= TRIM_SILENCE_THRESHOLD:
+            break
+        end = start
+    # Keep a small tail for natural fade
+    end = min(end + window, len(wav))
+    return wav[:end]
 
 
 def _to_wav_bytes(pcm16: np.ndarray, sr: int) -> bytes:
@@ -381,9 +425,9 @@ async def _decode_worker_loop():
                         return tokenizer.decode(inputs)
 
                     wav_results, sr = await loop.run_in_executor(None, _do_full)
-                    wav_24k = _resample_to_24k(wav_results[0], sr)
-                    wav_24k = _postprocess_audio(wav_24k)
-                    pcm16 = _float_to_pcm16(wav_24k)
+                    wav_resampled = _resample(wav_results[0], sr)
+                    wav_resampled = _postprocess_audio(wav_resampled)
+                    pcm16 = _float_to_pcm16(wav_resampled)
                     if not req["future"].done():
                         req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
 
@@ -404,9 +448,9 @@ async def _decode_worker_loop():
                     else:
                         wav_list, sr = result["wav_list"], result["sr"]
                         for req, wav in zip(batch_window, wav_list):
-                            wav_24k = _resample_to_24k(wav, sr)
-                            wav_24k = _postprocess_audio(wav_24k)
-                            pcm16 = _float_to_pcm16(wav_24k)
+                            wav_resampled = _resample(wav, sr)
+                            wav_resampled = _postprocess_audio(wav_resampled)
+                            pcm16 = _float_to_pcm16(wav_resampled)
                             if not req["future"].done():
                                 req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
                 else:
@@ -417,9 +461,9 @@ async def _decode_worker_loop():
 
                     wav_list, sr = await loop.run_in_executor(None, _do_window)
                     for req, wav in zip(batch_window, wav_list):
-                        wav_24k = _resample_to_24k(wav, sr)
-                        wav_24k = _postprocess_audio(wav_24k)
-                        pcm16 = _float_to_pcm16(wav_24k)
+                        wav_resampled = _resample(wav, sr)
+                        wav_resampled = _postprocess_audio(wav_resampled)
+                        pcm16 = _float_to_pcm16(wav_resampled)
                         if not req["future"].done():
                             req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
 
@@ -448,6 +492,8 @@ class SynthesizeRequest(BaseModel):
     text: str
     language: str = "en"
     session_id: str | None = None
+    speaker: str | None = None
+    instruct: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -461,7 +507,7 @@ class HealthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _generate_speech_stream(text: str, language: str, speaker: str, session_id: str | None = None):
+async def _generate_speech_stream(text: str, language: str, speaker: str, session_id: str | None = None, instruct: str | None = None):
     """
     Streaming decode: producer feeds code chunks to a queue; consumer decodes
     (window + context) and yields PCM audio chunks.
@@ -493,6 +539,7 @@ async def _generate_speech_stream(text: str, language: str, speaker: str, sessio
                 text=gen_text,
                 language=language,
                 speaker=speaker,
+                instruct=instruct,
             )
 
         # Producer feeds code chunks; consumer decodes and yields audio
@@ -597,9 +644,10 @@ async def _generate_speech_stream(text: str, language: str, speaker: str, sessio
                 yield chunk_bytes
                 await asyncio.sleep(0)
 
-            # Emit held-back tail as final chunk
+            # Emit held-back tail as final chunk (trim trailing silence)
             if prev_tail is not None:
-                out = np.clip(prev_tail, -32768, 32767).astype(np.int16)
+                trimmed = _trim_trailing_silence(prev_tail / 32768.0) * 32768.0
+                out = np.clip(trimmed, -32768, 32767).astype(np.int16)
                 chunk_bytes = out.tobytes()
                 total_bytes += len(chunk_bytes)
                 yield chunk_bytes
@@ -644,7 +692,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("Loading model: %s (GPU_MEMORY_UTILIZATION=%.2f)", MODEL_DIR, GPU_MEMORY_UTILIZATION)
     interface = get_interface()
-    get_tokenizer()
+    tokenizer = get_tokenizer()
+    # Share the CUDAGraph tokenizer with the interface to avoid loading a duplicate
+    # on GPU. The CUDAGraph tokenizer has the same encoder — only the decoder differs.
+    logger.info("Injecting shared CUDAGraph tokenizer into interface (saving ~600 MB VRAM)")
+    interface.speech_tokenizer = tokenizer
     await interface.start_zmq_tasks()
 
     # Precompute voice clone prompts
@@ -697,21 +749,6 @@ async def lifespan(app: FastAPI):
     global _server_status
     _server_status = "weights_ready"
     logger.info("Phase 1 complete: weights loaded, status=weights_ready (waiting for /allocate_kv_cache)")
-
-    # Auto-allocate on restart: if budget is known from env var, self-trigger phase 2
-    auto_budget = os.environ.get("TTS_VRAM_BUDGET_MB", "")
-    if auto_budget:
-        logger.info(f"Auto-allocating KV cache from env: TTS_VRAM_BUDGET_MB={auto_budget}")
-        import httpx as _httpx
-        async def _auto_allocate():
-            await asyncio.sleep(1)  # let server finish startup
-            try:
-                async with _httpx.AsyncClient() as c:
-                    resp = await c.post(f"http://localhost:{PORT}/allocate_kv_cache", params={"budget_mb": int(auto_budget)})
-                    logger.info(f"Auto-allocate result: {resp.status_code}")
-            except Exception as e:
-                logger.error(f"Auto-allocate failed: {e}")
-        asyncio.create_task(_auto_allocate())
 
     # Start TTL eviction for session codec cache
     async def _ttl_eviction_loop():
@@ -816,14 +853,14 @@ async def allocate_kv_cache(budget_mb: int = 0):
     talker_fut = holder.talker_client.send_allocate_kv_cache(talker_budget or 0)
     predictor_fut = holder.predictor_client.send_allocate_kv_cache(predictor_budget or 0)
 
-    # Wait for both acks (timeout 120s for CUDA graph capture)
+    # Wait for both acks (timeout 240s for CUDA graph capture — 48kHz decoder needs longer)
     try:
         talker_ack, predictor_ack = await asyncio.wait_for(
             asyncio.gather(talker_fut, predictor_fut),
-            timeout=120.0,
+            timeout=240.0,
         )
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="KV cache allocation timed out (120s)")
+        raise HTTPException(status_code=504, detail="KV cache allocation timed out (240s)")
 
     talker_ok = talker_ack.get("success", False)
     predictor_ok = predictor_ack.get("success", False)
@@ -914,10 +951,10 @@ async def synthesize_stream(req: SynthesizeRequest):
             detail=f"Unsupported language: {req.language}. Use 'en' or 'ko'.",
         )
 
-    speaker = SPEAKER_MAP.get(lang_key, DEFAULT_SPEAKER)
+    speaker = req.speaker or SPEAKER_MAP.get(lang_key, DEFAULT_SPEAKER)
 
     return StreamingResponse(
-        _generate_speech_stream(text, language, speaker, session_id=req.session_id),
+        _generate_speech_stream(text, language, speaker, session_id=req.session_id, instruct=req.instruct),
         media_type="application/octet-stream",
         headers={
             "x-sample-rate": str(TARGET_SAMPLE_RATE),
@@ -941,7 +978,7 @@ async def synthesize(req: SynthesizeRequest, request: Request):
             detail=f"Unsupported language: {req.language}. Use 'en' or 'ko'.",
         )
 
-    speaker = SPEAKER_MAP.get(lang_key, DEFAULT_SPEAKER)
+    speaker = req.speaker or SPEAKER_MAP.get(lang_key, DEFAULT_SPEAKER)
     start = time.time()
 
     # Collect all audio codes from the model (no windowed decode)
@@ -958,6 +995,7 @@ async def synthesize(req: SynthesizeRequest, request: Request):
     else:
         gen = interface.generate_custom_voice_async(
             text=gen_text, language=language, speaker=speaker,
+            instruct=req.instruct,
         )
     async for audio_code in gen:
         audio_codes.append(audio_code)
@@ -983,6 +1021,10 @@ async def synthesize(req: SynthesizeRequest, request: Request):
             fade_in, _ = _get_hann_windows()
             pcm16_f32[:BLEND_SAMPLES] *= fade_in
             pcm16 = np.clip(pcm16_f32, -32768, 32767).astype(np.int16)
+        # Trim trailing silence/artifacts
+        pcm16_f32 = pcm16.astype(np.float32) / 32768.0
+        pcm16_f32 = _trim_trailing_silence(pcm16_f32)
+        pcm16 = (np.clip(pcm16_f32, -1.0, 1.0) * 32767).astype(np.int16)
         raw_pcm = pcm16.tobytes()
         _set_session_warmup(req.session_id, audio_codes)
     else:
@@ -1045,6 +1087,61 @@ async def synthesize(req: SynthesizeRequest, request: Request):
                 "x-rtf": f"{rtf:.2f}",
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# Voice design endpoint (experimental)
+# ---------------------------------------------------------------------------
+
+
+class VoiceDesignRequest(BaseModel):
+    text: str
+    instruct: str  # e.g. "Male, 30 years old, calm and professional"
+    language: str = "en"
+
+
+@app.post("/synthesize/voice-design")
+async def synthesize_voice_design(req: VoiceDesignRequest, request: Request):
+    """Synthesize speech with voice design — describe the voice in natural language."""
+    if _server_status != "ready":
+        raise HTTPException(status_code=503, detail=f"Server not ready: {_server_status}")
+
+    interface = get_interface()
+    tokenizer = get_tokenizer()
+    lang_key = req.language.lower()
+    language = SUPPORTED_LANGUAGES.get(lang_key, "Auto")
+
+    start = time.time()
+    audio_codes = []
+    async for audio_code in interface.generate_voice_design_async(
+        text=req.text, instruct=req.instruct, language=language,
+    ):
+        audio_codes.append(audio_code)
+
+    if not audio_codes:
+        raise HTTPException(status_code=500, detail="No audio generated")
+
+    pcm16, _ = await _decode_batched(audio_codes)
+    gen_time = time.time() - start
+    raw_pcm = pcm16.tobytes()
+    audio_duration_s = len(pcm16) / TARGET_SAMPLE_RATE
+
+    accept = request.headers.get("accept", "")
+    if "application/octet-stream" in accept:
+        return Response(
+            content=raw_pcm,
+            media_type="application/octet-stream",
+            headers={
+                "x-audio-duration-ms": str(int(audio_duration_s * 1000)),
+                "x-generation-time-ms": str(int(gen_time * 1000)),
+                "x-sample-rate": str(TARGET_SAMPLE_RATE),
+                "x-sample-format": "s16le",
+            },
+        )
+    else:
+        pcm16_array = np.frombuffer(raw_pcm, dtype=np.int16)
+        wav_bytes = _to_wav_bytes(pcm16_array, TARGET_SAMPLE_RATE)
+        return Response(content=wav_bytes, media_type="audio/wav")
 
 
 # ---------------------------------------------------------------------------

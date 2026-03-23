@@ -96,7 +96,11 @@ class SpeechTokenizerCUDAGraph:
         # Decoder uses SnakeBeta with torch.exp() that overflows in bf16
         self.tokenizer.model.decoder = self.tokenizer.model.decoder.to(torch.float32)
 
-        if hasattr(self.tokenizer.config, "sample_rate"):
+        # Prefer decoder's actual output rate (may differ from config, e.g. 48kHz decoder)
+        output_sr = getattr(self.tokenizer.model, "get_output_sample_rate", None)
+        if output_sr is not None:
+            self.sample_rate = int(output_sr())
+        elif hasattr(self.tokenizer.config, "sample_rate"):
             self.sample_rate = self.tokenizer.config.sample_rate
         elif hasattr(getattr(self.tokenizer, "feature_extractor", None), "sampling_rate"):
             self.sample_rate = self.tokenizer.feature_extractor.sampling_rate

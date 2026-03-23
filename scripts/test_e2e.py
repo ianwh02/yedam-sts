@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""End-to-end integration test for yedam-sts pipeline.
+"""E2E pipeline test — Audio → STT → LLM → TTS → Speaker.
 
-Requires all services running:
-  docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+Tests the full speech-to-speech pipeline by connecting directly to each service.
+Uses client-side VAD for flush timing, with window fallback for continuous speech.
 
 Usage:
-  python scripts/test_e2e.py                    # test everything
-  python scripts/test_e2e.py --test health      # just health checks
-  python scripts/test_e2e.py --test services    # test individual services
-  python scripts/test_e2e.py --test pipeline    # test full pipeline
+  python scripts/test_e2e.py --desktop              # desktop audio capture
+  python scripts/test_e2e.py                         # mic input
+  python scripts/test_e2e.py --desktop --no-tts      # skip TTS (text only)
+  python scripts/test_e2e.py --list-devices
 """
 
 from __future__ import annotations
@@ -16,345 +16,620 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import struct
+import logging
+import os
+import re
+import subprocess
 import sys
 import time
 
 import httpx
 import numpy as np
 
-# ============================================================
-# Config — matches docker-compose.dev.yml exposed ports
-# ============================================================
+logger = logging.getLogger("test_e2e")
 
-ORCHESTRATOR_URL = "http://localhost:8080"
-STT_WS_URL = "ws://localhost:9090"
-LLM_URL = "http://localhost:8000"
-TTS_URL = "http://localhost:7860"
+STT_WS_URL = os.environ.get("STT_WS_URL", "ws://localhost:9090")
+LLM_URL = os.environ.get("LLM_URL", "http://localhost:8000")
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen3-4B-AWQ")
+TTS_URL = os.environ.get("TTS_URL", "http://localhost:7860")
+LLM_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
-# ============================================================
-# Helpers
-# ============================================================
-
-
-def generate_sine_wave(
-    duration_s: float = 3.0,
-    freq_hz: float = 440.0,
-    sample_rate: int = 16000,
-) -> bytes:
-    """Generate a sine wave as Float32 PCM bytes (matches pipeline input format)."""
-    t = np.linspace(0, duration_s, int(sample_rate * duration_s), dtype=np.float32)
-    audio = (0.3 * np.sin(2 * np.pi * freq_hz * t)).astype(np.float32)
-    return audio.tobytes()
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+SAMPLE_RATE = 16000
+SAMPLE_RATE_TTS = 24000
+SAMPLE_RATE_OUT = 48000
+CHUNK_DURATION_S = 0.1
+CHANNELS = 1
+CONTEXT_WINDOW = 3
 
 
-def generate_silence(duration_s: float = 1.0, sample_rate: int = 16000) -> bytes:
-    """Generate silence as Float32 PCM bytes."""
-    samples = int(sample_rate * duration_s)
-    return b"\x00" * (samples * 4)  # 4 bytes per float32
-
-
-def ok(msg: str):
-    print(f"  ✓ {msg}")
-
-
-def fail(msg: str):
-    print(f"  ✗ {msg}")
-
-
-def section(title: str):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
-
-
-# ============================================================
-# Test: Health Checks
-# ============================================================
-
-
-async def test_health():
-    """Verify all services are up and responding to health checks."""
-    section("Health Checks")
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # Orchestrator
-        try:
-            resp = await client.get(f"{ORCHESTRATOR_URL}/health")
-            data = resp.json()
-            if resp.status_code == 200:
-                ok(f"Orchestrator: {data.get('status', 'unknown')}")
-                services = data.get("services", {})
-                for name, status in services.items():
-                    if "healthy" in status:
-                        ok(f"  → {name}: {status}")
-                    else:
-                        fail(f"  → {name}: {status}")
-            else:
-                fail(f"Orchestrator: HTTP {resp.status_code}")
-        except Exception as e:
-            fail(f"Orchestrator: {e}")
-            return False
-
-        # STT (direct)
-        try:
-            resp = await client.get(f"http://localhost:9090/health", timeout=5.0)
-            ok(f"STT direct: HTTP {resp.status_code}")
-        except Exception as e:
-            fail(f"STT direct: {e}")
-
-        # LLM (direct)
-        try:
-            resp = await client.get(f"{LLM_URL}/health", timeout=5.0)
-            ok(f"LLM direct: HTTP {resp.status_code}")
-        except Exception as e:
-            fail(f"LLM direct: {e}")
-
-        # TTS (direct)
-        try:
-            resp = await client.get(f"{TTS_URL}/health", timeout=5.0)
-            data = resp.json()
-            gpu = data.get("gpu", False)
-            model = data.get("model", "unknown")
-            ok(f"TTS direct: model={model}, gpu={gpu}")
-        except Exception as e:
-            fail(f"TTS direct: {e}")
-
-    return True
-
-
-# ============================================================
-# Test: Individual Services
-# ============================================================
-
-
-async def test_services():
-    """Test each service independently to isolate issues."""
-    section("Individual Service Tests")
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # --- LLM: simple completion ---
-        print("\n  LLM (vLLM) — chat completion:")
-        try:
-            resp = await client.post(
-                f"{LLM_URL}/v1/chat/completions",
-                json={
-                    "model": "Qwen/Qwen2.5-7B-Instruct-AWQ",
-                    "messages": [
-                        {"role": "system", "content": "Translate Korean to English."},
-                        {"role": "user", "content": "안녕하세요"},
-                    ],
-                    "max_tokens": 50,
-                    "temperature": 0.3,
-                },
-            )
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            ok(f"LLM response: {content[:80]}")
-        except Exception as e:
-            fail(f"LLM: {e}")
-
-        # --- TTS: synthesize ---
-        print("\n  TTS (Qwen3-TTS) — synthesis:")
-        try:
-            start = time.time()
-            resp = await client.post(
-                f"{TTS_URL}/synthesize",
-                json={"text": "Hello, this is a test.", "language": "en"},
-            )
-            elapsed = time.time() - start
-            if resp.status_code == 200:
-                wav_size = len(resp.content)
-                duration_ms = resp.headers.get("X-Audio-Duration-Ms", "?")
-                rtf = resp.headers.get("X-RTF", "?")
-                ok(f"TTS synthesized: {wav_size}B, duration={duration_ms}ms, rtf={rtf}, gen={elapsed:.2f}s")
-            else:
-                fail(f"TTS: HTTP {resp.status_code} — {resp.text[:100]}")
-        except Exception as e:
-            fail(f"TTS: {e}")
-
-        # --- STT: WebSocket connection test ---
-        print("\n  STT (WhisperLive) — WebSocket connection:")
-        try:
-            import websockets
-
-            async with websockets.connect(STT_WS_URL) as ws:
-                config = {
-                    "uid": "test-e2e",
-                    "language": "ko",
-                    "task": "transcribe",
-                    "model": "large-v3",
-                    "use_vad": True,
-                }
-                await ws.send(json.dumps(config))
-                response = await asyncio.wait_for(ws.recv(), timeout=10.0)
-                data = json.loads(response)
-                if data.get("message") == "SERVER_READY":
-                    ok("STT connected and SERVER_READY received")
-
-                    # Send a short sine wave to verify audio processing
-                    audio = generate_sine_wave(duration_s=2.0)
-                    chunk_size = 16000 * 4  # 1 second of float32 at 16kHz
-                    for i in range(0, len(audio), chunk_size):
-                        await ws.send(audio[i : i + chunk_size])
-                        await asyncio.sleep(0.1)
-
-                    # Wait for any transcription response
-                    try:
-                        resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                        segments = json.loads(resp).get("segments", [])
-                        ok(f"STT responded with {len(segments)} segment(s)")
-                    except asyncio.TimeoutError:
-                        ok("STT connected (no transcription from sine wave, as expected)")
-                else:
-                    fail(f"STT unexpected response: {data}")
-        except ImportError:
-            fail("STT: websockets package not installed (pip install websockets)")
-        except Exception as e:
-            fail(f"STT: {e}")
-
-
-# ============================================================
-# Test: Full Pipeline
-# ============================================================
-
-
-async def test_pipeline():
-    """Test the full pipeline: create session → feed audio → verify flow."""
-    section("Full Pipeline Test")
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        # 1. Create session
-        print("\n  Step 1: Create session")
-        try:
-            resp = await client.post(
-                f"{ORCHESTRATOR_URL}/api/sessions",
-                json={
-                    "source_lang": "ko",
-                    "target_lang": "en",
-                    "processor": "translation",
-                },
-            )
-            if resp.status_code != 200:
-                fail(f"Create session: HTTP {resp.status_code} — {resp.text[:100]}")
-                return
-            session_data = resp.json()
-            session_id = session_data["session_id"]
-            admin_ws_url = session_data["admin_ws_url"]
-            ok(f"Session created: {session_id}")
-            ok(f"  admin_ws: {admin_ws_url}")
-        except Exception as e:
-            fail(f"Create session: {e}")
-            return
-
-        # 2. Check session exists via health
-        resp = await client.get(f"{ORCHESTRATOR_URL}/health")
-        active = resp.json().get("active_sessions", 0)
-        ok(f"Active sessions: {active}")
-
-        # 3. Connect admin WebSocket and feed audio
-        print("\n  Step 2: Connect admin WebSocket and feed audio")
-        try:
-            import websockets
-
-            ws_url = f"ws://localhost:8080{admin_ws_url}"
-            async with websockets.connect(ws_url) as ws:
-                ok(f"Admin WebSocket connected to {ws_url}")
-
-                # Send 3 seconds of sine wave audio in chunks
-                audio = generate_sine_wave(duration_s=3.0, freq_hz=440.0)
-                chunk_size = 16000 * 4  # 1 second chunks
-                chunks_sent = 0
-
-                for i in range(0, len(audio), chunk_size):
-                    chunk = audio[i : i + chunk_size]
-                    await ws.send(chunk)
-                    chunks_sent += 1
-                    await asyncio.sleep(0.5)
-
-                ok(f"Sent {chunks_sent} audio chunks ({len(audio)} bytes total)")
-
-                # Give pipeline time to process
-                await asyncio.sleep(2.0)
-
-                # Send stop command
-                await ws.send(json.dumps({"type": "stop"}))
-                ok("Sent stop command")
-
-        except ImportError:
-            fail("websockets package not installed (pip install websockets)")
-            return
-        except Exception as e:
-            fail(f"Admin WebSocket: {e}")
-            return
-
-        # 4. Verify session was cleaned up
-        await asyncio.sleep(1.0)
-        resp = await client.get(f"{ORCHESTRATOR_URL}/health")
-        active = resp.json().get("active_sessions", 0)
-        ok(f"Active sessions after stop: {active}")
-
-        # 5. Test session deletion (create another and delete via REST)
-        print("\n  Step 3: Test REST session lifecycle")
-        resp = await client.post(
-            f"{ORCHESTRATOR_URL}/api/sessions",
-            json={"source_lang": "ko", "target_lang": "en"},
+def list_devices():
+    import sounddevice as sd
+    print("=== sounddevice ===")
+    print(sd.query_devices())
+    print(f"\nDefault input: {sd.default.device[0]}")
+    print(f"Default output: {sd.default.device[1]}")
+    print("\n=== PulseAudio monitor sources (for --desktop) ===")
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sources"],
+            capture_output=True, text=True, timeout=5,
         )
-        session_id_2 = resp.json()["session_id"]
-        ok(f"Created session: {session_id_2}")
-
-        resp = await client.delete(f"{ORCHESTRATOR_URL}/api/sessions/{session_id_2}")
-        if resp.status_code == 200:
-            ok(f"Deleted session: {session_id_2}")
-        else:
-            fail(f"Delete session: HTTP {resp.status_code}")
-
-        # Delete non-existent session
-        resp = await client.delete(f"{ORCHESTRATOR_URL}/api/sessions/nonexistent")
-        if resp.status_code == 404:
-            ok("404 for non-existent session (correct)")
-        else:
-            fail(f"Expected 404, got {resp.status_code}")
-
-    print("\n" + "=" * 60)
-    print("  Pipeline test complete!")
-    print("  Note: callback outputs (STT/translation/TTS) are logged")
-    print("  server-side. Check orchestrator container logs:")
-    print("    docker logs yedam-orchestrator")
-    print("=" * 60)
+        for line in result.stdout.strip().split("\n"):
+            if "monitor" in line.lower():
+                print(f"  {line}")
+    except Exception:
+        print("  (pactl not available)")
 
 
-# ============================================================
-# Main
-# ============================================================
+def _create_audio_source(args) -> tuple:
+    """Create an audio source — returns (start_fn, stop_fn, queue, description)."""
+    loop = asyncio.get_event_loop()
+    audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION_S)
+
+    if args.desktop:
+        source = None
+        if not source:
+            try:
+                result = subprocess.run(
+                    ["pactl", "list", "short", "sources"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in result.stdout.strip().split("\n"):
+                    parts = line.split("\t")
+                    if len(parts) >= 2 and "monitor" in parts[1] and "RUNNING" in line:
+                        source = parts[1]
+                        break
+                if not source:
+                    for line in result.stdout.strip().split("\n"):
+                        parts = line.split("\t")
+                        if len(parts) >= 2 and "monitor" in parts[1]:
+                            source = parts[1]
+                            break
+            except Exception:
+                pass
+            if not source:
+                raise RuntimeError("No PulseAudio monitor source found.")
+
+        proc = None
+
+        def start():
+            nonlocal proc
+            proc = subprocess.Popen(
+                [
+                    "parec",
+                    "--device", source,
+                    "--format=float32le",
+                    "--channels=1",
+                    "--rate=16000",
+                    "--latency-msec=100",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            import threading
+
+            def reader():
+                chunk_bytes = chunk_samples * 4
+                while proc and proc.poll() is None:
+                    data = proc.stdout.read(chunk_bytes)
+                    if data:
+                        loop.call_soon_threadsafe(audio_queue.put_nowait, data)
+
+            t = threading.Thread(target=reader, daemon=True)
+            t.start()
+
+        def stop():
+            nonlocal proc
+            if proc:
+                proc.terminate()
+                proc = None
+
+        return start, stop, audio_queue, f"Desktop ({source})"
+
+    else:
+        import sounddevice as sd
+
+        def mic_callback(indata, frames, time_info, status):
+            if status:
+                logger.warning(f"Mic: {status}")
+            loop.call_soon_threadsafe(audio_queue.put_nowait, indata.copy().tobytes())
+
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+            blocksize=chunk_samples,
+            device=args.input_device,
+            callback=mic_callback,
+        )
+
+        device_name = sd.query_devices(args.input_device, 'input')['name']
+        return stream.start, lambda: (stream.stop(), stream.close()), audio_queue, f"Mic ({device_name})"
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="E2E test for yedam-sts pipeline")
-    parser.add_argument(
-        "--test",
-        choices=["health", "services", "pipeline", "all"],
-        default="all",
-        help="Which test to run (default: all)",
+async def run_e2e(args):
+    """Full E2E: Audio → STT → LLM → TTS → Speaker."""
+    import websockets
+    import torch
+
+    start_audio, stop_audio, audio_queue, source_desc = _create_audio_source(args)
+
+    print("=== E2E Pipeline Test: Audio → STT → LLM → TTS → Speaker ===")
+    print(f"STT: {STT_WS_URL}")
+    print(f"LLM: {LLM_URL} ({LLM_MODEL})")
+    print(f"TTS: {TTS_URL}" if not args.no_tts else "TTS: disabled")
+    print(f"Source: {source_desc}")
+    print(f"Language: {args.source} → {args.target}")
+    print(f"VAD pause: {args.vad_pause}s, Min speech: {args.min_speech}s, Max speech: {args.max_speech}s")
+    print("─" * 50)
+    print("Press Ctrl+C to stop.\n")
+
+    # ── Load Silero VAD ──
+    vad_model, _ = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad', model='silero_vad',
+        trust_repo=True, verbose=False,
     )
+    vad_model.eval()
+
+    loop = asyncio.get_event_loop()
+    last_partial = ""
+    flush_num = 0
+    flushed_len = 0
+    send_seq = 0
+    recent_pairs: list[dict] = []
+    completed_count = 0
+    translate_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+    tts_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+    audio_out_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    llm_client = httpx.AsyncClient(timeout=30.0)
+    tts_client = httpx.AsyncClient(timeout=60.0)
+
+    # VAD state
+    is_speaking = False
+    speech_start_time = 0.0
+    silence_start_time = 0.0
+    window_flush_pending = False  # set when max_speech exceeded, flush on next partial
+
+    transcript_path = f"stt_transcript_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    transcript_file = open(transcript_path, "w", encoding="utf-8")
+    print(f"Transcript: {transcript_path}")
+
+    try:
+        terminal_width = os.get_terminal_size().columns
+    except OSError:
+        terminal_width = 120
+
+    def clear_line():
+        print(f"\r{' ' * terminal_width}\r", end="", flush=True)
+
+    def do_flush(text: str, reason: str):
+        nonlocal flush_num
+        text = text.strip()
+        if not text:
+            return
+        flush_num += 1
+        clear_line()
+        print(f"  [{args.source}] {text}")
+        transcript_file.write(f"[{args.source}] {text}\n")
+        transcript_file.flush()
+        translate_queue.put_nowait((flush_num, text))
+
+    flush_signal: asyncio.Queue[str] = asyncio.Queue()
+
+    async with websockets.connect(STT_WS_URL) as ws:
+        config = {
+            "uid": "e2e-test",
+            "language": args.source,
+            "task": "transcribe",
+            "model": "large-v3",
+            "use_vad": True,
+            "initial_prompt": args.initial_prompt,
+        }
+        await ws.send(json.dumps(config))
+        ready = await ws.recv()
+        data = json.loads(ready)
+        if data.get("message") != "SERVER_READY":
+            print(f"Server not ready: {data}")
+            return
+        print("Server ready.\n")
+
+        async def send_audio():
+            """Send audio to Whisper + run client-side VAD."""
+            nonlocal is_speaking, speech_start_time, silence_start_time, window_flush_pending, send_seq
+
+            while True:
+                pcm = await audio_queue.get()
+                await ws.send(pcm)
+                send_seq += 1
+
+                audio_tensor = torch.frombuffer(pcm, dtype=torch.float32).clone()
+                chunk_has_speech = False
+                for offset in range(0, len(audio_tensor) - 511, 512):
+                    window = audio_tensor[offset:offset + 512]
+                    confidence = vad_model(window, SAMPLE_RATE).item()
+                    if confidence > 0.5:
+                        chunk_has_speech = True
+                        break
+
+                now = time.monotonic()
+
+                if chunk_has_speech:
+                    if not is_speaking:
+                        is_speaking = True
+                        speech_start_time = now
+                    silence_start_time = 0.0
+
+                    speech_duration = now - speech_start_time
+                    if speech_duration >= args.max_speech and not window_flush_pending:
+                        window_flush_pending = True
+                else:
+                    if is_speaking and silence_start_time == 0.0:
+                        silence_start_time = now
+                    elif is_speaking and silence_start_time > 0:
+                        silence_duration = now - silence_start_time
+                        speech_duration = silence_start_time - speech_start_time
+
+                        if silence_duration >= args.vad_pause and speech_duration >= args.min_speech:
+                            is_speaking = False
+                            silence_start_time = 0.0
+                            await flush_signal.put(f"pause {silence_duration:.1f}s")
+
+        async def receive_transcripts():
+            nonlocal completed_count, last_partial, send_seq
+            nonlocal window_flush_pending, speech_start_time
+            async for message in ws:
+                if isinstance(message, bytes):
+                    continue
+
+                data = json.loads(message)
+
+                msg_type = data.get("type", data.get("message", ""))
+
+                if msg_type in ("buffer_cleared", "buffer_trimmed", "final_before_clear"):
+                    if msg_type == "buffer_cleared":
+                        completed_count = 0
+                    continue
+
+                segments = data.get("segments", [])
+                for i, seg in enumerate(segments):
+                    text = seg.get("text", "").strip()
+                    completed = seg.get("completed", False)
+                    if not text:
+                        continue
+
+                    if completed and i >= completed_count:
+                        completed_count = i + 1
+                        do_flush(text, "whisper completed")
+                        last_partial = ""
+                    else:
+                        last_partial = text
+
+                        # Window flush: max_speech exceeded, flush on this partial
+                        if window_flush_pending:
+                            window_flush_pending = False
+                            speech_start_time = time.monotonic()
+                            do_flush(text, "window")
+                            last_partial = ""
+                            await ws.send(json.dumps({"type": "clear_buffer", "seq": send_seq}))
+                        else:
+                            max_display = terminal_width - 12
+                            display = text if len(text) <= max_display else text[:max_display - 3] + "..."
+                            clear_line()
+                            print(f"  partial: {display}", end="", flush=True)
+
+        async def flush_on_vad():
+            """Wait for VAD flush signals — flush last_partial then clear_buffer.
+
+            VAD fires after silence, so Whisper has already transcribed trailing
+            words into last_partial by this point.
+            """
+            nonlocal last_partial, send_seq
+            while True:
+                reason = await flush_signal.get()
+                if last_partial:
+                    do_flush(last_partial, reason)
+                    last_partial = ""
+                    await ws.send(json.dumps({"type": "clear_buffer", "seq": send_seq}))
+
+        # Sentence boundary regex for splitting LLM streaming output
+        _SENTENCE_END = re.compile(r'[.!?;:]\s|[.!?]$')
+
+        async def translate_worker():
+            """Stream LLM translation tokens, split at sentence boundaries, send to TTS."""
+            while True:
+                num, korean_text = await translate_queue.get()
+                try:
+                    system = (
+                        "/no_think\n"
+                        "You are a real-time Korean to English translator for a church sermon. "
+                        "Translate the following Korean text into natural, fluent English. "
+                        "Output ONLY the English translation, no explanations.\n\n"
+                        "Important: The Korean text comes from live speech recognition which may contain errors. "
+                        "Apply these corrections:\n"
+                        "- The speaker frequently code-switches to English mid-sentence. "
+                        "Garbled Korean that sounds like English phrases should be interpreted as English "
+                        "(e.g. '에이블' = 'able', '히미' = 'Him', '나와 투' = 'now to', '후이즈' = 'who is').\n"
+                        "- Fix obvious STT mishearings based on sermon context "
+                        "(e.g. '쓰레기' in a sermon context likely means something else, "
+                        "'구이의 이불' likely means 'who is able').\n"
+                        "- '능히 하신다' = 'He is able' (key sermon phrase).\n"
+                        "- Maintain consistent terminology: 청년 = young adult/youth, "
+                        "집사님 = deacon, 장로님 = elder, 목사님 = pastor."
+                    )
+
+                    if recent_pairs:
+                        context = "\n".join(
+                            f"Korean: {p['ko']}\nEnglish: {p['en']}"
+                            for p in recent_pairs[-CONTEXT_WINDOW:]
+                        )
+                        system += f"\n\nRecent context for continuity:\n{context}"
+
+                    input_chars = len(system) + len(korean_text)
+                    est_input_tokens = int(input_chars * 1.5)
+                    max_model_len = 2048
+                    max_output = min(256, max_model_len - est_input_tokens - 50)
+                    max_output = max(max_output, 64)
+
+                    t0 = time.monotonic()
+                    full_translation = ""
+                    sentence_buf = ""
+
+                    async with llm_client.stream(
+                        "POST",
+                        f"{LLM_URL}/v1/chat/completions",
+                        json={
+                            "model": LLM_MODEL,
+                            "messages": [
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": korean_text},
+                            ],
+                            "max_tokens": max_output,
+                            "temperature": 0.3,
+                            "stream": True,
+                            **LLM_EXTRA_BODY,
+                        },
+                    ) as response:
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:]
+                            if payload.strip() == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(payload)
+                                delta = chunk["choices"][0].get("delta", {})
+                                token = delta.get("content", "")
+                                if not token:
+                                    continue
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                continue
+
+                            # Strip think tags from stream
+                            full_translation += token
+                            sentence_buf += token
+
+                            # Display streaming tokens
+                            clean = _THINK_RE.sub("", full_translation).strip()
+                            if clean:
+                                clear_line()
+                                max_display = terminal_width - 8
+                                display = clean if len(clean) <= max_display else "..." + clean[-(max_display - 3):]
+                                print(f"  [{args.target}] {display}", end="", flush=True)
+
+                            # Check for sentence boundary in buffer
+                            clean_buf = _THINK_RE.sub("", sentence_buf).strip()
+                            m = _SENTENCE_END.search(clean_buf)
+                            if m and len(clean_buf) >= 15:
+                                # Split at sentence boundary
+                                split_pos = m.end()
+                                sentence = clean_buf[:split_pos].strip()
+                                sentence_buf = clean_buf[split_pos:]
+                                if sentence and not args.no_tts:
+                                    tts_queue.put_nowait((num, sentence))
+
+                    elapsed = (time.monotonic() - t0) * 1000
+                    translation = _THINK_RE.sub("", full_translation).strip()
+
+                    # Flush remaining sentence buffer to TTS
+                    remaining = _THINK_RE.sub("", sentence_buf).strip()
+                    if remaining and not args.no_tts:
+                        tts_queue.put_nowait((num, remaining))
+
+                    if translation:
+                        clear_line()
+                        print(f"  [{args.target}] {translation}  ({elapsed:.0f}ms)")
+                        transcript_file.write(f"[{args.target}] {translation}\n")
+                        transcript_file.flush()
+                        recent_pairs.append({"ko": korean_text, "en": translation})
+                        if len(recent_pairs) > CONTEXT_WINDOW * 2:
+                            recent_pairs.pop(0)
+
+                except Exception as e:
+                    clear_line()
+                    print(f"  [{args.target}] ERROR: {e}")
+
+        async def tts_worker():
+            """Stream TTS audio and queue chunks for playback."""
+            while True:
+                num, english_text = await tts_queue.get()
+                try:
+                    t0 = time.monotonic()
+                    total_bytes = 0
+
+                    async with tts_client.stream(
+                        "POST",
+                        f"{TTS_URL}/synthesize/stream",
+                        json={"text": english_text, "language": args.target, "session_id": "e2e-test"},
+                    ) as response:
+                        if response.status_code == 404:
+                            # Streaming not available — fall back to non-streaming
+                            pass
+                        else:
+                            response.raise_for_status()
+                            sample_format = response.headers.get("x-sample-format", "f32le")
+                            async for raw_chunk in response.aiter_bytes(chunk_size=4096):
+                                if not raw_chunk:
+                                    continue
+                                if sample_format == "s16le":
+                                    audio_bytes = raw_chunk
+                                else:
+                                    samples = np.frombuffer(raw_chunk, dtype=np.float32)
+                                    audio_bytes = (samples.clip(-1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                                total_bytes += len(audio_bytes)
+                                await audio_out_queue.put(audio_bytes)
+
+                            elapsed = (time.monotonic() - t0) * 1000
+                            if total_bytes > 0:
+                                clear_line()
+                                print(f"  [tts] {total_bytes // 2 / SAMPLE_RATE_TTS:.1f}s audio  ({elapsed:.0f}ms stream)")
+                            continue
+
+                    # Fallback: non-streaming
+                    resp = await tts_client.post(
+                        f"{TTS_URL}/synthesize",
+                        json={"text": english_text, "language": args.target, "session_id": "e2e-test"},
+                        headers={"Accept": "application/octet-stream"},
+                    )
+                    resp.raise_for_status()
+                    elapsed = (time.monotonic() - t0) * 1000
+                    sample_format = resp.headers.get("x-sample-format", "f32le")
+                    if sample_format == "s16le":
+                        audio_bytes = resp.content
+                    else:
+                        samples = np.frombuffer(resp.content, dtype=np.float32)
+                        audio_bytes = (samples.clip(-1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                    await audio_out_queue.put(audio_bytes)
+                    clear_line()
+                    print(f"  [tts] {len(audio_bytes) // 2 / SAMPLE_RATE_TTS:.1f}s audio  ({elapsed:.0f}ms)")
+
+                except Exception as e:
+                    clear_line()
+                    print(f"  [tts] ERROR: {e}")
+
+        async def play_audio():
+            """Play TTS audio through speaker (or virtual sink for Discord)."""
+            if args.tts_sink:
+                # Use paplay to route to specific PipeWire/PulseAudio sink
+                proc = await asyncio.create_subprocess_exec(
+                    "paplay", "--raw", "--rate=24000", "--channels=1",
+                    "--format=s16le", f"--device={args.tts_sink}",
+                    stdin=asyncio.subprocess.PIPE,
+                )
+                try:
+                    while True:
+                        chunk = await audio_out_queue.get()
+                        if proc.stdin and len(chunk) > 0:
+                            proc.stdin.write(chunk)
+                            await proc.stdin.drain()
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    if proc.stdin:
+                        proc.stdin.close()
+                    await proc.wait()
+            else:
+                import sounddevice as sd
+
+                stream = sd.OutputStream(
+                    samplerate=SAMPLE_RATE_OUT,
+                    channels=CHANNELS,
+                    dtype="float32",
+                    device=args.output_device,
+                )
+                stream.start()
+
+                try:
+                    while True:
+                        chunk = await audio_out_queue.get()
+                        # TTS sends s16le at 24kHz → float32 at 48kHz
+                        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                        if len(samples) > 0:
+                            # 2x upsample (24kHz → 48kHz) via linear interpolation
+                            indices = np.linspace(0, len(samples) - 1, len(samples) * 2)
+                            resampled = np.interp(indices, np.arange(len(samples)), samples)
+                            stream.write(resampled.reshape(-1, 1).astype(np.float32))
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    stream.stop()
+                    stream.close()
+
+        # ── Build task list ──
+        tasks = [
+            asyncio.create_task(send_audio()),
+            asyncio.create_task(receive_transcripts()),
+            asyncio.create_task(flush_on_vad()),
+            asyncio.create_task(translate_worker()),
+        ]
+        if not args.no_tts:
+            tasks.append(asyncio.create_task(tts_worker()))
+            tasks.append(asyncio.create_task(play_audio()))
+
+        start_audio()
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            stop_audio()
+            await llm_client.aclose()
+            await tts_client.aclose()
+            transcript_file.close()
+            print(f"\nTranscript saved to {transcript_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E2E pipeline test: Audio → STT → LLM → TTS → Speaker")
+    parser.add_argument("--source", default="ko", help="Source language (default: ko)")
+    parser.add_argument("--target", default="en", help="Target language (default: en)")
+    parser.add_argument("--input-device", type=int, default=None, help="Input device index (mic mode)")
+    parser.add_argument("--output-device", type=int, default=None, help="Output device index (speaker)")
+    parser.add_argument("--desktop", action="store_true", help="Capture desktop/system audio instead of mic")
+    parser.add_argument("--no-tts", action="store_true", help="Skip TTS — text output only")
+    parser.add_argument("--tts-sink", type=str, default=None, help="PipeWire/PulseAudio sink name for TTS output (e.g. tts_virtual_mic)")
+    parser.add_argument("--list-devices", action="store_true", help="List audio devices")
+    parser.add_argument("--vad-pause", type=float, default=0.3, help="Seconds of silence to trigger flush (default: 0.3)")
+    parser.add_argument("--min-speech", type=float, default=0.5, help="Min speech duration before flush (default: 0.5)")
+    parser.add_argument("--max-speech", type=float, default=10.0, help="Max continuous speech before window flush (default: 10.0)")
+    parser.add_argument("--initial-prompt", type=str,
+                        default="다음은 한국어 기독교 교회 설교 음성입니다. "
+                                "주요 단어: 능히 하신다, 하나님, 예수 그리스도, 성령님, 교회, 예담교회, 청년부, "
+                                "말씀, 은혜, 구원, 십자가, 부활, 사명, 소명, 넘치도록, 역사하신다, "
+                                "에베소서, 빌립보서, 로마서, 시편, 정체성, 헌신, 순종, "
+                                "바울, 베드로, 모세, 다윗, 고난, 회복, 광야.",
+                        help="Whisper initial prompt for domain vocabulary")
+    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
-    print("yedam-sts E2E Integration Test")
-    print(f"Orchestrator: {ORCHESTRATOR_URL}")
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(name)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-    if args.test in ("health", "all"):
-        healthy = await test_health()
-        if args.test == "health":
-            return
+    if args.list_devices:
+        list_devices()
+        return
 
-    if args.test in ("services", "all"):
-        await test_services()
-        if args.test == "services":
-            return
+    if not args.desktop:
+        try:
+            import sounddevice  # noqa: F401
+        except ImportError:
+            print("Missing: pip install sounddevice")
+            sys.exit(1)
 
-    if args.test in ("pipeline", "all"):
-        await test_pipeline()
+    try:
+        asyncio.run(run_e2e(args))
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

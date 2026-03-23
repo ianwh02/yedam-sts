@@ -58,7 +58,7 @@ class STTClient:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._completed_count: int = 0
         self._receive_task: asyncio.Task | None = None
-        self._suppressing: bool = False
+        self._send_seq: int = 0
 
         # ── Stable-prefix flushing ──
         self._prev_partial: str = ""        # previous partial text
@@ -101,19 +101,15 @@ class STTClient:
 
     async def send_audio(self, pcm_data: bytes):
         """Forward raw PCM audio to WhisperLive."""
-        if self._ws and not self._suppressing:
+        if self._ws:
             await self._ws.send(pcm_data)
+            self._send_seq += 1
 
     async def clear_buffer(self):
         """Clear WhisperLive's audio buffer after a completed segment."""
         if self._ws:
-            self._suppressing = True
-            await self._ws.send(json.dumps({"type": "clear_buffer"}))
-            logger.debug("Sent clear_buffer for session %s", self.session_id)
-            asyncio.get_event_loop().call_later(3.0, self._lift_suppression)
-
-    def _lift_suppression(self):
-        self._suppressing = False
+            await self._ws.send(json.dumps({"type": "clear_buffer", "seq": self._send_seq}))
+            logger.debug("Sent clear_buffer for session %s (seq=%d)", self.session_id, self._send_seq)
 
     def _reset_flush_timer(self):
         """Reset the silence flush timer. Called on every partial."""
@@ -126,7 +122,7 @@ class STTClient:
 
     async def _silence_flush(self):
         """Force-flush remaining partial text after silence timeout."""
-        if self._last_partial and not self._suppressing:
+        if self._last_partial:
             # Flush only the unflushed portion
             text = self._last_partial[self._flushed_len:].strip()
             if text:
@@ -220,7 +216,6 @@ class STTClient:
 
                 # Handle buffer_cleared ACK
                 if data.get("message") == "buffer_cleared":
-                    self._suppressing = False
                     continue
 
                 segments = data.get("segments", [])
@@ -246,16 +241,15 @@ class STTClient:
                             self._reset_state()
                             await self.clear_buffer()
                     else:
-                        if not self._suppressing:
-                            self._last_partial = segment.text
-                            self._reset_flush_timer()
+                        self._last_partial = segment.text
+                        self._reset_flush_timer()
 
-                            # Show full partial to listeners (not just unflushed)
-                            if self.on_partial:
-                                await self.on_partial(segment.text)
+                        # Show full partial to listeners (not just unflushed)
+                        if self.on_partial:
+                            await self.on_partial(segment.text)
 
-                            # Check for stable prefix to flush early
-                            await self._check_stable_prefix(segment.text)
+                        # Check for stable prefix to flush early
+                        await self._check_stable_prefix(segment.text)
 
         except websockets.exceptions.ConnectionClosed:
             logger.warning("STT connection closed for session %s", self.session_id)

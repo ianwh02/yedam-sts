@@ -698,6 +698,21 @@ async def lifespan(app: FastAPI):
     _server_status = "weights_ready"
     logger.info("Phase 1 complete: weights loaded, status=weights_ready (waiting for /allocate_kv_cache)")
 
+    # Auto-allocate on restart: if budget is known from env var, self-trigger phase 2
+    auto_budget = os.environ.get("TTS_VRAM_BUDGET_MB", "")
+    if auto_budget:
+        logger.info(f"Auto-allocating KV cache from env: TTS_VRAM_BUDGET_MB={auto_budget}")
+        import httpx as _httpx
+        async def _auto_allocate():
+            await asyncio.sleep(1)  # let server finish startup
+            try:
+                async with _httpx.AsyncClient() as c:
+                    resp = await c.post(f"http://localhost:{PORT}/allocate_kv_cache", params={"budget_mb": int(auto_budget)})
+                    logger.info(f"Auto-allocate result: {resp.status_code}")
+            except Exception as e:
+                logger.error(f"Auto-allocate failed: {e}")
+        asyncio.create_task(_auto_allocate())
+
     # Start TTL eviction for session codec cache
     async def _ttl_eviction_loop():
         while True:

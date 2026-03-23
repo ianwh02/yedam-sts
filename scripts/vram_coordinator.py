@@ -261,7 +261,7 @@ def allocate_kv_caches(
             fraction = min(0.90, total_mb / free_mb) if free_mb > 0 else 0.05
             fraction = max(0.01, fraction)
             log.info("  Signaling %s to allocate (fraction=%.3f, share=%d MB)",
-                     container, fraction, budget_mb)
+                     container, fraction, total_mb)
             try:
                 result = subprocess.run(
                     ["docker", "exec", container, "python3", "-c",

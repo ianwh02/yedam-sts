@@ -68,7 +68,7 @@ def _create_audio_source(args) -> tuple:
 
     if args.desktop:
         # Desktop audio capture via PulseAudio/PipeWire monitor
-        source = args.monitor_source
+        source = None
         if not source:
             # Auto-detect: find the running monitor source
             try:
@@ -91,7 +91,7 @@ def _create_audio_source(args) -> tuple:
             except Exception:
                 pass
             if not source:
-                raise RuntimeError("No PulseAudio monitor source found. Use --monitor-source to specify.")
+                raise RuntimeError("No PulseAudio monitor source found.")
 
         proc = None
 
@@ -256,7 +256,8 @@ async def run_with_flushing(args):
     loop = asyncio.get_event_loop()
     last_partial = ""
     flush_num = 0
-    ignore_until_cleared = False
+    flushed_len = 0
+    send_seq = 0
     recent_pairs: list[dict] = []  # rolling context: [{ko: ..., en: ...}, ...]
     CONTEXT_WINDOW = 3  # include last N translations as context
     completed_count = 0
@@ -283,19 +284,21 @@ async def run_with_flushing(args):
     def clear_line():
         print(f"\r{' ' * terminal_width}\r", end="", flush=True)
 
-    def do_flush(text: str, reason: str):
-        nonlocal flush_num
+    def do_flush(reason: str):
+        """Flush unflushed portion of last_partial to the LLM."""
+        nonlocal flush_num, flushed_len
+        if not last_partial:
+            return
+        text = last_partial[flushed_len:].strip()
+        if not text:
+            return
+        flushed_len = len(last_partial)
         flush_num += 1
         clear_line()
         print(f"  [ko] {text}")
         transcript_file.write(f"[ko] {text}\n")
         transcript_file.flush()
         translate_queue.put_nowait((flush_num, text))
-
-    def _lift_ignore():
-        nonlocal ignore_until_cleared
-        if ignore_until_cleared:
-            ignore_until_cleared = False
 
     # Queue for VAD-triggered flush signals
     flush_signal: asyncio.Queue[str] = asyncio.Queue()
@@ -322,11 +325,12 @@ async def run_with_flushing(args):
 
         async def send_audio():
             """Send audio to Whisper + run client-side VAD."""
-            nonlocal is_speaking, speech_start_time, silence_start_time
+            nonlocal is_speaking, speech_start_time, silence_start_time, send_seq
 
             while True:
                 pcm = await audio_queue.get()
                 await ws.send(pcm)
+                send_seq += 1
 
                 # Run VAD on this chunk
                 audio_tensor = torch.frombuffer(pcm, dtype=torch.float32).clone()
@@ -367,24 +371,12 @@ async def run_with_flushing(args):
                             await flush_signal.put(f"pause {silence_duration:.1f}s after {speech_duration:.1f}s speech")
 
         async def receive_transcripts():
-            nonlocal completed_count, last_partial, ignore_until_cleared
+            nonlocal completed_count, last_partial, flushed_len
             async for message in ws:
                 if isinstance(message, bytes):
                     continue
 
                 data = json.loads(message)
-
-                msg_type = data.get("type", data.get("message", ""))
-                if msg_type in ("buffer_cleared", "buffer_trimmed"):
-                    ignore_until_cleared = False
-                    clear_line()
-                    trimmed = data.get("trimmed_seconds", "")
-                    label = f"trimmed {trimmed:.1f}s" if trimmed else "cleared"
-                    print(f"  [{label}]")
-                    continue
-
-                if ignore_until_cleared:
-                    continue
 
                 segments = data.get("segments", [])
                 for i, seg in enumerate(segments):
@@ -395,30 +387,22 @@ async def run_with_flushing(args):
 
                     if completed and i >= completed_count:
                         completed_count = i + 1
-                        do_flush(text, "whisper completed")
-                        last_partial = ""
-                        completed_count = 0
-                        ignore_until_cleared = True
-                        await ws.send(json.dumps({"type": "clear_buffer"}))
-                        loop.call_later(2.0, _lift_ignore)
+                        last_partial = text
+                        do_flush("whisper completed")
                     else:
                         last_partial = text
-                        max_display = terminal_width - 12
-                        display = text if len(text) <= max_display else text[:max_display - 3] + "..."
-                        clear_line()
-                        print(f"  partial: {display}", end="", flush=True)
+                        unflushed = text[flushed_len:].strip()
+                        if unflushed:
+                            max_display = terminal_width - 12
+                            display = unflushed if len(unflushed) <= max_display else unflushed[:max_display - 3] + "..."
+                            clear_line()
+                            print(f"  partial: {display}", end="", flush=True)
 
         async def flush_on_vad():
             """Wait for VAD flush signals and flush the latest transcript."""
-            nonlocal last_partial, ignore_until_cleared
             while True:
                 reason = await flush_signal.get()
-                if last_partial and not ignore_until_cleared:
-                    do_flush(last_partial, reason)
-                    last_partial = ""
-                    ignore_until_cleared = True
-                    await ws.send(json.dumps({"type": "clear_buffer"}))
-                    loop.call_later(2.0, _lift_ignore)
+                do_flush(reason)
 
         async def translate_worker():
             """Consume flushed Korean text and translate via LLM."""
@@ -515,7 +499,6 @@ def main():
     parser.add_argument("--language", default="ko", help="STT language (default: ko)")
     parser.add_argument("--input-device", type=int, default=None, help="Input device index (mic mode)")
     parser.add_argument("--desktop", action="store_true", help="Capture desktop/system audio instead of mic")
-    parser.add_argument("--monitor-source", type=str, default=None, help="PulseAudio monitor source name (auto-detected if omitted)")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices")
     parser.add_argument("--with-flushing", action="store_true", help="Enable VAD + window flushing")
     parser.add_argument("--vad-pause", type=float, default=0.2, help="Seconds of silence to trigger flush (default: 0.2)")
@@ -536,6 +519,8 @@ def main():
         format="%(asctime)s %(name)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     if args.list_devices:
         list_devices()

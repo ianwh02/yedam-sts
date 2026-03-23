@@ -61,3 +61,12 @@ BUSINESS.md
 
 # Migration plans (internal working docs)
 PLAN-VLLM-OMNI-MIGRATION.md
+
+# Claude Code
+.claude/
+
+# VRAM cache
+.vram_cache.json
+
+# Auto-generated VRAM budget
+.env.vram

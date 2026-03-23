@@ -66,6 +66,7 @@ SENTENCE_ENDINGS: list[str] = sorted([
     # Casual/spoken declarative (common in sermons)
     "거든요", "잖아요",
     "겠죠", "있죠", "없죠", "하죠",
+    "서요", "해서요", "돼서요",  # polite reason as sentence ender
     # Noun + copula endings
     "입니다", "이에요", "예요",
     # Sermon-specific boundaries (always end a thought)
@@ -85,7 +86,7 @@ PHRASE_ENDINGS: list[str] = sorted([
     "어서", "아서", "여서", "해서",
     "므로", "으므로",
     # Contrast / concession
-    "지만", "는데", "은데", "인데",
+    "지만", "는데", "은데", "인데", "한데",
     "더라도", "을지라도",
     # Conditional
     "으면", "다면", "라면",
@@ -105,6 +106,13 @@ PHRASE_ENDINGS: list[str] = sorted([
     # Listing with emphasis
     "뿐만", "아니라",
 ], key=len, reverse=True)
+
+# Clause connectives: flush everything BEFORE the connective.
+# These are standalone tokens that start a new clause.
+CLAUSE_CONNECTIVES = {
+    "그래서", "그런데", "그러니까", "그러면", "그러나",
+    "하지만", "그리고", "그렇지만", "그러므로",
+}
 
 # Punctuation that Whisper may insert (strip before checking endings)
 TRAILING_PUNCT = set(".,!?;:…·~\"'""''")
@@ -131,7 +139,7 @@ class KoreanEndingDetector:
 
     Tracks flushed_len internally — only checks unflushed text.
     """
-    min_phrase_chars: int = 12      # min chars since last flush for phrase flush
+    min_phrase_chars: int = 15      # min chars since last flush for phrase flush
     min_sentence_chars: int = 6     # min chars since last flush for sentence flush
     stability_count: int = 2        # consecutive stable detections before flushing
     max_no_flush_s: float = 30.0    # emergency fallback: force flush after this many seconds
@@ -189,29 +197,46 @@ class KoreanEndingDetector:
                 continue
 
             # Check sentence endings first (higher priority)
-            ending = self._match_sentence_ending(clean)
-            if ending:
+            sent_ending = self._match_sentence_ending(clean)
+            if sent_ending:
                 chars_since_flush = token_end_pos  # relative to unflushed start
                 is_marker = clean in _ALWAYS_FLUSH_MARKERS
                 if chars_since_flush >= self.min_sentence_chars or is_marker:
                     abs_pos = self.flushed_len + token_end_pos
-                    if self._check_stability(ending, abs_pos):
+                    if self._check_stability(sent_ending, abs_pos):
                         flush_text = unflushed[:token_end_pos].strip()
                         self._prev_text = text
                         return FlushDecision("sentence", flush_text, abs_pos,
-                                             f"~{ending}")
+                                             f"~{sent_ending}")
+                # Sentence ending matched but stability not met yet —
+                # skip phrase check on this token to avoid ping-pong
+                continue
 
-            # Check phrase endings
-            ending = self._match_phrase_ending(clean)
-            if ending:
+            # Check phrase endings (only if no sentence ending on this token)
+            phrase_ending = self._match_phrase_ending(clean)
+            if phrase_ending:
                 chars_since_flush = token_end_pos
                 if chars_since_flush >= self.min_phrase_chars:
                     abs_pos = self.flushed_len + token_end_pos
-                    if self._check_stability(ending, abs_pos):
+                    if self._check_stability(phrase_ending, abs_pos):
                         flush_text = unflushed[:token_end_pos].strip()
                         self._prev_text = text
                         return FlushDecision("phrase", flush_text, abs_pos,
-                                             f"~{ending}")
+                                             f"~{phrase_ending}")
+
+        # ── Connective check (runs after endings found nothing) ──
+        # If a clause connective (그래서, 그런데, etc.) appears, flush
+        # everything before it so the connective stays with the next clause.
+        for token_text, token_end_pos in tokens:
+            if token_text in CLAUSE_CONNECTIVES:
+                token_start = token_end_pos - len(token_text)
+                if token_start >= self.min_phrase_chars:
+                    flush_text = unflushed[:token_start].strip()
+                    if flush_text:
+                        abs_pos = self.flushed_len + token_start
+                        self._prev_text = text
+                        return FlushDecision("phrase", flush_text, abs_pos,
+                                             f"before:{token_text}")
 
         self._prev_text = text
         return FlushDecision("none", "", 0, "")
@@ -322,9 +347,13 @@ class KoreanEndingDetector:
         return None
 
     def _check_stability(self, ending: str, pos: int) -> bool:
-        """Check if the same ending has been detected at the same position
-        across consecutive updates (stability gate)."""
-        if ending == self._prev_ending and pos == self._prev_ending_pos:
+        """Check if the same ending has been detected across consecutive updates.
+
+        Only checks the ending string, not the exact position — Whisper
+        frequently shifts text by adding/removing spaces, which changes
+        absolute positions without changing the actual ending.
+        """
+        if ending == self._prev_ending:
             self._stable_count += 1
         else:
             self._prev_ending = ending

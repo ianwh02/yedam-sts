@@ -30,7 +30,7 @@ class ServeClientTensorRT(ServeClientBase):
         max_batch_size=1,
         initial_prompt=None,
         flush_mode="default",
-        min_phrase_chars=12,
+        min_phrase_chars=15,
         min_sentence_chars=6,
         stability_count=2,
     ):
@@ -61,7 +61,7 @@ class ServeClientTensorRT(ServeClientBase):
                 min_sentence_chars=min_sentence_chars,
                 stability_count=stability_count,
             )
-            self._last_sentence_text = ""  # dedup: skip re-transcription of just-flushed sentence
+            self._last_flushed_text = ""  # dedup: skip re-transcription of just-flushed text
             self._last_flush_was_phrase = False  # track consecutive phrases for trimming
             logging.info(f"[{client_uid}] Korean sermon flush mode enabled")
 
@@ -182,17 +182,33 @@ class ServeClientTensorRT(ServeClientBase):
             return
 
         # After _internal_trim, Whisper re-transcribes remaining audio which may
-        # reproduce the just-flushed sentence ending. Skip if unflushed portion
-        # is just the old sentence text being re-transcribed.
-        if self._last_sentence_text:
-            unflushed_check = full_text[self._detector.flushed_len:].strip()
-            last_clean = self._last_sentence_text.rstrip(".!? ")
-            if not unflushed_check or unflushed_check.rstrip(".!? ") == last_clean:
-                return
-            # Genuinely new content — clear dedup
-            self._last_sentence_text = ""
+        # reproduce the just-flushed text. Skip if unflushed portion
+        # is just the old text being re-transcribed.
+        # Safety: clear dedup after 3 seconds to prevent permanent blocking.
+        if self._last_flushed_text:
+            if time.monotonic() - self._detector._last_flush_time > 3.0:
+                self._last_flushed_text = ""
+            else:
+                unflushed_check = full_text[self._detector.flushed_len:].strip()
+                last_clean = self._last_flushed_text.rstrip(".!? ")
+                if not unflushed_check or unflushed_check.rstrip(".!? ") == last_clean:
+                    return
+                self._last_flushed_text = ""
 
         decision = self._detector.check(full_text)
+
+        if decision.flush_type == "none" and len(full_text) > 40:
+            unflushed = full_text[self._detector.flushed_len:]
+            # Log complete tokens found
+            tokens = self._detector._extract_complete_tokens(unflushed, full_text)
+            token_strs = [(t, p) for t, p in tokens[:5]]
+            logging.warning(
+                f"[{self.client_uid}] NO FLUSH: flushed_len={self._detector.flushed_len}, "
+                f"text_len={len(full_text)}, tokens={token_strs}, "
+                f"stability={self._detector._stable_count}/{self._detector.stability_count}, "
+                f"prev_ending='{self._detector._prev_ending}', "
+                f"dedup={self._last_flushed_text[:20] if self._last_flushed_text else 'none'}"
+            )
 
         if decision.flush_type in ("phrase", "sentence"):
             flush_text = decision.text.strip()
@@ -225,13 +241,14 @@ class ServeClientTensorRT(ServeClientBase):
                     self.timestamp_offset += duration
                     self._internal_trim()
                     self._last_flush_was_phrase = False
+                    self._last_flushed_text = flush_text
                 elif decision.flush_type == "phrase":
                     if self._last_flush_was_phrase:
-                        # Consecutive phrase — trim up to previous phrase
+                        # Consecutive phrase — trim to prevent unbounded growth
                         self.timestamp_offset += duration
                         self._internal_trim()
+                        self._last_flushed_text = flush_text
                     self._last_flush_was_phrase = True
-                    self._last_sentence_text = flush_text
 
         # Send the unflushed portion as a partial
         unflushed = full_text[self._detector.flushed_len:].strip()

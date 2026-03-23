@@ -224,7 +224,7 @@ class TranscriptionServer:
                     max_batch_size=trt_max_batch,
                     initial_prompt=options.get("initial_prompt"),
                     flush_mode=options.get("flush_mode", "default"),
-                    min_phrase_chars=options.get("min_phrase_chars", 12),
+                    min_phrase_chars=options.get("min_phrase_chars", 15),
                     min_sentence_chars=options.get("min_sentence_chars", 6),
                     stability_count=options.get("stability_count", 2),
                 )

@@ -191,10 +191,10 @@ class ServeClientBase(object):
         else:
             self._chunk_seq = seq
 
-        # Overflow trim: discard oldest 30s if buffer exceeds 45s
-        if self.frames_np is not None and self.frames_np.shape[0] > 45 * self.RATE:
-            trim_samples = int(30 * self.RATE)
-            self.frames_offset += 30.0
+        # Overflow trim: discard oldest 60s if buffer exceeds 90s
+        if self.frames_np is not None and self.frames_np.shape[0] > 90 * self.RATE:
+            trim_samples = int(60 * self.RATE)
+            self.frames_offset += 60.0
             self.frames_np = self.frames_np[trim_samples:]
             if self.timestamp_offset < self.frames_offset:
                 self.timestamp_offset = self.frames_offset

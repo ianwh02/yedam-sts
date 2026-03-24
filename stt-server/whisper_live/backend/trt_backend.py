@@ -51,19 +51,23 @@ class ServeClientTensorRT(ServeClientBase):
         self.max_new_tokens = max_new_tokens
         self.max_batch_size = max_batch_size
 
-        # Flush mode: "default" = standard WhisperLive, "korean_sermon" = grammar-based
+        # Flush mode: "default" = standard WhisperLive, "korean" = grammar-based
         self.flush_mode = flush_mode
         self._detector = None
-        if flush_mode == "korean_sermon":
+        if flush_mode in ("korean", "korean_sermon"):  # korean_sermon kept for backward compat
+            import os
             from whisper_live.korean_endings import KoreanEndingDetector
+            extra_markers_str = os.environ.get("STT_EXTRA_FLUSH_MARKERS", "")
+            extra_markers = {m.strip() for m in extra_markers_str.split(",") if m.strip()} if extra_markers_str else set()
             self._detector = KoreanEndingDetector(
                 min_phrase_chars=min_phrase_chars,
                 min_sentence_chars=min_sentence_chars,
                 stability_count=stability_count,
+                extra_flush_markers=extra_markers,
             )
             self._last_flushed_text = ""  # dedup: skip re-transcription of just-flushed text
             self._last_flush_was_phrase = False  # track consecutive phrases for trimming
-            logging.info(f"[{client_uid}] Korean sermon flush mode enabled")
+            logging.info(f"[{client_uid}] Korean grammar flush mode enabled (extra markers: {extra_markers or 'none'})")
 
         if single_model:
             if ServeClientTensorRT.SINGLE_MODEL is None:

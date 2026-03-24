@@ -63,14 +63,12 @@ SENTENCE_ENDINGS: list[str] = sorted([
     "하자", "보자", "가자",
     # Quoted endings
     "래요", "대요", "재요",
-    # Casual/spoken declarative (common in sermons)
+    # Casual/spoken declarative (common in spoken Korean)
     "거든요", "잖아요",
     "겠죠", "있죠", "없죠", "하죠",
     "서요", "해서요", "돼서요",  # polite reason as sentence ender
     # Noun + copula endings
     "입니다", "이에요", "예요",
-    # Sermon-specific boundaries (always end a thought)
-    "아멘", "할렐루야",
 ], key=len, reverse=True)
 
 # ㅂ니다 / ㅂ니까 forms: the syllable before 니다/니까 has ㅂ batchim.
@@ -97,7 +95,7 @@ PHRASE_ENDINGS: list[str] = sorted([
     "려고", "으려고", "도록",
     # Background / explanation
     "거든", "잖아",
-    # Through / passing (common in sermon narrative)
+    # Through / passing (common in spoken narrative)
     "통해서", "을통해",
     # Quoting
     "라고", "다고", "냐고",
@@ -117,8 +115,9 @@ CLAUSE_CONNECTIVES = {
 # Punctuation that Whisper may insert (strip before checking endings)
 TRAILING_PUNCT = set(".,!?;:…·~\"'""''")
 
-# Short markers that always trigger a sentence flush regardless of min_chars
-_ALWAYS_FLUSH_MARKERS = {"아멘", "할렐루야"}
+# Short markers that always trigger a sentence flush regardless of min_chars.
+# Empty by default — populated via extra_flush_markers in KoreanEndingDetector.
+_ALWAYS_FLUSH_MARKERS: set[str] = set()
 
 
 @dataclass
@@ -143,6 +142,7 @@ class KoreanEndingDetector:
     min_sentence_chars: int = 6     # min chars since last flush for sentence flush
     stability_count: int = 2        # consecutive stable detections before flushing
     max_no_flush_s: float = 30.0    # emergency fallback: force flush after this many seconds
+    extra_flush_markers: set[str] = field(default_factory=set)  # domain-specific markers (e.g. 아멘, 할렐루야)
 
     # ── Internal state ──
     flushed_len: int = field(default=0, init=False)
@@ -151,6 +151,24 @@ class KoreanEndingDetector:
     _stable_count: int = field(default=0, init=False)
     _last_flush_time: float = field(default_factory=time.monotonic, init=False)
     _prev_text: str = field(default="", init=False)
+    _sentence_endings: list[str] = field(default_factory=list, init=False)
+    _always_flush_markers: set[str] = field(default_factory=set, init=False)
+    _standalone_ok: set[str] = field(default_factory=set, init=False)
+
+    def __post_init__(self):
+        # Build instance-level copies with extra markers merged in
+        if self.extra_flush_markers:
+            self._sentence_endings = sorted(
+                list(SENTENCE_ENDINGS) + list(self.extra_flush_markers),
+                key=len, reverse=True,
+            )
+            self._always_flush_markers = _ALWAYS_FLUSH_MARKERS | self.extra_flush_markers
+        else:
+            self._sentence_endings = SENTENCE_ENDINGS
+            self._always_flush_markers = _ALWAYS_FLUSH_MARKERS
+        self._standalone_ok = {
+            "합시다", "읍시다", "갑시다", "하자", "보자", "가자",
+        } | self.extra_flush_markers
 
     def check(self, text: str) -> FlushDecision:
         """Check streaming partial text for Korean endings.
@@ -171,11 +189,11 @@ class KoreanEndingDetector:
             return FlushDecision("sentence", stripped, len(text), "timeout")
 
         # Need enough text to check (use the smaller threshold)
-        # But always allow sermon-specific markers (아멘, 할렐루야) regardless of length
+        # But always allow domain-specific markers regardless of length
         min_chars = min(self.min_sentence_chars, self.min_phrase_chars)
         if len(stripped) < min_chars:
             # Check for short standalone markers before giving up
-            if stripped not in _ALWAYS_FLUSH_MARKERS:
+            if stripped not in self._always_flush_markers:
                 self._prev_text = text
                 return FlushDecision("none", "", 0, "")
 
@@ -200,7 +218,7 @@ class KoreanEndingDetector:
             sent_ending = self._match_sentence_ending(clean)
             if sent_ending:
                 chars_since_flush = token_end_pos  # relative to unflushed start
-                is_marker = clean in _ALWAYS_FLUSH_MARKERS
+                is_marker = clean in self._always_flush_markers
                 if chars_since_flush >= self.min_sentence_chars or is_marker:
                     abs_pos = self.flushed_len + token_end_pos
                     if self._check_stability(sent_ending, abs_pos):
@@ -318,12 +336,9 @@ class KoreanEndingDetector:
         # Check standard suffix list
         # Token must be longer than just the ending (at least 1 stem char),
         # OR the token IS the ending for standalone markers.
-        # Standalone endings that can be the entire token
-        STANDALONE_OK = {"아멘", "할렐루야", "합시다", "읍시다", "갑시다", "하자", "보자", "가자"}
-
-        for ending in SENTENCE_ENDINGS:
+        for ending in self._sentence_endings:
             if token.endswith(ending):
-                if len(token) > len(ending) or ending in STANDALONE_OK:
+                if len(token) > len(ending) or ending in self._standalone_ok:
                     return ending
 
         # Check ㅂ니다 / ㅂ니까 forms via jamo

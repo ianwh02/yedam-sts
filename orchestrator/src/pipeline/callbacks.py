@@ -13,7 +13,7 @@ class SessionCallbacks:
     STT transcription, processor output, and TTS audio.
 
     This is the primary integration point for consumers building on top
-    of the yedam-sts pipeline. Transport (WebSocket, HTTP SSE, gRPC)
+    of the STS pipeline. Transport (WebSocket, HTTP SSE, gRPC)
     and encoding (Opus, MP3) are the consumer's responsibility.
     """
 

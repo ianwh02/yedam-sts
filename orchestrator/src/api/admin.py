@@ -57,7 +57,7 @@ async def delete_session(session_id: str, request: Request):
 
 @ws_router.websocket("/{session_id}")
 async def admin_websocket(websocket: WebSocket, session_id: str):
-    """Admin WebSocket: receives audio input from church PA.
+    """Admin WebSocket: receives audio input from the source.
 
     Protocol:
       - Client sends binary Float32 PCM frames at 16kHz mono

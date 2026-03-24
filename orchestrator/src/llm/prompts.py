@@ -1,22 +1,35 @@
 from __future__ import annotations
 
-TRANSLATION_SYSTEM_PROMPT = """/no_think
-You are a real-time Korean to English translator for a church sermon. Translate the following Korean text into natural, fluent English. Maintain the spiritual and pastoral tone.
+import logging
+from pathlib import Path
+
+from ..config import settings
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_SYSTEM_PROMPT = """/no_think
+You are a real-time translator. Translate the following text naturally and fluently.
 
 Rules:
-- Output ONLY the English translation, no explanations or notes
-- Preserve paragraph structure and rhetorical style
-- Use standard Christian theological terms in English
-- Bible verse references should use standard English notation (e.g., Romans 8:28)
-- Maintain the speaker's style (questions, exclamations, pauses)
-- Keep proper nouns in their standard English forms (e.g., 예수님 → Jesus, 하나님 → God)
-- Consistent terminology: 청년 = young adult/youth, 집사님 = deacon, 장로님 = elder, 목사님 = pastor
+- Output ONLY the translation, no explanations or notes
+- Maintain the speaker's style and tone
+- The input comes from live speech recognition and may contain errors"""
 
-STT error correction:
-The input comes from live speech recognition and may contain errors.
-- The speaker frequently code-switches to English. Garbled Korean that sounds like English should be interpreted as English (e.g. 에이블 = able, 히미 = Him, 나와 투 = now to, 후이즈 = who is).
-- 능히 하신다 = He is able (key sermon phrase).
-- Fix obvious mishearings based on sermon context."""
+
+def _load_system_prompt() -> str:
+    """Load system prompt from file if configured, otherwise use default."""
+    path = settings.llm_system_prompt_path
+    if path:
+        p = Path(path)
+        if p.is_file():
+            prompt = p.read_text(encoding="utf-8").strip()
+            logger.info("Loaded system prompt from %s", p)
+            return prompt
+        logger.warning("System prompt file not found: %s — using default", p)
+    return _DEFAULT_SYSTEM_PROMPT
+
+
+TRANSLATION_SYSTEM_PROMPT = _load_system_prompt()
 
 
 def build_translation_prompt(

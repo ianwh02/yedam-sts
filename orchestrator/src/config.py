@@ -20,9 +20,11 @@ class Settings(BaseSettings):
 
     # STT context
     stt_initial_prompt_segments: int = 3
-    stt_initial_prompt_vocab: str = ""  # comma-separated domain vocabulary
+    stt_initial_prompt_vocab: str = ""  # inline domain vocabulary
+    stt_initial_prompt_vocab_path: str = ""  # path to domain vocabulary file
 
     # LLM context
+    llm_system_prompt_path: str = ""  # path to custom system prompt file
     llm_model: str = os.environ.get("LLM_MODEL", "Qwen/Qwen3-4B-AWQ")
     llm_context_window_segments: int = 5
     llm_summary_interval_segments: int = 10

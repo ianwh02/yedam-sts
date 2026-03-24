@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class AudioPreprocessor:
-    """Audio preprocessing pipeline for cleaning church PA input.
+    """Audio preprocessing pipeline for cleaning audio input.
 
     Pipeline: Raw PCM → RNNoise denoise → RMS normalize
 
@@ -79,7 +79,7 @@ class AudioPreprocessor:
     def _normalize_rms(self, audio: np.ndarray) -> np.ndarray:
         """Normalize audio volume to target RMS level.
 
-        Church PA systems have wildly varying output levels.
+        Audio sources have wildly varying output levels.
         This ensures consistent volume reaching the STT model.
         """
         rms = np.sqrt(np.mean(audio**2))

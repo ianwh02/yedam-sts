@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start yedam-sts with two-phase VRAM allocation.
+# Start STS pipeline with two-phase VRAM allocation.
 #
 # Phase 1: All services start in parallel, load model weights only.
 # Phase 2: Coordinator measures free VRAM, distributes KV cache budgets.

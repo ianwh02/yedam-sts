@@ -349,7 +349,7 @@ async def profile_e2e_latency():
 
     test_texts_ko = [
         "오늘 날씨가 정말 좋습니다.",
-        "교회에서 예배를 드렸습니다.",
+        "서울에서 회의를 했습니다.",
         "감사합니다. 좋은 하루 되세요.",
     ]
 
@@ -428,7 +428,7 @@ async def profile_e2e_concurrent(concurrency_levels: list[int] | None = None):
 
     test_texts_ko = [
         "오늘 날씨가 정말 좋습니다.",
-        "교회에서 예배를 드렸습니다.",
+        "서울에서 회의를 했습니다.",
         "감사합니다. 좋은 하루 되세요.",
         "한국어를 영어로 번역해 주세요.",
         "이 프로젝트는 정말 흥미롭습니다.",

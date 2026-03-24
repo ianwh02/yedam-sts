@@ -47,7 +47,7 @@ def test_sentence_endings():
 
     cases = [
         # (text, expected_type, expected_ending_substring)
-        ("하나님이 능히 하십니다 ", "sentence", "니다"),  # matched as ㅂ니다
+        ("우리가 능히 하십니다 ", "sentence", "니다"),  # matched as ㅂ니다
         ("그것이 사실입니까 ", "sentence", "ㅂ니까"),
         ("정말 감사해요 ", "sentence", "해요"),
         ("그렇죠 ", "sentence", "죠"),
@@ -55,8 +55,6 @@ def test_sentence_endings():
         ("그랬었다 ", "sentence", "었다"),
         ("함께 읽으세요 ", "sentence", "세요"),
         ("함께 합시다 ", "sentence", "합시다"),
-        ("아멘 ", "sentence", "아멘"),
-        ("할렐루야 ", "sentence", "할렐루야"),
         ("정말 좋은데요 ", "sentence", "은데요"),
         ("그렇잖아요 ", "sentence", "잖아요"),
         ("어디 갈까요 ", "sentence", "까요"),
@@ -103,6 +101,36 @@ def test_phrase_endings():
     print("  ✓ phrase endings")
 
 
+def test_extra_flush_markers():
+    """Test that extra_flush_markers are detected as sentence endings."""
+    markers = {"아멘", "할렐루야"}
+    d = KoreanEndingDetector(stability_count=1, min_sentence_chars=3, extra_flush_markers=markers)
+
+    cases = [
+        ("아멘 ", "sentence", "아멘"),
+        ("할렐루야 ", "sentence", "할렐루야"),
+    ]
+    for text, expected_type, expected_ending in cases:
+        d.reset()
+        d.check(text)
+        result = d.check(text)
+        assert result.flush_type == expected_type, \
+            f"'{text.strip()}': expected {expected_type}, got {result.flush_type}"
+        assert expected_ending in result.reason, \
+            f"'{text.strip()}': expected '{expected_ending}' in reason, got '{result.reason}'"
+
+    # Without extra markers, they should NOT match
+    d2 = KoreanEndingDetector(stability_count=1, min_sentence_chars=3)
+    for marker in markers:
+        d2.reset()
+        d2.check(marker + " ")
+        result = d2.check(marker + " ")
+        assert result.flush_type == "none", \
+            f"'{marker}' without extra_flush_markers should be 'none', got {result.flush_type}"
+
+    print("  ✓ extra flush markers")
+
+
 def test_no_match():
     """Test that non-endings don't trigger false positives."""
     d = KoreanEndingDetector(stability_count=1)
@@ -110,9 +138,9 @@ def test_no_match():
     cases = [
         "가장 큰",          # adjective, not a sentence ending
         "습니",              # incomplete ending
-        "하나님",            # noun
-        "교회",              # noun
-        "예수",              # noun
+        "우리나라",          # noun
+        "서울시",            # noun
+        "대학교",            # noun
         "아",                # too short
         "hello world",       # English
     ]
@@ -193,9 +221,9 @@ def test_flushed_len_tracking():
     assert result.flush_type == "sentence", f"Expected sentence, got {result.flush_type}"
     assert "감사합니다" in result.text, f"Flush text should contain only new part, got '{result.text}'"
 
-    # Mark as flushed (sentence = reset)
+    # Mark as flushed — flushed_len advances (server-side doesn't clear buffer)
     d.on_flushed("sentence", result.end_pos)
-    assert d.flushed_len == 0, "Sentence flush should reset flushed_len"
+    assert d.flushed_len == result.end_pos, "Sentence flush should advance flushed_len"
 
     print("  ✓ flushed_len tracking")
 
@@ -320,6 +348,7 @@ def main():
     tests = [
         test_jamo,
         test_sentence_endings,
+        test_extra_flush_markers,
         test_phrase_endings,
         test_no_match,
         test_sentence_over_phrase,

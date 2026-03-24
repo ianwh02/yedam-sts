@@ -44,6 +44,23 @@ CHUNK_DURATION_S = 0.1
 CHANNELS = 1
 CONTEXT_WINDOW = 3
 
+_DEFAULT_SYSTEM_PROMPT = (
+    "/no_think\n"
+    "You are a real-time translator. "
+    "Translate the following text naturally and fluently. "
+    "Output ONLY the translation, no explanations.\n\n"
+    "The input comes from live speech recognition and may contain errors."
+)
+
+
+def _load_system_prompt() -> str:
+    """Load system prompt from file (via env) or use default."""
+    path = os.environ.get("LLM_SYSTEM_PROMPT_PATH", "")
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    return _DEFAULT_SYSTEM_PROMPT
+
 
 def list_devices():
     import sounddevice as sd
@@ -163,7 +180,7 @@ async def run_e2e(args):
     print(f"TTS: {TTS_URL}" if not args.no_tts else "TTS: disabled")
     print(f"Source: {source_desc}")
     print(f"Language: {args.source} → {args.target}")
-    print(f"Flush mode: korean_sermon (server-side)")
+    print(f"Flush mode: korean (server-side)")
     print("─" * 50)
     print("Press Ctrl+C to stop.\n")
 
@@ -211,7 +228,7 @@ async def run_e2e(args):
             "model": "large-v3",
             "use_vad": True,
             "initial_prompt": args.initial_prompt,
-            "flush_mode": "korean_sermon",
+            "flush_mode": "korean",
         }
         await ws.send(json.dumps(config))
         ready = await ws.recv()
@@ -287,23 +304,7 @@ async def run_e2e(args):
                         continue
                     korean_text = combined
                     pending_buffer = ""
-                    system = (
-                        "/no_think\n"
-                        "You are a real-time Korean to English translator for a church sermon. "
-                        "Translate the following Korean text into natural, fluent English. "
-                        "Output ONLY the English translation, no explanations.\n\n"
-                        "Important: The Korean text comes from live speech recognition which may contain errors. "
-                        "Apply these corrections:\n"
-                        "- The speaker frequently code-switches to English mid-sentence. "
-                        "Garbled Korean that sounds like English phrases should be interpreted as English "
-                        "(e.g. '에이블' = 'able', '히미' = 'Him', '나와 투' = 'now to', '후이즈' = 'who is').\n"
-                        "- Fix obvious STT mishearings based on sermon context "
-                        "(e.g. '쓰레기' in a sermon context likely means something else, "
-                        "'구이의 이불' likely means 'who is able').\n"
-                        "- '능히 하신다' = 'He is able' (key sermon phrase).\n"
-                        "- Maintain consistent terminology: 청년 = young adult/youth, "
-                        "집사님 = deacon, 장로님 = elder, 목사님 = pastor."
-                    )
+                    system = _load_system_prompt()
 
                     if recent_pairs:
                         context = "\n".join(
@@ -560,18 +561,8 @@ def main():
     parser.add_argument("--instruct", type=str, default=None, help="Voice design instruction (e.g. 'Male, 25 years old, warm and friendly')")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices")
     parser.add_argument("--initial-prompt", type=str,
-                        default="다음은 한국어 기독교 교회 설교 음성입니다. "
-                                "주요 단어: 능히 하신다, 하나님, 예수 그리스도, 성령님, 주님, 아버지 하나님, "
-                                "교회, 예담교회, 청년부, 청년교회, 에베소, 에베소 교회, "
-                                "말씀, 은혜, 구원, 십자가, 부활, 사명, 소명, 넘치도록, 역사하신다, "
-                                "에베소서, 빌립보서, 로마서, 시편, 고린도서, "
-                                "바울, 바울의 기도, 베드로, 모세, 다윗, 아브라함, "
-                                "정체성, 헌신, 순종, 고난, 회복, 광야, 성장주기, "
-                                "집사님, 목사님, 장로님, 전도사님, 성도, "
-                                "교회 성장주기, 청년기, 어린이 시절, 청소년 시절, "
-                                "무릎을 꿇다, 간절한 기도, 절박한 기도, "
-                                "He is able, who is able, now to Him, amen.",
-                        help="Whisper initial prompt for domain vocabulary")
+                        default="",
+                        help="Whisper initial prompt for domain vocabulary (or set STT_INITIAL_PROMPT_VOCAB_PATH)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 

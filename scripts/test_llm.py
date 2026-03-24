@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -18,19 +19,26 @@ import httpx
 LLM_URL = "http://localhost:8000/v1/chat/completions"
 LLM_MODEL = "Qwen/Qwen3-4B-AWQ"
 
-SYSTEM_PROMPT = """/no_think
-You are a real-time translation engine for a Korean church sermon.
+_DEFAULT_SYSTEM_PROMPT = """/no_think
+You are a real-time translator.
 
 RULES:
 1. Output ONLY the translation — no explanations, notes, or formatting.
 2. Maintain consistent terminology across the conversation.
-3. STT Error Correction — the input comes from speech recognition and may contain errors:
-   - Korean phonetic English: 에이블=able, 히미=Him, 후이즈=who is, 나우=now, 아멘=amen
-   - 능히 하신다 = "He is able" (not "able to cook" etc.)
-   - 집사님=deacon (not pastor), 목사님=pastor, 장로님=elder
-   - 청년=youth/young adult (not teenager)
-   - Fix obvious STT errors using surrounding context before translating.
+3. The input comes from live speech recognition and may contain errors.
 4. If a sentence is cut off mid-thought, translate what's there naturally."""
+
+
+def _load_system_prompt() -> str:
+    """Load system prompt from file (via env) or use default."""
+    path = os.environ.get("LLM_SYSTEM_PROMPT_PATH", "")
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    return _DEFAULT_SYSTEM_PROMPT
+
+
+SYSTEM_PROMPT = _load_system_prompt()
 
 CONTEXT_WINDOW = 3
 MAX_CHARS_PER_FLUSH = 50  # ~10s of Korean speech

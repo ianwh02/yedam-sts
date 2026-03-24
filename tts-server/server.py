@@ -716,17 +716,28 @@ async def lifespan(app: FastAPI):
         logger.info("[clone] %s prompt ready (mode=%s, ref_text=%s)", label, mode, repr(ref_text)[:60])
         return prompt
 
-    # Per-language ref audio
-    for lang, (path, ref_text) in _REF_AUDIO_LANG_CONFIG.items():
-        _voice_clone_prompts[lang] = _load_clone_prompt(path, ref_text, lang)
+    # Detect if model supports voice cloning (has speaker_encoder)
+    _has_speaker_encoder = getattr(interface, '_speaker_encoder_available', None) is not False
+    try:
+        interface._load_speaker_encoder()
+        _has_speaker_encoder = True
+    except Exception:
+        _has_speaker_encoder = False
 
-    # Generic fallback ref audio
-    if REF_AUDIO_PATH is not None:
-        _voice_clone_prompts[None] = _load_clone_prompt(REF_AUDIO_PATH, REF_TEXT, "default")
+    if _has_speaker_encoder:
+        # Per-language ref audio
+        for lang, (path, ref_text) in _REF_AUDIO_LANG_CONFIG.items():
+            _voice_clone_prompts[lang] = _load_clone_prompt(path, ref_text, lang)
 
-    if _voice_clone_prompts:
-        langs = [k or "default" for k in _voice_clone_prompts]
-        logger.info("[clone] Voice clone prompts loaded: %s", ", ".join(langs))
+        # Generic fallback ref audio
+        if REF_AUDIO_PATH is not None:
+            _voice_clone_prompts[None] = _load_clone_prompt(REF_AUDIO_PATH, REF_TEXT, "default")
+
+        if _voice_clone_prompts:
+            langs = [k or "default" for k in _voice_clone_prompts]
+            logger.info("[clone] Voice clone prompts loaded: %s", ", ".join(langs))
+    else:
+        logger.info("[clone] CustomVoice model detected (no speaker_encoder) — skipping voice clone prompt loading")
 
     # Optional multiprocessing decoder worker
     if os.environ.get("DECODER_MP_WORKER", "0").lower() in ("1", "true", "yes"):

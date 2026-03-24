@@ -251,6 +251,43 @@ services:
 
 For larger models, you may also need to adjust `LLM_MAX_MODEL_LEN` and `LLM_MAX_NUM_SEQS` in `docker-compose.yml` to fit within the budget.
 
+### TensorRT STT Backend
+
+The STT server has an optional TensorRT-LLM backend that replaces the default CTranslate2 (faster-whisper) backend. TensorRT builds GPU-specific optimised engines for the Whisper model — inference is faster but requires a one-time engine build step.
+
+**Prerequisites:**
+
+Build the slimmed NGC base image once (this is a large download, ~15 GB):
+
+```bash
+cd stt-server
+docker build -f Dockerfile.ngc-slim -t ngc-trtllm-slim:1.2.0 .
+```
+
+**Running:**
+
+```bash
+./scripts/start.sh --trt
+```
+
+On first startup, the container builds TRT encoder + decoder engines for your GPU (~10-15 minutes). Engines are cached in a Docker named volume (`trt_engines`) so subsequent starts are fast.
+
+**Rebuilding engines** (e.g. after changing the Whisper model):
+
+```bash
+docker volume rm yedam-sts_trt_engines
+./scripts/start.sh --trt
+```
+
+**Environment variables** (set in `.env` or `docker-compose.tensorrt.yml`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WHISPER_TRT_MODEL` | `large-v3-turbo` | Whisper model to build engines for |
+| `STT_BEAM_SIZE` | `1` | Beam width (1 = greedy, faster) |
+
+Note: TRT engines are tied to your exact GPU architecture and TensorRT version. They are not portable between different GPUs.
+
 ### Swapping the STT Model
 
 Change the Whisper variant in `.env`:
@@ -368,6 +405,7 @@ python scripts/profile_vram.py
 
 ## TODO
 
+- [ ] Fork vLLM for coordinator support — currently vLLM allocates KV cache at boot via `--gpu-memory-utilization`, so the coordinator can't measure true free VRAM after all weights load. Fork needs: `/startup` endpoint returning `weights_ready`, `/allocate_kv_cache` endpoint accepting `budget_mb`, and deferred KV cache allocation (matching the TTS/STT pattern)
 - [ ] Audio preprocessing (RNNoise noise suppression)
 - [ ] Legacy GPU compatibility (SM75 / T4 — TTS needs CUDA compute cap rebuild, vLLM needs `--dtype float16`)
 - [ ] Punctuation-based flush detector for non-Korean languages

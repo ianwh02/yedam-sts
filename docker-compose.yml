@@ -14,6 +14,7 @@ services:
       - WHISPER_COMPUTE_TYPE=${WHISPER_COMPUTE_TYPE:-int8_float16}
       - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
       - CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${STT_MPS_THREAD_PCT:-30}
+      - STT_EXTRA_FLUSH_MARKERS=${STT_EXTRA_FLUSH_MARKERS:-}
     volumes:
       - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
     expose:
@@ -92,7 +93,7 @@ services:
       - TTS_VRAM_BUDGET_MB=${TTS_VRAM_BUDGET_MB:-}
       - PORT=7860
       - REF_AUDIO_PATH_EN=${REF_AUDIO_PATH_EN:-/app/ref_audio/en.wav}
-      - REF_TEXT_EN=${REF_TEXT_EN:-Hello I'm recording a test audio to clone my own voice um to qwen tts nano}
+      - REF_TEXT_EN=${REF_TEXT_EN:-Hello my name is Ian and I'm testing the voice cloning system the weather is quite nice and I hope to go for a walk later this afternoon this recording will help the system learn how I speak}
       - REF_AUDIO_PATH_KO=${REF_AUDIO_PATH_KO:-}
       - REF_TEXT_KO=${REF_TEXT_KO:-}
       - X_VECTOR_ONLY=${X_VECTOR_ONLY:-0}
@@ -156,6 +157,9 @@ services:
       - DEFAULT_PROCESSOR=${DEFAULT_PROCESSOR:-translation}
       - LLM_CONTEXT_WINDOW_SEGMENTS=${LLM_CONTEXT_WINDOW_SEGMENTS:-5}
       - STT_INITIAL_PROMPT_SEGMENTS=${STT_INITIAL_PROMPT_SEGMENTS:-3}
+      - LLM_SYSTEM_PROMPT_PATH=${LLM_SYSTEM_PROMPT_PATH:-}
+      - STT_INITIAL_PROMPT_VOCAB=${STT_INITIAL_PROMPT_VOCAB:-}
+      - STT_INITIAL_PROMPT_VOCAB_PATH=${STT_INITIAL_PROMPT_VOCAB_PATH:-}
     ports:
       - "${ORCHESTRATOR_PORT:-8080}:8080"
     # No depends_on — start.sh handles startup ordering:

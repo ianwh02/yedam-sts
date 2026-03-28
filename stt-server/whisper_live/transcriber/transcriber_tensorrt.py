@@ -21,7 +21,12 @@ import tensorrt_llm
 import tensorrt_llm.logger as logger
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
-from tensorrt_llm.bindings import GptJsonConfig, KVCacheType
+from tensorrt_llm.bindings import GptJsonConfig
+try:
+    from tensorrt_llm.bindings import KVCacheType
+    _HAS_KV_CACHE_TYPE = True
+except ImportError:
+    _HAS_KV_CACHE_TYPE = False  # TRT-LLM < 1.0 doesn't have KVCacheType
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelConfig, SamplingConfig
 from tensorrt_llm.runtime.session import Session, TensorInfo
 if PYTHON_BINDINGS:
@@ -100,17 +105,14 @@ class WhisperEncoding:
             position_ids = remove_tensor_padding(
                 position_ids, mel_input_lengths // encoder_downsampling_factor)
         inputs = OrderedDict()
-        inputs['input_features'] = mel
+        inputs['x'] = mel
         inputs['input_lengths'] = mel_input_lengths
-        inputs['position_ids'] = position_ids
 
         output_list = [
-            TensorInfo('input_features', str_dtype_to_trt(self.dtype),
+            TensorInfo('x', str_dtype_to_trt(self.dtype),
                        mel.shape),
             TensorInfo('input_lengths', str_dtype_to_trt('int32'),
                        mel_input_lengths.shape),
-            TensorInfo('position_ids', str_dtype_to_trt('int32'),
-                       inputs['position_ids'].shape)
         ]
 
         output_info = (self.session).infer_shapes(output_list)
@@ -128,7 +130,7 @@ class WhisperEncoding:
                               stream=stream.cuda_stream)
         assert ok, 'Engine execution failed'
         stream.synchronize()
-        encoder_output = outputs['encoder_output']
+        encoder_output = outputs.get('encoder_output', outputs.get('output'))
         encoder_output_lengths = mel_input_lengths // encoder_downsampling_factor
         return encoder_output, encoder_output_lengths
 
@@ -158,9 +160,9 @@ class WhisperDecoding:
             ['gpt_attention_plugin'],
             remove_input_padding=self.decoder_config['plugin_config']
             ['remove_input_padding'],
-            kv_cache_type=KVCacheType.PAGED
-            if self.decoder_config['plugin_config']['paged_kv_cache'] == True
-            else KVCacheType.CONTINUOUS,
+            **({"kv_cache_type": KVCacheType.PAGED
+                if self.decoder_config['plugin_config']['paged_kv_cache']
+                else KVCacheType.CONTINUOUS} if _HAS_KV_CACHE_TYPE else {}),
             has_position_embedding=self.
             decoder_config['has_position_embedding'],
             dtype=self.decoder_config['dtype'],
@@ -242,7 +244,7 @@ class WhisperTRTLLM(object):
                  is_multilingual=False,
                  language="en",
                  task="transcribe",
-                 use_py_session=False,
+                 use_py_session=True,
                  num_beams=1,
                  debug_mode=False,
                  max_output_len=96,
@@ -289,8 +291,8 @@ class WhisperTRTLLM(object):
                 max_output_len=max_output_len,
                 max_beam_width=num_beams,
                 debug_mode=debug_mode,
-                cross_kv_cache_fraction=0.5,
             )
+            self._try_cross_kv = True  # will try cross_kv_cache_fraction at allocation time
             logger.info("[WhisperTRTLLM] defer_kv_cache=True, ModelRunnerCpp deferred")
         else:
             json_config = GptJsonConfig.parse_file(engine_dir / 'decoder' /
@@ -303,9 +305,12 @@ class WhisperTRTLLM(object):
                                  max_output_len=max_output_len,
                                  max_beam_width=num_beams,
                                  debug_mode=debug_mode,
-                                 kv_cache_free_gpu_memory_fraction=float(os.environ.get("STT_KV_CACHE_FREE_GPU_FRACTION", "0.05")),
-                                 cross_kv_cache_fraction=0.5)
-            self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
+                                 kv_cache_free_gpu_memory_fraction=float(os.environ.get("STT_KV_CACHE_FREE_GPU_FRACTION", "0.05")))
+            try:
+                self.model_runner_cpp = ModelRunnerCpp.from_dir(cross_kv_cache_fraction=0.5, **runner_kwargs)
+            except TypeError:
+                # cross_kv_cache_fraction not supported in TRT-LLM < 1.0
+                self.model_runner_cpp = ModelRunnerCpp.from_dir(**runner_kwargs)
             self._kv_allocated = True
         self.filters = mel_filters(self.device, self.n_mels, assets_dir)
 
@@ -324,7 +329,10 @@ class WhisperTRTLLM(object):
         logger.info(
             "[WhisperTRTLLM] creating ModelRunnerCpp (kv_cache_fraction=%.3f)", kv_cache_fraction
         )
-        self.model_runner_cpp = ModelRunnerCpp.from_dir(**kwargs)
+        try:
+            self.model_runner_cpp = ModelRunnerCpp.from_dir(cross_kv_cache_fraction=0.5, **kwargs)
+        except TypeError:
+            self.model_runner_cpp = ModelRunnerCpp.from_dir(**kwargs)
         self._kv_allocated = True
         del self._deferred_runner_kwargs
         logger.info("[WhisperTRTLLM] KV cache allocated")

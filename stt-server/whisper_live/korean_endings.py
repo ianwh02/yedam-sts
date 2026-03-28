@@ -141,7 +141,7 @@ class KoreanEndingDetector:
     min_phrase_chars: int = 15      # min chars since last flush for phrase flush
     min_sentence_chars: int = 6     # min chars since last flush for sentence flush
     stability_count: int = 2        # consecutive stable detections before flushing
-    max_no_flush_s: float = 30.0    # emergency fallback: force flush after this many seconds
+    max_no_flush_s: float = 25.0    # emergency fallback: force flush after this many seconds (Whisper hallucinates ~30s)
     extra_flush_markers: set[str] = field(default_factory=set)  # domain-specific markers (e.g. 아멘, 할렐루야)
 
     # ── Internal state ──
@@ -380,4 +380,113 @@ class KoreanEndingDetector:
     def _reset_stability(self):
         self._prev_ending = ""
         self._prev_ending_pos = -1
+        self._stable_count = 0
+
+
+# ── Punctuation-based flush detector (language-agnostic) ──────────────
+
+
+import re
+
+_SENTENCE_PUNCT = re.compile(r'[.!?](?:\s|$)')
+_CLAUSE_PUNCT = re.compile(r'[,;:](?:\s|$)')
+
+
+@dataclass
+class PunctuationFlushDetector:
+    """Detects sentence/clause boundaries from Whisper punctuation.
+
+    Works for any language. Uses the same stability pattern as KoreanEndingDetector:
+    punctuation must appear in N consecutive partial updates before flushing,
+    which prevents false flushes from short pauses where Whisper temporarily
+    adds a period then revises it away.
+
+    Higher stability_count than Korean (4 vs 2) because Whisper revises
+    punctuation more aggressively than Korean grammar endings.
+    """
+    min_sentence_chars: int = 10     # min chars since last flush for sentence flush
+    min_clause_chars: int = 30       # min chars for clause flush (comma/semicolon)
+    stability_count: int = 4         # consecutive stable detections before flushing
+    max_no_flush_s: float = 25.0     # emergency fallback: force flush after this many seconds
+
+    # ── Internal state ──
+    flushed_len: int = field(default=0, init=False)
+    _prev_text: str = field(default="", init=False)
+    _prev_punct_pos: int = field(default=-1, init=False)
+    _prev_punct_type: str = field(default="", init=False)
+    _stable_count: int = field(default=0, init=False)
+    _last_flush_time: float = field(default_factory=time.monotonic, init=False)
+
+    def check(self, text: str) -> FlushDecision:
+        """Check streaming partial text for punctuation boundaries."""
+        unflushed = text[self.flushed_len:]
+        stripped = unflushed.strip()
+
+        # Emergency fallback
+        if (stripped and
+                time.monotonic() - self._last_flush_time > self.max_no_flush_s):
+            self._reset_stability()
+            return FlushDecision("sentence", stripped, len(text), "timeout")
+
+        if len(stripped) < self.min_sentence_chars:
+            self._prev_text = text
+            return FlushDecision("none", "", 0, "")
+
+        # Scan for the latest sentence punctuation (.!?) in the unflushed text
+        best_match = None
+        best_type = None
+        for m in _SENTENCE_PUNCT.finditer(unflushed):
+            pos = m.start()
+            text_before = unflushed[:pos + 1].strip()
+            if len(text_before) >= self.min_sentence_chars:
+                best_match = pos + 1  # include the punctuation
+                best_type = "sentence"
+
+        # If no sentence punct, check for clause punct with longer minimum
+        if best_match is None:
+            for m in _CLAUSE_PUNCT.finditer(unflushed):
+                pos = m.start()
+                text_before = unflushed[:pos + 1].strip()
+                if len(text_before) >= self.min_clause_chars:
+                    best_match = pos + 1
+                    best_type = "phrase"
+
+        if best_match is None:
+            self._reset_stability()
+            self._prev_text = text
+            return FlushDecision("none", "", 0, "")
+
+        # Stability check: same punctuation position across consecutive updates
+        abs_pos = self.flushed_len + best_match
+        if best_type == self._prev_punct_type and abs_pos == self._prev_punct_pos:
+            self._stable_count += 1
+        else:
+            self._prev_punct_pos = abs_pos
+            self._prev_punct_type = best_type
+            self._stable_count = 1
+
+        if self._stable_count >= self.stability_count:
+            flush_text = unflushed[:best_match].strip()
+            self._reset_stability()
+            self._prev_text = text
+            return FlushDecision(best_type, flush_text, abs_pos,
+                                 f"punct:{unflushed[best_match - 1]}")
+
+        self._prev_text = text
+        return FlushDecision("none", "", 0, "")
+
+    def on_flushed(self, flush_type: str, end_pos: int):
+        self.flushed_len = end_pos
+        self._reset_stability()
+        self._last_flush_time = time.monotonic()
+
+    def reset(self):
+        self.flushed_len = 0
+        self._reset_stability()
+        self._last_flush_time = time.monotonic()
+        self._prev_text = ""
+
+    def _reset_stability(self):
+        self._prev_punct_pos = -1
+        self._prev_punct_type = ""
         self._stable_count = 0

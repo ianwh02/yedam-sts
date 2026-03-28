@@ -331,28 +331,6 @@ class ServeClientBase(object):
 
         If ``seq`` is None, falls back to a full wipe (backward compat).
         """
-        # Send current transcript as finalized before clearing
-        with self.lock:
-            final_text = self.current_out.strip() if self.current_out else ""
-            if not final_text and self.text:
-                final_text = " ".join(self.text).strip()
-
-        if final_text:
-            try:
-                self.websocket.send(json.dumps({
-                    "uid": self.client_uid,
-                    "segments": [{
-                        "text": final_text,
-                        "start": 0.0,
-                        "end": 0.0,
-                        "completed": True,
-                    }],
-                    "type": "final_before_clear",
-                }))
-                logging.info(f"[{self.client_uid}] Sent final transcript before clear: {final_text[:60]}")
-            except Exception as e:
-                logging.error(f"[ERROR]: Sending final_before_clear: {e}")
-
         with self.lock:
             self.buffer_epoch += 1
             self.frames_np = None

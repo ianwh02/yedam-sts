@@ -11,6 +11,15 @@
 
 set -euo pipefail
 
+# Use TRT venv if available (unified container), otherwise system Python
+if [ -x "/opt/stt-trt-venv/bin/python3" ]; then
+    PYTHON="/opt/stt-trt-venv/bin/python3"
+    TRTLLM_BUILD="/opt/stt-trt-venv/bin/trtllm-build"
+else
+    PYTHON="python3"
+    TRTLLM_BUILD="trtllm-build"
+fi
+
 MODEL_NAME="${1:-large-v3-turbo}"
 OUTPUT_DIR="${2:-/app/engines}"
 TRT_EXAMPLES="/app/trt-whisper-examples"
@@ -67,12 +76,17 @@ case "$MODEL_NAME" in
     "large-v3") MODEL_URL="https://openaipublic.azureedge.net/main/whisper/models/e5b1a55b89c1367dacf97e3e19bfd829a01529dbfdeefa8caeb59b3f1b81dadb/large-v3.pt" ;;
     "large-v3-turbo") MODEL_URL="https://openaipublic.azureedge.net/main/whisper/models/aff26ae408abcba5fbf8813c21e62b0941638c5f6eebfb145be0c9839262a19a/large-v3-turbo.pt" ;;
     *)
-        # Try as HuggingFace repo ID (e.g. ghost613/whisper-large-v3-turbo-korean)
-        if [[ "${MODEL_NAME}" == *"/"* ]]; then
+        # Local directory (already downloaded) or HuggingFace repo ID
+        if [ -d "${MODEL_NAME}" ]; then
+            # Local path — use directly
+            HF_MODEL_DIR="${MODEL_NAME}"
+            MODEL_URL=""
+        elif [[ "${MODEL_NAME}" == *"/"* ]]; then
+            # HuggingFace repo ID (e.g. ghost613/whisper-large-v3-turbo-korean)
             HF_MODEL_DIR="${ASSETS_DIR}/hf_${MODEL_NAME//\//_}"
             if [ ! -d "${HF_MODEL_DIR}" ]; then
                 echo "Downloading HuggingFace model ${MODEL_NAME}..."
-                python3 -c "
+                $PYTHON -c "
 from huggingface_hub import snapshot_download
 snapshot_download('${MODEL_NAME}', local_dir='${HF_MODEL_DIR}')
 print('Download complete.')
@@ -119,7 +133,7 @@ if [ -n "${HF_MODEL_DIR:-}" ] && [ -d "${HF_MODEL_DIR}" ]; then
     # TRT-LLM convert_checkpoint.py expects OpenAI .pt format.
     # Convert HF safetensors → .pt using whisper's state_dict layout.
     # Detect whisper architecture from HF config
-    WHISPER_ARCH=$(python3 -c "
+    WHISPER_ARCH=$($PYTHON -c "
 import json, os
 cfg = json.load(open(os.path.join('${HF_MODEL_DIR}', 'config.json')))
 el, dl = cfg['encoder_layers'], cfg['decoder_layers']
@@ -136,7 +150,7 @@ else: print('large-v3')  # fallback
     echo "  → Detected architecture: ${WHISPER_ARCH}"
     PT_PATH="${ASSETS_DIR}/${WHISPER_ARCH}.pt"
     if [ ! -f "${PT_PATH}" ]; then
-        python3 -c "
+        $PYTHON -c "
 import torch
 from transformers import WhisperForConditionalGeneration
 
@@ -181,18 +195,21 @@ for k, v in model.model.state_dict().items():
 
 state_dict['decoder.proj_out.weight'] = model.proj_out.weight if hasattr(model, 'proj_out') else model.lm_head.weight
 
+# Cast all weights to fp16 (fine-tuned models may save as fp32, but TRT-LLM expects fp16)
+state_dict = {k: v.half() if v.is_floating_point() else v for k, v in state_dict.items()}
+
 torch.save({'dims': dims, 'model_state_dict': state_dict}, '${PT_PATH}')
 print(f'Saved .pt to ${PT_PATH}')
 print(f'Architecture: ${WHISPER_ARCH}, dims: {dims}')
 "
     fi
-    python3 convert_checkpoint.py \
+    $PYTHON convert_checkpoint.py \
         --output_dir "${CHECKPOINT_DIR}" \
         --model_name "${WHISPER_ARCH}" \
         --model_dir "${ASSETS_DIR}" \
         ${QUANT_FLAGS}
 else
-    python3 convert_checkpoint.py \
+    $PYTHON convert_checkpoint.py \
         --output_dir "${CHECKPOINT_DIR}" \
         --model_name "${MODEL_NAME}" \
         --model_dir "${ASSETS_DIR}" \
@@ -202,25 +219,27 @@ fi
 # Step 2: Build encoder engine
 echo ""
 echo "[2/3] Building encoder engine..."
-trtllm-build \
+$TRTLLM_BUILD \
     --checkpoint_dir "${CHECKPOINT_DIR}/encoder" \
     --output_dir "${OUTPUT_DIR}/encoder" \
     --max_batch_size "${MAX_BATCH_SIZE}" \
     --bert_attention_plugin "${INFERENCE_PRECISION}" \
+    --remove_input_padding disable \
     --max_input_len 3000 \
     --max_seq_len 3000
 
 # Step 3: Build decoder engine
 echo ""
 echo "[3/3] Building decoder engine..."
-trtllm-build \
+$TRTLLM_BUILD \
     --checkpoint_dir "${CHECKPOINT_DIR}/decoder" \
     --output_dir "${OUTPUT_DIR}/decoder" \
     --max_beam_width "${MAX_BEAM_WIDTH}" \
     --max_batch_size "${MAX_BATCH_SIZE}" \
     --max_seq_len "${DECODER_MAX_SEQ_LEN}" \
     --max_input_len "${DECODER_MAX_INPUT_LEN}" \
-    --max_encoder_input_len 3000
+    --max_encoder_input_len 3000 \
+    --paged_kv_cache disable
 
 # Copy mel_filters.npz to output dir (needed at runtime)
 cp "${ASSETS_DIR}/mel_filters.npz" "${OUTPUT_DIR}/"

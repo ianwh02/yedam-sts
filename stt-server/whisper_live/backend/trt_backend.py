@@ -21,7 +21,7 @@ class ServeClientTensorRT(ServeClientBase):
         client_uid=None,
         model=None,
         single_model=False,
-        use_py_session=False,
+        use_py_session=True,
         max_new_tokens=96,
         send_last_n_segments=10,
         no_speech_thresh=0.45,
@@ -51,7 +51,8 @@ class ServeClientTensorRT(ServeClientBase):
         self.max_new_tokens = max_new_tokens
         self.max_batch_size = max_batch_size
 
-        # Flush mode: "default" = standard WhisperLive, "korean" = grammar-based
+        # Flush mode: "default" = standard WhisperLive, "korean" = grammar-based,
+        # "punctuation" = language-agnostic punctuation detection
         self.flush_mode = flush_mode
         self._detector = None
         if flush_mode in ("korean", "korean_sermon"):  # korean_sermon kept for backward compat
@@ -66,6 +67,10 @@ class ServeClientTensorRT(ServeClientBase):
                 extra_flush_markers=extra_markers,
             )
             self._last_flushed_text = ""  # dedup: skip re-transcription of just-flushed text
+        elif flush_mode == "punctuation":
+            from whisper_live.korean_endings import PunctuationFlushDetector
+            self._detector = PunctuationFlushDetector()
+            self._last_flushed_text = ""
             self._last_flush_was_phrase = False  # track consecutive phrases for trimming
             logging.info(f"[{client_uid}] Korean grammar flush mode enabled (extra markers: {extra_markers or 'none'})")
 
@@ -121,20 +126,23 @@ class ServeClientTensorRT(ServeClientBase):
             self.transcriber.transcribe(mel)
 
     def _build_text_prefix(self):
-        """Build decoder prompt with optional previous transcript context.
+        """Build decoder prompt with vocab anchoring + transcript context.
 
         Whisper's initial_prompt mechanism: previous text is prepended with
         <|startofprev|> token so the decoder has linguistic context after
-        a buffer clear. Limited to ~200 chars to stay within decoder limits.
+        a buffer clear. Vocab (initial_prompt) gets a reserved 200-char
+        budget for entity anchoring; prev_transcript fills the remainder
+        up to ~400 chars total (~200 tokens, within decoder limit of 224).
         """
         task_tokens = f"<|startoftranscript|><|{self.language}|><|{self.task}|><|notimestamps|>"
 
-        # Combine initial_prompt + prev_transcript for context
-        context = ""
-        if self.prev_transcript:
-            context = self.prev_transcript[-200:]  # last ~200 chars
-        elif self.initial_prompt:
-            context = self.initial_prompt[:200]
+        # Always include initial_prompt (vocab) for entity anchoring,
+        # then append prev_transcript for linguistic continuity.
+        # Vocab gets a reserved budget so it's never fully displaced.
+        max_chars = 400
+        vocab = self.initial_prompt[:200] if self.initial_prompt else ""
+        transcript = self.prev_transcript[-(max_chars - len(vocab)):] if self.prev_transcript else ""
+        context = f"{vocab} {transcript}".strip() if (vocab or transcript) else ""
 
         if context:
             return f"<|startofprev|>{context}{task_tokens}"
@@ -201,6 +209,11 @@ class ServeClientTensorRT(ServeClientBase):
 
         decision = self._detector.check(full_text)
 
+        # Track flushed position for partial computation below.
+        # _internal_trim() resets detector.flushed_len to 0 for the next pass,
+        # but we need the post-flush value to slice THIS pass's full_text.
+        partial_offset = self._detector.flushed_len
+
         if decision.flush_type == "none" and len(full_text) > 40:
             unflushed = full_text[self._detector.flushed_len:]
             # Log complete tokens found
@@ -233,6 +246,7 @@ class ServeClientTensorRT(ServeClientBase):
                     logging.error(f"[ERROR]: Sending flushed segment: {e}")
 
                 self._detector.on_flushed(decision.flush_type, decision.end_pos)
+                partial_offset = self._detector.flushed_len
                 logging.info(
                     f"[{self.client_uid}] {decision.flush_type} flush: "
                     f"{decision.reason} ({len(flush_text)} chars)"
@@ -255,7 +269,7 @@ class ServeClientTensorRT(ServeClientBase):
                     self._last_flush_was_phrase = True
 
         # Send the unflushed portion as a partial
-        unflushed = full_text[self._detector.flushed_len:].strip()
+        unflushed = full_text[partial_offset:].strip()
         if unflushed:
             segment = self.format_segment(
                 self.timestamp_offset,

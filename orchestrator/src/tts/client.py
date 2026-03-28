@@ -282,7 +282,24 @@ class TTSClient:
         ws = self._continuous_ws.get(session_id)
         if ws is None:
             return
-        await ws.send(json.dumps({"type": "text", "text": text}))
+        try:
+            await ws.send(json.dumps({"type": "text", "text": text}))
+        except Exception:
+            # WebSocket died (server closed after continuation_timeout) — reconnect
+            logger.info("Continuous TTS WebSocket stale for session %s, reconnecting", session_id)
+            self._continuous_ws.pop(session_id, None)
+            reader = self._continuous_readers.pop(session_id, None)
+            if reader:
+                reader.cancel()
+            self._continuous_ready.pop(session_id, None)
+            try:
+                await self.open_continuous_stream(
+                    session_id=session_id,
+                    language=language,
+                    initial_text=text,
+                )
+            except Exception:
+                logger.warning("Failed to reconnect continuous stream for session %s", session_id, exc_info=True)
 
     async def close_continuous_stream(self, session_id: str):
         """End the continuous TTS stream."""

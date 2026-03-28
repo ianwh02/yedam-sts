@@ -1467,7 +1467,7 @@ class Qwen3TTSInterface:
         instruct: str | None = None,
         voice_clone_prompt: dict | None = None,
         non_streaming_mode: bool = True,
-        continuation_timeout: float = 5.0,
+        continuation_timeout: float = 120.0,  # 2 min idle before closing (reconnect handles longer gaps)
     ):
         """Async generator: fresh prompt per sentence through persistent WebSocket.
 

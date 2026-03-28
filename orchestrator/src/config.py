@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # Sentence splitting for TTS pipelining
     tts_min_words_sentence_split: int = 4  # min words before splitting on sentence punctuation (short fragments combine with next)
     tts_min_words_comma_split: int = 8  # min words before splitting on comma
-    tts_max_words_per_chunk: int = 20  # force split at this word count
+    tts_max_words_per_chunk: int = 35  # force split at this word count
 
     # Audio preprocessing
     audio_rnnoise_enabled: bool = True

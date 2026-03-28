@@ -7,16 +7,21 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SYSTEM_PROMPT = """/no_think
-You are a real-time translator. Translate the following text naturally and fluently.
+_DEFAULT_SYSTEM_PROMPT_TEMPLATE = """/no_think
+You are a real-time {source_lang_name} to {target_lang_name} translator. Translate the following {source_lang_name} text into {target_lang_name} naturally and fluently.
 
 Rules:
-- Output ONLY the translation, no explanations or notes
+- Output ONLY the {target_lang_name} translation, no explanations or notes
 - Maintain the speaker's style and tone
 - The input comes from live speech recognition and may contain errors"""
 
+_LANG_NAMES = {
+    "ko": "Korean", "en": "English", "zh": "Chinese", "ja": "Japanese",
+    "es": "Spanish", "fr": "French", "de": "German", "pt": "Portuguese",
+}
 
-def _load_system_prompt() -> str:
+
+def _load_system_prompt(source_lang: str, target_lang: str) -> str:
     """Load system prompt from file if configured, otherwise use default."""
     path = settings.llm_system_prompt_path
     if path:
@@ -26,10 +31,10 @@ def _load_system_prompt() -> str:
             logger.info("Loaded system prompt from %s", p)
             return prompt
         logger.warning("System prompt file not found: %s — using default", p)
-    return _DEFAULT_SYSTEM_PROMPT
-
-
-TRANSLATION_SYSTEM_PROMPT = _load_system_prompt()
+    return _DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(
+        source_lang_name=_LANG_NAMES.get(source_lang, source_lang),
+        target_lang_name=_LANG_NAMES.get(target_lang, target_lang),
+    )
 
 
 def build_translation_prompt(
@@ -54,12 +59,12 @@ def build_translation_prompt(
     Returns:
         OpenAI-format messages list.
     """
-    system = TRANSLATION_SYSTEM_PROMPT
+    system = _load_system_prompt(source_lang, target_lang)
 
     # Add recent context for continuity
     if recent_segments:
         context_lines = []
-        for seg in recent_segments[-5:]:
+        for seg in recent_segments[-settings.llm_context_window_segments:]:
             if seg.get("english"):
                 context_lines.append(
                     f"Korean: {seg['korean']}\nEnglish: {seg['english']}"

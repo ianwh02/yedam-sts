@@ -38,7 +38,7 @@ class LLMClient:
     async def stream_chat(
         self,
         messages: list[dict],
-        max_tokens: int = 512,
+        max_tokens: int = 200,
         temperature: float = 0.3,
     ) -> AsyncGenerator[str, None]:
         """Stream chat completion tokens from vLLM.

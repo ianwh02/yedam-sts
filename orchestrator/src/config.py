@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # LLM context
     llm_system_prompt_path: str = ""  # path to custom system prompt file
     llm_model: str = os.environ.get("LLM_MODEL", "Qwen/Qwen3-4B-AWQ")
-    llm_context_window_segments: int = 5
+    llm_context_window_segments: int = 3
     llm_summary_interval_segments: int = 10
 
     # Session limits

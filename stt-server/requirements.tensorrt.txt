@@ -1,0 +1,28 @@
+# Requirements for TensorRT WhisperLive server
+# Note: torch, tensorrt_llm, cuda are pre-installed in the NGC base image
+# Do NOT list them here to avoid version conflicts
+
+# WhisperLive server core
+websockets>=13.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+
+# VAD (uses faster-whisper's silero-vad integration)
+faster-whisper==1.2.0
+
+# Whisper tokenizer + mel spectrogram
+openai-whisper
+tiktoken
+
+# Audio loading
+soundfile
+av
+
+# Model download
+huggingface_hub>=0.20.0
+requests>=2.31.0
+
+# Misc
+numpy<2
+cffi

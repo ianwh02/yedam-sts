@@ -95,3 +95,365 @@ Proposed (continuous KV cache):
 - If LLM output is slower than TTS generation, the talker must "pause" and wait for more text. Options: hold the last hidden state, generate silence tokens, or use a special "wait" token.
 - EOS handling changes — the talker shouldn't emit EOS between sentences, only at the true end of the session/segment. Need a mechanism to signal "more text coming" vs "segment done."
 - Error recovery — if one sentence's generation fails, the KV cache state may be corrupted for subsequent sentences.
+
+---
+---
+
+# Latency / Compute Optimizations from KoljaB's Repos
+
+**Source repos**: [RealtimeSTT](https://github.com/KoljaB/RealtimeSTT), [RealtimeTTS](https://github.com/KoljaB/RealtimeTTS), [RealtimeVoiceChat](https://github.com/KoljaB/RealtimeVoiceChat)
+
+Identified 2026-03-28. Ranked by impact for the yedam-sts pipeline.
+
+---
+
+## High Impact — Latency Reduction
+
+### K1. Speculative LLM Pre-generation
+
+**Source**: RealtimeVoiceChat (`speech_pipeline_manager.py`)
+
+**Current behavior**: Orchestrator waits for final STT segment → fires LLM translation request.
+
+**Proposed**: Start LLM inference *before* the user finishes speaking, using sentence-end detection heuristics.
+
+**How KoljaB does it**:
+- `detect_potential_sentence_end()` monitors realtime STT partials
+- Keeps a cache of recent normalized texts
+- If the same punctuation-terminated text appears 3+ times within 200ms (STT has stabilized), triggers `prepare_generation()` which queues LLM inference
+- If the user continues speaking and text changes significantly, `check_abort()` compares text similarity (weighted SequenceMatcher focusing on last 5 words, threshold 0.95) and aborts the speculative generation
+- Uses `TextSimilarity` class to avoid re-generating for nearly identical partial transcriptions
+
+**Integration points in our codebase**:
+- `orchestrator/src/pipeline/orchestrator.py` — add speculative LLM trigger on partial STT updates
+- `orchestrator/src/stt/client.py` — expose partial text stability metrics to orchestrator
+- Need abort mechanism for in-flight LLM requests (cancel httpx streaming)
+
+**Estimated savings**: ~200-500ms of LLM TTFT hidden behind user speech
+
+**Risks**: Wasted GPU compute on aborted speculative requests. Mitigated by text similarity check before aborting.
+
+---
+
+### K2. Quick Answer / First Fragment Split
+
+**Source**: RealtimeVoiceChat (`speech_pipeline_manager.py`) + RealtimeTTS (`stream.py`)
+
+**Current behavior**: `SentenceBoundaryDetector` accumulates LLM tokens, splits on punctuation but waits for `min_words_comma_split=8` words before splitting on commas. First TTS request fires after first full sentence detected.
+
+**Proposed**: Yield the first sub-sentence fragment as soon as any delimiter is found, regardless of length.
+
+**How KoljaB does it**:
+- **RealtimeVoiceChat**: Splits response into two phases:
+  - *Quick answer*: First sentence extracted via `TextContext.get_context()` which scans for first natural sentence boundary (period, comma, exclamation, etc. with minimum length/alphanumeric constraints). Sent to TTS immediately on a dedicated thread.
+  - *Final answer*: Remaining LLM tokens stream to TTS via a separate generator-based synthesis path on another thread. Both go into the same audio queue for seamless playback.
+- **RealtimeTTS** (`stream2sentence`): `fast_sentence_fragment=True` yields on the *first* delimiter found. `force_first_fragment_after_words=30` forces yield even without a delimiter for long openings. `minimum_first_fragment_length=10` chars prevents trivially small fragments.
+
+**Integration points in our codebase**:
+- `orchestrator/src/pipeline/orchestrator.py` — modify `SentenceBoundaryDetector` to have a `first_fragment` mode with lower thresholds
+- `orchestrator/src/tts/client.py` — no change needed (already has per-session queue)
+- Consider: reduce `min_words_comma_split` from 8 to 3-4 for the first fragment only, then revert to 8 for subsequent fragments
+
+**Estimated savings**: ~200-500ms to first audio chunk
+
+**Tradeoffs**: Very short fragments (<5 words) may produce slightly lower TTS quality. Tunable via minimum_first_fragment_length.
+
+---
+
+### K3. ML-Based Turn Detection
+
+**Source**: RealtimeVoiceChat (`turndetect.py`)
+
+**Current behavior**: Fixed silence thresholds + Korean grammar endings (`korean_endings.py`) determine when user is done speaking.
+
+**Proposed**: Use a fine-tuned DistilBERT model to predict whether partial STT text is a complete utterance, dynamically adjusting silence duration.
+
+**How KoljaB does it**:
+- Model: `KoljaB/SentenceFinishedClassification` (DistilBERT fine-tuned for sentence completion prediction)
+- Probability interpolated to a pause duration via configurable anchor points
+- Combined with punctuation-based heuristics in a weighted average (65% punctuation weight, 35% model weight)
+- Final pause dynamically sets `post_speech_silence_duration` on the RealtimeSTT recorder
+- Speed factor (0.0-1.0) adjustable from UI — interpolates between "fast" settings (0.33s question pause) and "slow" (0.8s)
+- Dynamic behavior: questions ending with "?" get short pause, ambiguous fragments get longer pause
+
+**Integration points in our codebase**:
+- `stt-server/whisper_live/` — add turn detection module alongside `korean_endings.py`
+- Would need a Korean-trained equivalent of `SentenceFinishedClassification` (the existing model is English)
+- Could use Korean grammar endings as a strong signal (equivalent to punctuation heuristics) combined with a Korean sentence completion model
+- `orchestrator/src/pipeline/orchestrator.py` — consume dynamic silence duration from STT
+
+**Estimated savings**: 200-400ms average reduction in turn gap
+
+**Challenges**: Requires Korean-language sentence completion model (fine-tune DistilBERT on Korean corpus, or use existing Korean grammar endings as proxy). English model won't work for Korean speech.
+
+---
+
+### K4. Early Transcription on Silence
+
+**Source**: RealtimeSTT (`audio_recorder.py`, lines 2178-2192)
+
+**Current behavior**: STT waits for silence duration to fully expire, then sends audio to Whisper for final transcription.
+
+**Proposed**: When silence is first detected (before threshold expires), speculatively send audio to the main Whisper model. If speech resumes, discard the result. If silence continues, use the pre-computed result instantly.
+
+**How KoljaB does it**:
+- `early_transcription_on_silence` flag enables this behavior
+- When `speech_end_silence_start` is first set (voice stops), immediately sends current audio to the main model over the transcription pipe
+- `transcribe_count` tracks pending speculative transcriptions
+- If voice resumes before silence threshold, increments `transcribe_count` — when the speculative result arrives, it's discarded because count doesn't match
+- If silence continues past threshold, the already-completed transcription is used immediately — zero additional wait
+
+**Integration points in our codebase**:
+- `stt-server/whisper_live/backend/trt_backend.py` or `faster_whisper_backend.py` — add speculative transcription on silence onset
+- `stt-server/whisper_live/batch_inference.py` — may need priority flag for speculative requests (lower priority than confirmed final transcriptions)
+- Need epoch/counter mechanism to discard stale speculative results
+
+**Estimated savings**: Hides entire Whisper final transcription latency (~100-300ms depending on model size)
+
+**Tradeoffs**: Wasted GPU compute on false alarms (user pauses then continues). With batch inference, speculative requests compete for batch slots. Could be mitigated with a low-priority queue.
+
+---
+
+## Medium Impact — Perceived Latency
+
+### K5. Dual Whisper Model
+
+**Source**: RealtimeSTT (`audio_recorder.py`)
+
+**Current behavior**: Single Whisper model (large-v3-turbo or whisper-small-komixv2 TRT) handles both partial and final transcription.
+
+**Proposed**: Use a smaller model for real-time partials (fast, lower quality) and a larger model for final transcription (slower, higher quality).
+
+**How KoljaB does it**:
+- **Main model** (`model` param, default "tiny"): Runs in a separate process via `multiprocessing.Process` (Windows/Mac) or `threading.Thread` (Linux). Used only when a complete utterance is ready. Communicates via `SafePipe` (thread-safe `multiprocessing.Pipe` wrapper).
+- **Realtime model** (`realtime_model_type` param, default "tiny"): Loaded in the main process. Runs transcription in `_realtime_worker()` on a daemon thread. Transcribes the *entire accumulated frames buffer* on each pass (every 20ms in server config).
+- `use_main_model_for_realtime` flag allows sharing one model for both (saves GPU memory).
+- Main model uses `beam_size=5` for accuracy, realtime uses `beam_size_realtime=3` for speed.
+
+**Integration points in our codebase**:
+- Would require loading two Whisper models in the STT server
+- VRAM impact: second small model (whisper-tiny) adds ~75 MiB; whisper-base adds ~150 MiB
+- Batch inference would only apply to the main model; realtime model runs independently
+- For Korean: both models would need Korean fine-tuning for acceptable quality
+
+**Estimated benefit**: Smoother real-time display, lower perceived latency. Partials update faster with tiny model.
+
+**Tradeoffs**: Additional VRAM for second model. May not be worth it if current single-model partials are already fast enough (batch inference with beam_size=1 is already near-instant).
+
+---
+
+### K6. Realtime Text Stabilization
+
+**Source**: RealtimeSTT (`audio_recorder.py`, lines 2435-2493)
+
+**Current behavior**: Korean flushing uses `stability_count=2` (consecutive stable detections before flushing). Partial text sent directly to UI.
+
+**Proposed**: Compute longest common prefix between consecutive transcriptions. Stable prefix never regresses; only the unstable tail updates.
+
+**How KoljaB does it**:
+- Keeps `text_storage` (list of all recent transcriptions)
+- Computes `os.path.commonprefix([last_two_texts[0], last_two_texts[1]])`
+- `realtime_stabilized_safetext` grows monotonically — only updates if new prefix is longer
+- `_find_tail_match_in_text` finds where the stable prefix ends in the fresh transcription, appends only the new unstable tail
+- Two callback streams: `on_realtime_transcription_update` (raw, jittery) and `on_realtime_transcription_stabilized` (left portion stable, right portion updates)
+
+**Integration points in our codebase**:
+- `orchestrator/src/stt/client.py` — add stabilization layer for partial text before broadcasting to listeners
+- Or implement server-side in `stt-server/whisper_live/backend/base.py` alongside existing stability mechanism
+- Could combine with Korean grammar endings: stable prefix uses grammar-based validation, unstable tail uses common-prefix approach
+
+**Estimated benefit**: Less visual jitter in partial transcription display. Better UX for listeners.
+
+**Tradeoffs**: Minimal compute cost. Slight delay in partial updates (waits for two consecutive transcriptions to compute prefix).
+
+---
+
+### K7. Buffer Threshold Flow Control
+
+**Source**: RealtimeTTS (`stream.py`, `_synthesis_chunk_generator()`)
+
+**Current behavior**: TTS client has staleness dropping (items older than 10s or queue > 2 items are dropped). No awareness of actual client-side audio buffer state.
+
+**Proposed**: Pause sending text to TTS when `buffered_audio_seconds > threshold`. Resume when buffer drops below threshold.
+
+**How KoljaB does it**:
+- `buffer_threshold_seconds` parameter in `play()`
+- `_synthesis_chunk_generator()` checks `player.get_buffered_seconds()` before yielding each text chunk
+- If buffered audio exceeds threshold, pauses text yielding (blocks the generator)
+- `AudioBufferManager` tracks total buffered samples: `total_samples / sample_rate = buffered_seconds`
+- When set to 0.0, disables flow control (chunks sent immediately)
+
+**Integration points in our codebase**:
+- `orchestrator/src/tts/client.py` — add buffer-aware flow control
+- Need client-side feedback: how much audio is buffered/playing on the listener
+- WebSocket listener protocol would need a `buffer_status` message from client → server
+- Alternative: estimate server-side based on audio sent vs. time elapsed
+
+**Estimated benefit**: Reduces wasted TTS compute on segments that will be dropped. More efficient GPU utilization under load.
+
+**Tradeoffs**: Requires client cooperation (buffer reporting) or server-side estimation. Adds complexity to the WebSocket protocol.
+
+---
+
+## Medium Impact — Compute Optimization
+
+### K8. Speaker Embedding Caching with Sentinel Key
+
+**Source**: RealtimeTTS (`faster_qwen_engine.py`)
+
+**Current behavior**: Per-session voice prompt caching via `/sessions/init_voice` endpoint (TTL=1hr). Speaker embedding extraction runs on first TTS request per session.
+
+**Proposed**: Pre-extract speaker embeddings at server startup and inject into model cache under a sentinel key. All synthesis calls hit the cached embedding with zero encoder overhead.
+
+**How KoljaB does it**:
+- `_CACHE_SENTINEL = "__preloaded_spk_emb__"` as a fake ref_audio path
+- `_prime_cache()` at init: loads or extracts speaker embedding, injects directly into `self._model._voice_prompt_cache` under the sentinel key for both `append_silence=True` and `append_silence=False`
+- All synthesis calls use `ref_audio=_CACHE_SENTINEL`, which hits the pre-primed cache entry
+- `FasterQwenVoice` class supports `speaker_pt` path — if `.pt` file exists, loads pre-extracted embedding; otherwise extracts from ref_audio/ref_text and optionally saves to disk
+- Embeddings are ~4KB tensors, trivial to cache
+
+**Integration points in our codebase**:
+- `tts-server/server.py` — pre-extract embeddings for all configured voices at startup
+- `tts-server/nano-qwen3tts-vllm/nano-qwen3tts-vllm/interface.py` — inject pre-computed prompts into cache
+- Could save extracted embeddings as `.pt` files in `tts-server/ref_audio/` alongside WAV files
+- Session init would load from `.pt` instead of re-extracting
+
+**Estimated savings**: ~50-100ms per new session's first TTS request
+
+**Tradeoffs**: Minimal. Small disk footprint. One-time extraction at startup or build time.
+
+---
+
+### K9. Silence Insertion by Delimiter Type
+
+**Source**: RealtimeTTS (`stream.py`)
+
+**Current behavior**: Orchestrator appends fixed inter-segment silence between TTS segments. No variation by punctuation type.
+
+**Proposed**: Insert different silence durations based on the delimiter that ended each sentence/clause.
+
+**How KoljaB does it**:
+- End delimiters (`.!?...`): `sentence_silence_duration` seconds of silence (e.g., 300ms)
+- Mid delimiters (`;:,\n()-""`): `comma_silence_duration` seconds (e.g., 100ms)
+- Other/default: `default_silence_duration` seconds (e.g., 50ms)
+- Silence is PCM zeros injected into the audio stream between synthesized segments
+- Configurable per-play() call
+
+**Integration points in our codebase**:
+- `orchestrator/src/pipeline/orchestrator.py` — `SentenceBoundaryDetector` already tracks which delimiter caused the split. Pass delimiter type to TTS client.
+- `orchestrator/src/tts/client.py` — vary inter-segment silence based on delimiter type
+- Simple lookup table: `{'.': 0.3, ',': 0.1, ';': 0.15, '!': 0.25, '?': 0.25}`
+
+**Estimated benefit**: More natural prosody without extra TTS model compute
+
+**Tradeoffs**: None significant. Trivial to implement.
+
+---
+
+### K10. Background Noise Detection / Anti-Hallucination
+
+**Source**: RealtimeSTT server (`stt_server.py`)
+
+**Current behavior**: No detection of steady background noise. Whisper may hallucinate repeated phrases on ambient noise, generating phantom STT segments → wasted LLM+TTS compute.
+
+**Proposed**: If realtime transcriptions are nearly identical for several seconds, force-stop recording and discard.
+
+**How KoljaB does it**:
+- Server monitors realtime transcription text over time
+- Uses `SequenceMatcher` ratio > 0.99 across 3+ seconds of transcriptions
+- If detected, forces `recorder.stop()` — prevents infinite recording on steady background noise
+- Effectively a "Whisper is hallucinating" detector
+
+**Integration points in our codebase**:
+- `stt-server/whisper_live/backend/base.py` — add similarity tracking in `handle_transcription_output()`
+- Compare consecutive partial transcriptions; if identical for N seconds, discard and reset buffer
+- Could also integrate with the existing `same_output_threshold` mechanism (currently promotes stable text to completed — but for noise, we want to *discard* instead)
+
+**Estimated benefit**: Avoids phantom STT segments that waste LLM and TTS compute. Prevents cascading pipeline waste.
+
+**Tradeoffs**: Risk of discarding legitimate repeated speech (e.g., chanting, liturgical responses). Mitigate with higher similarity threshold or domain-specific exclusions.
+
+---
+
+## Lower Impact — Quality of Life
+
+### K11. Interruption Handling
+
+**Source**: RealtimeVoiceChat (`server.py`, `TranscriptionCallbacks`)
+
+**Current behavior**: No interruption handling. If user speaks while TTS is playing on the client, both streams continue independently.
+
+**Proposed**: When user starts speaking during TTS playback, immediately stop TTS and abort in-flight generation.
+
+**How KoljaB does it**:
+- Binary WebSocket header includes `isTTSPlaying` flag (bit 0 of 4-byte flags field)
+- `on_recording_start` callback fires when VAD detects new speech
+- If `tts_client_playing` is True, triggers interruption cascade:
+  1. `tts_to_client = False` — stops sending TTS chunks
+  2. Sends `stop_tts` message to client — clears AudioWorklet buffer
+  3. `abort_generations()` — propagates stop events to all 4 worker threads (LLM inference, TTS quick, TTS final, request processor)
+  4. Sends `tts_interruption` message to client
+  5. Saves partial assistant answer to conversation history
+
+**Integration points in our codebase**:
+- `orchestrator/src/main.py` — WebSocket protocol: add `isTTSPlaying` flag to binary audio frames from admin client
+- `orchestrator/src/pipeline/orchestrator.py` — add interruption logic: cancel in-flight LLM (cancel httpx stream), flush TTS queue, send stop to listeners
+- `orchestrator/src/tts/client.py` — add abort mechanism for per-session TTS queue
+- Listener WebSocket protocol: add `stop_tts` message type
+- Client (Proverberate frontend): implement `isTTSPlaying` tracking in AudioWorklet, handle `stop_tts`
+
+**Estimated benefit**: Natural conversation flow. Reduces wasted compute on unwanted audio generation.
+
+**Tradeoffs**: Significant implementation effort across frontend + backend. Requires client-side changes. Risk of false interruptions (background noise during playback).
+
+---
+
+### K12. Adaptive Turn Detection Speed
+
+**Source**: RealtimeVoiceChat (`server.py`, `turndetect.py`)
+
+**Current behavior**: Fixed silence thresholds configured at deploy time.
+
+**Proposed**: UI slider that lets users control conversation pace in real-time.
+
+**How KoljaB does it**:
+- Client sends `{ type: "set_speed", speed: 0-100 }` over WebSocket
+- Server interpolates between "fast" and "slow" turn detection settings:
+  - Fast (speed=1.0): 0.33s question pause, 0.5s statement pause
+  - Slow (speed=0.0): 0.8s question pause, 1.2s statement pause
+- Dynamically updates `post_speech_silence_duration` on the recorder
+- Interpolation formula: `fast_value + (1 - speed_factor) * (slow_value - fast_value)`
+
+**Integration points in our codebase**:
+- `orchestrator/src/main.py` — add speed control message to admin WebSocket
+- `stt-server/` — support dynamic `post_speech_silence_duration` updates per client
+- Frontend (Proverberate): add slider UI element
+- Korean grammar flushing already handles most turn detection; this would supplement silence-based thresholds
+
+**Estimated benefit**: Per-user tuning of responsiveness vs. interruption risk
+
+**Tradeoffs**: Low priority. Korean grammar-based flushing already provides good turn detection for Korean speech. Most useful for non-Korean languages where grammar-based detection isn't available.
+
+---
+
+## Implementation Priority
+
+### Phase 1 — Orchestrator-level changes (no model/VRAM changes)
+1. **K4 Early Transcription on Silence** — lowest risk, highest reward ratio
+2. **K2 Quick Answer / First Fragment Split** — modify SentenceBoundaryDetector thresholds
+3. **K9 Silence Insertion by Delimiter Type** — trivial to implement
+4. **K8 Speaker Embedding Caching** — save .pt files, load at startup
+
+### Phase 2 — STT server changes
+5. **K1 Speculative LLM Pre-generation** — needs partial stability tracking + LLM abort
+6. **K10 Background Noise Detection** — add similarity tracking to STT backend
+7. **K6 Realtime Text Stabilization** — common prefix computation
+
+### Phase 3 — Requires client changes
+8. **K11 Interruption Handling** — needs frontend AudioWorklet changes
+9. **K7 Buffer Threshold Flow Control** — needs client buffer reporting
+10. **K12 Adaptive Turn Detection Speed** — needs frontend UI
+
+### Phase 4 — Research / Training required
+11. **K3 ML-Based Turn Detection** — needs Korean sentence completion model
+12. **K5 Dual Whisper Model** — needs second Korean-tuned model + VRAM budget

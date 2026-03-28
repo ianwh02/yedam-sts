@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy xxhash
+          # Install nano-qwen3tts-vllm in editable mode (no-deps to skip GPU packages)
+          pip install --no-deps -e tts-server/nano-qwen3tts-vllm/
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short

@@ -1,0 +1,60 @@
+# Unified build .dockerignore
+.git/
+.github/
+.env
+.env.*
+.vram_cache.json
+*.md
+LICENSE
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Docker (avoid recursive context)
+docker-compose*.yml
+Dockerfile
+Dockerfile.*
+
+# Dev/test artifacts
+scripts/benchmark_*.py
+scripts/profile_*.py
+scripts/test_*.py
+
+# Legacy / unused TTS server files
+tts-server/faster-qwen3-tts/
+tts-server/nano-qwen3tts-vllm-modified/
+tts-server/stage-configs/
+tts-server/models/
+tts-server/ref_audio/*.wav
+!tts-server/ref_audio/en.wav
+
+# nano-qwen3tts-vllm build artifacts
+tts-server/nano-qwen3tts-vllm/.git/
+tts-server/nano-qwen3tts-vllm/.github/
+tts-server/nano-qwen3tts-vllm/examples/
+tts-server/nano-qwen3tts-vllm/*.md
+tts-server/nano-qwen3tts-vllm/uv.lock
+tts-server/nano-qwen3tts-vllm/.python-version
+
+# STT build artifacts
+stt-server/Dockerfile*
+stt-server/.dockerignore
+stt-server/*.md
+
+# Orchestrator build artifacts
+orchestrator/Dockerfile
+orchestrator/.dockerignore
+orchestrator/tests/
+orchestrator/*.md

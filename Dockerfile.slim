@@ -1,0 +1,218 @@
+# syntax=docker/dockerfile:1
+# Slim variant — code + deps only, models read from /models volume mount.
+#
+# Services: STT (faster-whisper) + LLM (vLLM) + TTS (nano-qwen3tts-vllm) + Orchestrator
+# Models:   Expected at /models/ (RunPod Network Volume or docker -v mount)
+#
+# Build:
+#   docker build -f Dockerfile.slim -t ghcr.io/ianwh02/yedam-sts:slim .
+#
+# Run (with models volume):
+#   docker run --gpus all -p 8080:8080 -v /my/models:/models \
+#     -e RUNPOD_API_KEY=... ghcr.io/ianwh02/yedam-sts:slim
+#
+# First boot with empty volume auto-downloads models (~15 GB, needs HF_TOKEN).
+
+# v0.13.0: uses CUDA 12.4-12.6 (compatible with RunPod A5000/3090/4090 drivers).
+# v0.16.0+ uses CUDA 12.8 which requires newer drivers than most RunPod nodes have.
+# Override with --build-arg VLLM_BASE=... for newer/forked versions.
+ARG VLLM_BASE=vllm/vllm-openai:v0.13.0
+FROM ${VLLM_BASE}
+
+LABEL org.opencontainers.image.source="https://github.com/ianwh02/yedam-sts"
+LABEL org.opencontainers.image.description="Yedam STS (slim): models via volume mount"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System dependencies for all services ──
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 sox libopus0 libopus-dev curl git \
+    python3.10 python3.10-venv python3.10-dev libopenmpi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Verify base image provides what we need ──
+RUN python3 -c "\
+import torch; v = torch.__version__; \
+print(f'PyTorch: {v}'); \
+assert int(v.split('.')[0]) >= 2 and int(v.split('.')[1]) >= 6, f'Need PyTorch >= 2.6, got {v}'; \
+print(f'CUDA available: {torch.cuda.is_available()}')"
+
+# ── STT dependencies ──
+COPY stt-server/requirements.txt /tmp/stt-requirements.txt
+RUN sed -i '/^#/d; /^$/d; /^torch/Id' /tmp/stt-requirements.txt && \
+    pip install --no-cache-dir -r /tmp/stt-requirements.txt
+
+# ── TTS dependencies ──
+COPY tts-server/requirements.txt /tmp/tts-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/tts-requirements.txt && \
+    pip install --no-cache-dir --no-deps "qwen-tts==0.0.5" && \
+    pip install --no-cache-dir \
+    "transformers==4.57.3" "accelerate==1.12.0" \
+    librosa soundfile einops "xxhash>=3.6.0" sox protobuf onnxruntime triton
+
+# Flash Attention — install prebuilt wheel matching the base image's Python/PyTorch.
+# Auto-detects versions and downloads the correct wheel. Never builds from source.
+RUN python3 -c "\
+import torch, sys, subprocess; \
+py = f'cp{sys.version_info.major}{sys.version_info.minor}'; \
+tv = '.'.join(torch.__version__.split('.')[:2]); \
+abi = 'TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE'; \
+whl = f'https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch{tv}cxx11abi{abi}-{py}-{py}-linux_x86_64.whl'; \
+print(f'Installing: {whl}'); \
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', whl])"
+
+# ── TensorRT-LLM STT venv (isolated Python 3.10, CUDA 12.4) ──
+# Placed BEFORE editable source COPYs so it stays cached when code changes.
+# TRT-LLM 0.11.0 requires Python 3.10 (no cp312 wheel) and PyTorch 2.3.1.
+# Activated only when STT_BACKEND=tensorrt at runtime.
+RUN python3.10 -m venv /opt/stt-trt-venv && \
+    /opt/stt-trt-venv/bin/pip install --no-cache-dir --upgrade pip
+
+# TRT-LLM core (heavy, ~4 GB — cached as Docker layer)
+RUN /opt/stt-trt-venv/bin/pip install --no-cache-dir \
+        --extra-index-url https://pypi.nvidia.com \
+        tensorrt_llm==0.11.0 && \
+    /opt/stt-trt-venv/bin/pip install --no-cache-dir --force-reinstall \
+        "cuda-python==12.3.0" && \
+    sed -i '1i import pynvml as _pnv; _pnv.__version__ = getattr(_pnv, "__version__", "11.5.0")' \
+        /opt/stt-trt-venv/lib/python3.10/site-packages/tensorrt_llm/profiler.py
+
+# Add stt-server to venv's Python path so it can find whisper_live
+RUN echo "/app/stt-server" > /opt/stt-trt-venv/lib/python3.10/site-packages/stt-server.pth
+
+# TRT STT extras (light — can change without rebuilding TRT-LLM above)
+RUN /opt/stt-trt-venv/bin/pip install --no-cache-dir \
+        "transformers==4.44.0" \
+        websockets>=13.0 fastapi>=0.100.0 uvicorn>=0.23.0 \
+        python-multipart>=0.0.6 \
+        faster-whisper==1.2.0 \
+        openai-whisper tiktoken \
+        soundfile av \
+        huggingface_hub>=0.20.0 requests>=2.31.0 \
+        "numpy<2" cffi lazy_loader \
+        onnxruntime ctranslate2
+
+# TRT-LLM Whisper conversion scripts (sparse clone, ~5 MB)
+RUN git clone -b v0.11.0 --depth 1 --sparse \
+    https://github.com/NVIDIA/TensorRT-LLM.git /tmp/trtllm && \
+    cd /tmp/trtllm && git sparse-checkout set examples/whisper && \
+    mv /tmp/trtllm/examples/whisper /app/trt-whisper-examples && \
+    rm -rf /tmp/trtllm
+
+# Whisper mel filters (needed by both engine build and runtime)
+RUN mkdir -p /app/assets && \
+    curl -sfL -o /app/assets/mel_filters.npz \
+    https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz && \
+    curl -sfL -o /app/assets/jfk.flac \
+    https://raw.githubusercontent.com/openai/whisper/main/tests/jfk.flac
+
+# ── Orchestrator dependencies ──
+COPY orchestrator/pyproject.toml /app/orchestrator/pyproject.toml
+RUN pip install --no-cache-dir \
+    $(python3 -c "\
+import tomllib, pathlib; \
+d = tomllib.loads(pathlib.Path('/app/orchestrator/pyproject.toml').read_text()); \
+deps = d['project']['dependencies'] + d['project'].get('optional-dependencies',{}).get('audio',[]); \
+print(' '.join(deps))")
+
+# ── VRAM budget tooling ──
+RUN pip install --no-cache-dir pyyaml
+
+# nano-qwen3tts-vllm (editable install from local source)
+COPY tts-server/nano-qwen3tts-vllm/ /app/tts-server/nano-qwen3tts-vllm/
+RUN pip install --no-cache-dir --no-deps -e /app/tts-server/nano-qwen3tts-vllm/
+
+# Verify TTS imports
+RUN python3 -c "from nano_qwen3tts_vllm.interface import Qwen3TTSInterface; print('nano-qwen3tts-vllm OK')"
+
+# ── NO model downloads — models come from /models volume ──
+
+# ── Source code (changes frequently → last layers for fast rebuilds) ──
+COPY stt-server/whisper_live/ /app/stt-server/whisper_live/
+COPY stt-server/run_server.py /app/stt-server/
+COPY stt-server/convert_model.sh /app/stt-server/
+COPY stt-server/entrypoint.tensorrt.sh /app/stt-server/
+RUN chmod +x /app/stt-server/convert_model.sh /app/stt-server/entrypoint.tensorrt.sh
+
+COPY tts-server/server.py /app/tts-server/
+COPY tts-server/ref_audio/ /app/tts-server/ref_audio/
+
+COPY orchestrator/config/ /app/orchestrator/config/
+COPY orchestrator/src/ /app/orchestrator/src/
+RUN cd /app/orchestrator && pip install --no-cache-dir --no-deps ".[audio]"
+
+COPY vram_budget.yml /app/
+COPY scripts/vram_budget.py /app/scripts/
+COPY scripts/start_unified.sh /app/scripts/
+COPY scripts/download_models.sh /app/scripts/
+COPY deploy/runpod/idle_monitor.py /app/deploy/runpod/
+RUN chmod +x /app/scripts/start_unified.sh /app/scripts/download_models.sh
+
+# ── Environment defaults — models on volume disk at /models ──
+# Volume disk persists on podStop (unlike container disk which is erased).
+# First boot: download_models.sh populates /models (~15 GB)
+# Subsequent boots: models already there after podResume
+ENV WHISPER_MODEL_DIR=/models/whisper-small-komixv2-ct2
+ENV MODEL_DIR=/models/Qwen3-TTS-12Hz-1.7B-Base
+ENV TOKENIZER_DIR=/models/Qwen3-TTS-Tokenizer-12Hz-48kHz
+ENV LLM_MODEL=/models/Qwen3-8B-AWQ
+
+# Service ports (internal)
+ENV ORCHESTRATOR_PORT=8080
+ENV TTS_PORT=7860
+
+# LLM defaults (Qwen3-8B-AWQ on 24GB GPU)
+ENV LLM_QUANTIZATION=awq_marlin
+ENV LLM_KV_CACHE_DTYPE=fp8
+ENV LLM_MAX_MODEL_LEN=2048
+ENV LLM_MAX_NUM_SEQS=8
+ENV LLM_ATTENTION_BACKEND=FLASH_ATTN
+
+# TTS defaults
+ENV TARGET_SAMPLE_RATE=48000
+ENV SHARE_SPEECH_TOKENIZER=1
+ENV TTS_TALKER_TEMPERATURE=0.7
+ENV TTS_PREDICTOR_TEMPERATURE=0.9
+ENV TTS_HIGHPASS_HZ=80
+ENV TTS_TARGET_RMS=0.08
+ENV TTS_REPETITION_PENALTY=1.1
+ENV TTS_REPETITION_PENALTY_WINDOW=100
+ENV TTS_SUPPRESS_MASK=1
+ENV TTS_EOS_MIN_STEPS=0
+ENV TTS_EOS_BOOST_MAX=3.0
+ENV TTS_EOS_BOOST_START_STEP=35
+ENV TTS_EOS_BOOST_MAX_STEP=300
+ENV TTS_EOS_LOOP_DETECT_WINDOW=12
+ENV TTS_EOS_LOOP_THRESHOLD=0.4
+ENV TTS_EOS_LOOP_BOOST=5.0
+ENV TTS_EOS_LOOP_FORCE_AFTER=15
+
+# STT defaults
+ENV STT_BACKEND=tensorrt
+ENV WHISPER_COMPUTE_TYPE=int8_float16
+ENV OMP_NUM_THREADS=4
+ENV TRT_ENGINE_DIR=/models/trt_engines
+ENV WHISPER_MODEL=seastar105/whisper-small-komixv2
+
+# Orchestrator defaults
+ENV STT_WS_URL=ws://localhost:9090
+ENV LLM_API_URL=http://localhost:8000/v1
+ENV TTS_API_URL=http://localhost:7860
+ENV DEFAULT_SOURCE_LANG=ko
+ENV DEFAULT_TARGET_LANG=en
+ENV DEFAULT_PROCESSOR=translation
+ENV LLM_SYSTEM_PROMPT_PATH=/app/orchestrator/config/llm_prompt_church.txt
+ENV STT_INITIAL_PROMPT_VOCAB_PATH=/app/orchestrator/config/stt_vocab_church.txt
+
+# TF32 for TTS matmul throughput
+ENV TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=10 --start-period=300s \
+    CMD curl -f http://localhost:8080/health 2>/dev/null || exit 1
+
+ENTRYPOINT []
+CMD ["/app/scripts/start_unified.sh"]

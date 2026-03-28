@@ -51,8 +51,10 @@ class SentenceBoundaryDetector:
         """Feed a token and return a complete sentence if boundary detected."""
         self._buffer += token
 
-        # Rule 1: sentence-ending punctuation always splits
-        if _SENTENCE_END.search(self._buffer):
+        # Rule 1: sentence-ending punctuation splits (if buffer has enough words
+        # for TTS to produce quality audio — short fragments like "Yes." get
+        # combined with the next sentence)
+        if _SENTENCE_END.search(self._buffer) and self._word_count() >= settings.tts_min_words_sentence_split:
             return self._emit()
 
         # Rule 2: comma boundary when buffer is long enough
@@ -184,6 +186,7 @@ class SessionOrchestrator:
         # Stream processor tokens
         detector = SentenceBoundaryDetector()
         full_translation: list[str] = []
+        use_continuous = settings.tts_continuous_enabled and self._tts_client.has_continuous_stream(session.session_id)
 
         try:
             async for token in self._processor.process(korean_text, context):
@@ -196,17 +199,20 @@ class SessionOrchestrator:
                 if self._callbacks.on_processor_partial:
                     await self._callbacks.on_processor_partial(token, segment.index)
 
-                # Check for sentence boundary → enqueue TTS
+                # Check for sentence boundary → send to TTS
                 result = detector.feed(token)
                 if result:
                     sentence, sentence_idx = result
-                    await self._tts_client.enqueue(
-                        text=sentence,
-                        session_id=session.session_id,
-                        segment_index=segment.index,
-                        sentence_index=sentence_idx,
-                        language=session.target_lang,
-                    )
+                    if use_continuous:
+                        await self._tts_client.send_text_chunk(session.session_id, sentence, language=session.target_lang)
+                    else:
+                        await self._tts_client.enqueue(
+                            text=sentence,
+                            session_id=session.session_id,
+                            segment_index=segment.index,
+                            sentence_index=sentence_idx,
+                            language=session.target_lang,
+                        )
         except Exception:
             logger.exception(
                 "Processing failed for segment %d in session %s",
@@ -219,13 +225,16 @@ class SessionOrchestrator:
         result = detector.flush()
         if result:
             sentence, sentence_idx = result
-            await self._tts_client.enqueue(
-                text=sentence,
-                session_id=session.session_id,
-                segment_index=segment.index,
-                sentence_index=sentence_idx,
-                language=session.target_lang,
-            )
+            if use_continuous:
+                await self._tts_client.send_text_chunk(session.session_id, sentence, language=session.target_lang)
+            else:
+                await self._tts_client.enqueue(
+                    text=sentence,
+                    session_id=session.session_id,
+                    segment_index=segment.index,
+                    sentence_index=sentence_idx,
+                    language=session.target_lang,
+                )
 
         # Record translation and notify consumer
         translation = "".join(full_translation)

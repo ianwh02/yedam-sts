@@ -41,9 +41,12 @@ class Settings(BaseSettings):
     tts_streaming_enabled: bool = True  # use streaming TTS endpoint for lower TTFA
     tts_opus_enabled: bool = False  # encode TTS output to Opus before callbacks
     tts_inter_segment_pause_ms: int = 300  # silence between TTS segments for natural pacing
+    tts_segment_gap_ms: int = 400  # minimum silence gap between continuous TTS segments (only added if segments arrive back-to-back)
     tts_voice_clone_init_timeout: float = 90.0  # timeout for per-session voice clone init (first call after boot can take ~40s)
+    tts_continuous_enabled: bool = True  # use continuous TTS streaming (KV cache across segments)
 
     # Sentence splitting for TTS pipelining
+    tts_min_words_sentence_split: int = 4  # min words before splitting on sentence punctuation (short fragments combine with next)
     tts_min_words_comma_split: int = 8  # min words before splitting on comma
     tts_max_words_per_chunk: int = 20  # force split at this word count
 

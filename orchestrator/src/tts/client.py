@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 
 import httpx
 import numpy as np
+
+try:
+    import websockets
+except ImportError:
+    websockets = None
 
 from ..config import settings
 
@@ -53,6 +59,10 @@ class TTSClient:
         self._session_consumers: dict[str, asyncio.Task] = {}
         self._semaphore: asyncio.Semaphore | None = None
         self._session_voice_configs: dict[str, SessionVoiceConfig] = {}
+        # Continuous streaming state
+        self._continuous_ws: dict[str, websockets.WebSocketClientProtocol] = {}
+        self._continuous_readers: dict[str, asyncio.Task] = {}
+        self._continuous_ready: dict[str, asyncio.Event] = {}
 
     async def initialize(self):
         self._client = httpx.AsyncClient(
@@ -98,6 +108,8 @@ class TTSClient:
         self._on_audio.pop(session_id, None)
         self._session_voice_configs.pop(session_id, None)
         asyncio.create_task(self._stop_session_consumer(session_id))
+        if session_id in self._continuous_ws:
+            asyncio.create_task(self.close_continuous_stream(session_id))
 
     async def _stop_session_consumer(self, session_id: str):
         queue = self._session_queues.pop(session_id, None)
@@ -191,6 +203,147 @@ class TTSClient:
             language=language,
         )
         await queue.put(item)
+
+    # ── Continuous TTS streaming (WebSocket) ──────────────────────────
+
+    async def open_continuous_stream(
+        self, session_id: str, language: str, initial_text: str,
+        mode: str | None = None, speaker: str | None = None, instruct: str | None = None,
+    ):
+        """Open a persistent WebSocket to the TTS server for continuous streaming.
+
+        The WebSocket maintains talker KV cache across sentence boundaries.
+        Call send_text_chunk() to feed sentences, audio flows back via callbacks.
+        """
+        if websockets is None:
+            raise ImportError("websockets package required for continuous TTS streaming")
+
+        # Build WebSocket URL from HTTP base URL
+        base = settings.tts_api_url.rstrip("/")
+        ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
+        url = f"{ws_base}/synthesize/continuous/{session_id}"
+
+        ws = await websockets.connect(url)
+        self._continuous_ws[session_id] = ws
+
+        # Send initial text message
+        voice_cfg = self._session_voice_configs.get(session_id)
+        init_msg = {
+            "type": "text",
+            "text": initial_text,
+            "language": language,
+            "mode": mode or (voice_cfg.mode if voice_cfg else None),
+            "speaker": speaker or (voice_cfg.speaker if voice_cfg else None),
+            "instruct": instruct or (voice_cfg.instruct if voice_cfg else None),
+        }
+        await ws.send(json.dumps(init_msg))
+
+        # Wait for "ready" confirmation
+        ready_event = asyncio.Event()
+        self._continuous_ready[session_id] = ready_event
+
+        # Start background reader that dispatches audio to callbacks
+        reader_task = asyncio.create_task(
+            self._continuous_audio_reader(session_id, ws)
+        )
+        self._continuous_readers[session_id] = reader_task
+
+        try:
+            await asyncio.wait_for(ready_event.wait(), timeout=90.0)
+        except asyncio.TimeoutError:
+            logger.error("Continuous TTS ready timeout for session %s", session_id)
+            await self.close_continuous_stream(session_id)
+            raise
+
+        logger.info("Continuous TTS stream opened for session %s", session_id)
+
+    async def send_text_chunk(self, session_id: str, text: str, language: str = "en"):
+        """Send a sentence to the continuous TTS stream.
+
+        Lazily opens the stream on the first call — the first text becomes
+        the initial_text for the continuous generator.
+        """
+        if session_id not in self._continuous_ws:
+            # First text chunk — open the continuous stream
+            try:
+                await self.open_continuous_stream(
+                    session_id=session_id,
+                    language=language,
+                    initial_text=text,
+                )
+                return  # initial_text already sent in open_continuous_stream
+            except Exception:
+                logger.warning(
+                    "Failed to open continuous stream for session %s, falling back to per-sentence",
+                    session_id, exc_info=True,
+                )
+                return
+
+        ws = self._continuous_ws.get(session_id)
+        if ws is None:
+            return
+        await ws.send(json.dumps({"type": "text", "text": text}))
+
+    async def close_continuous_stream(self, session_id: str):
+        """End the continuous TTS stream."""
+        ws = self._continuous_ws.pop(session_id, None)
+        reader = self._continuous_readers.pop(session_id, None)
+        self._continuous_ready.pop(session_id, None)
+        if ws:
+            try:
+                await ws.send(json.dumps({"type": "end"}))
+                await ws.close()
+            except Exception:
+                pass
+        if reader:
+            reader.cancel()
+        logger.info("Continuous TTS stream closed for session %s", session_id)
+
+    def has_continuous_stream(self, session_id: str) -> bool:
+        """Check if continuous streaming is enabled and available for this session."""
+        if not settings.tts_continuous_enabled:
+            return False
+        # Return True even before the stream is open — it will be lazily opened
+        # on the first send_text_chunk call
+        return True
+
+    async def _continuous_audio_reader(self, session_id: str, ws):
+        """Background task: read audio/control messages from TTS WebSocket."""
+        segment_idx = 0
+        try:
+            async for message in ws:
+                if isinstance(message, bytes):
+                    # Binary = PCM audio chunk
+                    callbacks = self._on_audio.get(session_id, [])
+                    item = TTSQueueItem(
+                        text="", session_id=session_id,
+                        segment_index=segment_idx, sentence_index=0,
+                    )
+                    for cb in callbacks:
+                        await cb(message, item)
+                else:
+                    # JSON control message
+                    msg = json.loads(message)
+                    msg_type = msg.get("type")
+                    if msg_type == "ready":
+                        event = self._continuous_ready.get(session_id)
+                        if event:
+                            event.set()
+                    elif msg_type == "segment_boundary":
+                        segment_idx += 1
+                        logger.debug("Continuous TTS segment boundary for session %s", session_id)
+                    elif msg_type == "error":
+                        logger.error(
+                            "Continuous TTS error for session %s: %s",
+                            session_id, msg.get("detail"),
+                        )
+                        break
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("Continuous TTS WebSocket closed for session %s", session_id)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Continuous TTS reader error for session %s", session_id)
 
     def _make_silence(self, duration_ms: int, sample_rate: int = 48000) -> bytes:
         """Generate s16le silence of the given duration."""

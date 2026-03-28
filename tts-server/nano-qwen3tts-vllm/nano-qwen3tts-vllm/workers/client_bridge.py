@@ -113,6 +113,7 @@ class TalkerWorkerClient:
         pending_talker_futures: dict,
         talker_ready: set,
         loop: asyncio.AbstractEventLoop,
+        step_trigger: asyncio.Event | None = None,
     ):
         if zmq is None:
             raise ImportError("pyzmq required")
@@ -123,6 +124,7 @@ class TalkerWorkerClient:
         self._pending = pending_talker_futures
         self._talker_ready = talker_ready
         self._loop = loop
+        self._step_trigger = step_trigger
         self._allocate_future: list = [None]  # mutable container for result bridge thread
 
     def send_allocate_kv_cache(self, budget_bytes: int) -> asyncio.Future:
@@ -135,8 +137,10 @@ class TalkerWorkerClient:
     def send_add_request(self, request_id: str, inputs_embeds, sampling_params) -> None:
         sp_dict = _sampling_params_to_dict(sampling_params)
         payload = serialize_talker_add_request(request_id, inputs_embeds, sp_dict)
-        self._push.send(payload)
+        self._push.send(payload)  # ZMQ FIFO: worker receives add_request before any subsequent run_step
         self._talker_ready.add(request_id)
+        if self._step_trigger is not None:
+            self._step_trigger.set()  # wake the talker loop
 
     def send_clear_request(self, request_id: str) -> None:
         self._push.send(serialize_clear_request(request_id))

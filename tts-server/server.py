@@ -46,10 +46,35 @@ torch.set_float32_matmul_precision("high")
 # Config
 # ---------------------------------------------------------------------------
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+MODEL_DIR = os.environ.get("MODEL_DIR", "/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 TOKENIZER_DIR = os.environ.get("TOKENIZER_DIR", "Qwen/Qwen3-TTS-Tokenizer-12Hz")
 PORT = int(os.environ.get("PORT", "7860"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.15"))
+
+# Available TTS models (baked into image, selected by name)
+# Each model supports a different generation method:
+#   preset → CustomVoice (generate_custom_voice_async, speaker + optional instruct)
+#   design → VoiceDesign (generate_voice_design_async, instruct only)
+#   clone  → Base        (generate_voice_clone_async, ref_audio + ref_text)
+_models_root = os.path.dirname(MODEL_DIR)  # e.g. /models or /app/models
+AVAILABLE_MODELS = {
+    "base": os.path.join(_models_root, "Qwen3-TTS-12Hz-1.7B-Base"),
+    "custom": os.path.join(_models_root, "Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+    "design": os.path.join(_models_root, "Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+}
+
+# Map mode names (from platform) to model names (internal)
+MODE_TO_MODEL = {
+    "preset": "custom",
+    "design": "design",
+    "clone": "base",
+}
+
+# Track which model type is currently loaded
+_active_model_name: str | None = None  # "base", "custom", or "design"
+
+# Track last KV cache budget for reuse after model swap
+_last_kv_budget_mb: int = 0
 
 # Output format
 TARGET_SAMPLE_RATE = int(os.environ.get("TARGET_SAMPLE_RATE", "48000"))
@@ -175,6 +200,10 @@ _session_codec_cache: dict[str, tuple[list, float]] = {}
 SESSION_CODEC_TTL = float(os.environ.get("SESSION_CODEC_TTL", "300"))  # 5 minutes
 _ttl_task: asyncio.Task | None = None
 
+# Per-session voice clone prompts: session_id -> (voice_clone_prompt, last_access_time)
+_session_voice_prompts: dict[str, tuple[object, float]] = {}
+SESSION_VOICE_PROMPT_TTL = float(os.environ.get("SESSION_VOICE_PROMPT_TTL", "3600"))  # 1 hour
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -199,6 +228,25 @@ def _set_session_warmup(session_id: str | None, all_codes: list):
         return
     tail = all_codes[-DECODER_WARMUP_FRAMES:] if len(all_codes) >= DECODER_WARMUP_FRAMES else list(all_codes)
     _session_codec_cache[session_id] = (tail, time.time())
+
+
+def _get_voice_clone_prompt(session_id: str | None, language: str) -> object | None:
+    """Look up voice clone prompt: per-session first, then global by language, then global default."""
+    # 1. Per-session voice prompt (overrides everything)
+    if session_id is not None:
+        entry = _session_voice_prompts.get(session_id)
+        if entry is not None:
+            prompt, _ = entry
+            _session_voice_prompts[session_id] = (prompt, time.time())  # refresh TTL
+            return prompt
+
+    # 2. Global per-language prompt
+    prompt = _voice_clone_prompts.get(language)
+    if prompt is not None:
+        return prompt
+
+    # 3. Global default prompt
+    return _voice_clone_prompts.get(None)
 
 
 def _get_leading_silence_bytes() -> bytes:
@@ -494,6 +542,7 @@ class SynthesizeRequest(BaseModel):
     session_id: str | None = None
     speaker: str | None = None
     instruct: str | None = None
+    mode: str | None = None  # "preset", "design", "clone" — None = auto-detect from loaded model
 
 
 class HealthResponse(BaseModel):
@@ -503,11 +552,70 @@ class HealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Mode-based generation routing
+# ---------------------------------------------------------------------------
+
+
+def _resolve_mode(mode: str | None, session_id: str | None, language: str) -> str:
+    """Resolve the effective TTS mode for a request.
+
+    If mode is explicitly provided, use it. Otherwise fall back to heuristics:
+    - If a per-session or global voice clone prompt exists → "clone"
+    - Otherwise infer from the active model type
+    """
+    if mode is not None:
+        return mode
+
+    # Legacy fallback: check if clone prompts exist (backward compat with pre-mode clients)
+    clone_prompt = _get_voice_clone_prompt(session_id, language)
+    if clone_prompt is not None:
+        return "clone"
+
+    # Infer from loaded model
+    if _active_model_name == "design":
+        return "design"
+    return "preset"  # default: CustomVoice
+
+
+def _create_generator(interface, text: str, language: str, speaker: str,
+                      instruct: str | None, session_id: str | None, mode: str | None):
+    """Create the appropriate async generator based on the resolved mode."""
+    effective_mode = _resolve_mode(mode, session_id, language)
+
+    if effective_mode == "clone":
+        clone_prompt = _get_voice_clone_prompt(session_id, language)
+        if clone_prompt is None:
+            raise ValueError(
+                "Clone mode requested but no voice clone prompt found for "
+                f"session={session_id}. Call POST /sessions/init_voice first."
+            )
+        return interface.generate_voice_clone_async(
+            text=text, language=language, voice_clone_prompt=clone_prompt,
+        )
+
+    if effective_mode == "design":
+        if not instruct:
+            raise ValueError("Design mode requires an 'instruct' field (voice description)")
+        return interface.generate_voice_design_async(
+            text=text, instruct=instruct, language=language,
+        )
+
+    # Default: preset (CustomVoice)
+    return interface.generate_custom_voice_async(
+        text=text, language=language, speaker=speaker, instruct=instruct,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Streaming generation core
 # ---------------------------------------------------------------------------
 
 
-async def _generate_speech_stream(text: str, language: str, speaker: str, session_id: str | None = None, instruct: str | None = None):
+async def _generate_speech_stream(
+    text: str, language: str, speaker: str,
+    session_id: str | None = None, instruct: str | None = None,
+    mode: str | None = None,
+):
     """
     Streaming decode: producer feeds code chunks to a queue; consumer decodes
     (window + context) and yields PCM audio chunks.
@@ -525,22 +633,9 @@ async def _generate_speech_stream(text: str, language: str, speaker: str, sessio
         start_time = time.time()
 
         gen_text = text
-        logger.info("[stream] text=%d chars speaker=%s lang=%s", len(text), speaker, language)
+        logger.info("[stream] text=%d chars speaker=%s lang=%s session=%s mode=%s", len(text), speaker, language, session_id, mode)
 
-        clone_prompt = _voice_clone_prompts.get(language) or _voice_clone_prompts.get(None)
-        if clone_prompt is not None:
-            gen = interface.generate_voice_clone_async(
-                text=gen_text,
-                language=language,
-                voice_clone_prompt=clone_prompt,
-            )
-        else:
-            gen = interface.generate_custom_voice_async(
-                text=gen_text,
-                language=language,
-                speaker=speaker,
-                instruct=instruct,
-            )
+        gen = _create_generator(interface, gen_text, language, speaker, instruct, session_id, mode)
 
         # Producer feeds code chunks; consumer decodes and yields audio
         codes_queue: asyncio.Queue[list | None] = asyncio.Queue()
@@ -690,9 +785,16 @@ async def lifespan(app: FastAPI):
     global _decode_queue, _decode_worker_task
     global _mp_decoder_request_queue, _mp_decoder_result_queue, _mp_decoder_process
 
+    global _active_model_name
     logger.info("Loading model: %s (GPU_MEMORY_UTILIZATION=%.2f)", MODEL_DIR, GPU_MEMORY_UTILIZATION)
     interface = get_interface()
     tokenizer = get_tokenizer()
+    # Determine which model type is loaded
+    for name, path in AVAILABLE_MODELS.items():
+        if path == MODEL_DIR:
+            _active_model_name = name
+            break
+    logger.info("Active model type: %s", _active_model_name)
     # Share the CUDAGraph tokenizer with the interface to avoid loading a duplicate
     # on GPU. The CUDAGraph tokenizer has the same encoder — only the decoder differs.
     logger.info("Injecting shared CUDAGraph tokenizer into interface (saving ~600 MB VRAM)")
@@ -761,7 +863,7 @@ async def lifespan(app: FastAPI):
     _server_status = "weights_ready"
     logger.info("Phase 1 complete: weights loaded, status=weights_ready (waiting for /allocate_kv_cache)")
 
-    # Start TTL eviction for session codec cache
+    # Start TTL eviction for session codec cache + voice prompts
     async def _ttl_eviction_loop():
         while True:
             await asyncio.sleep(60)
@@ -770,7 +872,12 @@ async def lifespan(app: FastAPI):
             for k in stale:
                 _session_codec_cache.pop(k, None)
             if stale:
-                logger.info("[session_cache] evicted %d stale sessions", len(stale))
+                logger.info("[session_cache] evicted %d stale codec caches", len(stale))
+            stale_voice = [k for k, (_, t) in _session_voice_prompts.items() if now - t > SESSION_VOICE_PROMPT_TTL]
+            for k in stale_voice:
+                _session_voice_prompts.pop(k, None)
+            if stale_voice:
+                logger.info("[session_cache] evicted %d stale voice prompts", len(stale_voice))
 
     _ttl_task = asyncio.create_task(_ttl_eviction_loop())
 
@@ -831,13 +938,15 @@ async def allocate_kv_cache(budget_mb: int = 0):
     budget_mb: total MB for TTS KV cache (split between talker and predictor).
     If 0, workers use free-VRAM-based calculation (backward compat).
     """
-    global _server_status, _warmup_codec_frames
+    global _server_status, _warmup_codec_frames, _last_kv_budget_mb
 
     if _server_status == "ready":
         return {"status": "already_ready"}
 
-    if _server_status != "weights_ready":
+    if _server_status not in ("weights_ready", "swapping"):
         raise HTTPException(status_code=409, detail=f"Cannot allocate: status={_server_status}")
+
+    _last_kv_budget_mb = budget_mb
 
     interface = get_interface()
     holder = getattr(interface, "_mp_holder", None)
@@ -890,33 +999,37 @@ async def allocate_kv_cache(budget_mb: int = 0):
     # Run warmup inference now that engine loops are active and scheduler is ready.
     logger.info("[warmup] batch=1 (capturing codec frames)...")
 
+    # Determine warmup mode based on loaded model
+    if _active_model_name == "base":
+        # Base model: use clone if prompts exist, otherwise voice design
+        if _voice_clone_prompts:
+            _warmup_mode = "clone"
+        else:
+            _warmup_mode = "design"
+        _warmup_instruct = "A natural English speaking voice"
+    elif _active_model_name == "design":
+        _warmup_mode = "design"
+        _warmup_instruct = "A natural English speaking voice"
+    else:
+        _warmup_mode = "preset"
+        _warmup_instruct = None
+
+    logger.info("[warmup] Using mode=%s for warmup (model=%s)", _warmup_mode, _active_model_name)
+
     async def _warmup_one(capture_codes: bool = False) -> list | None:
         codes = [] if capture_codes else None
         try:
-            async for chunk in _generate_speech_stream("Hello, warmup.", "English", DEFAULT_SPEAKER):
-                pass
+            warmup_text = "The quick brown fox jumps over the lazy dog near the river bank."
+            gen = _create_generator(
+                interface, warmup_text, "English", DEFAULT_SPEAKER,
+                instruct=_warmup_instruct,
+                session_id=None, mode=_warmup_mode,
+            )
+            async for audio_code in gen:
+                if capture_codes:
+                    codes.append(audio_code)
         except Exception as e:
             logger.warning("[warmup] error (non-fatal): %s", e)
-        if capture_codes:
-            try:
-                # Use voice clone path (same as real requests) for codec capture.
-                # generate_custom_voice_async(speaker=...) requires built-in speakers
-                # which may not be available in all models.
-                clone_prompt = _voice_clone_prompts.get("English") or _voice_clone_prompts.get(None)
-                if clone_prompt is not None:
-                    gen = interface.generate_voice_clone_async(
-                        text="The quick brown fox jumps over the lazy dog near the river bank.",
-                        language="English", voice_clone_prompt=clone_prompt,
-                    )
-                else:
-                    gen = interface.generate_custom_voice_async(
-                        text="The quick brown fox jumps over the lazy dog near the river bank.",
-                        language="English", speaker=DEFAULT_SPEAKER,
-                    )
-                async for audio_code in gen:
-                    codes.append(audio_code)
-            except Exception as e:
-                logger.warning("[warmup] codec capture error (non-fatal): %s", e)
         return codes if capture_codes else None
 
     warmup_codes = await _warmup_one(capture_codes=True)
@@ -938,13 +1051,268 @@ async def allocate_kv_cache(budget_mb: int = 0):
     }
 
 
+class SwapModelRequest(BaseModel):
+    model: str  # "base", "custom", or "design"
+
+
+@app.post("/swap_model")
+async def swap_model(req: SwapModelRequest):
+    """Hot-swap the TTS model without container restart.
+
+    Tears down current model workers, loads the new model, re-allocates KV cache,
+    and runs warmup. Takes ~20-30s. Rejects requests during the swap.
+
+    model: "base" (voice cloning), "custom" (preset speakers), or "design" (voice design)
+    """
+    global _interface, _server_status, _warmup_codec_frames, MODEL_DIR, _voice_clone_prompts, _active_model_name
+
+    new_path = AVAILABLE_MODELS.get(req.model)
+    if new_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{req.model}'. Available: {list(AVAILABLE_MODELS.keys())}",
+        )
+
+    if not os.path.isdir(new_path):
+        raise HTTPException(status_code=404, detail=f"Model not found at {new_path}")
+
+    if new_path == MODEL_DIR and _server_status == "ready":
+        return {"status": "already_loaded", "model": req.model, "model_dir": MODEL_DIR}
+
+    if _server_status == "swapping":
+        raise HTTPException(status_code=409, detail="A swap is already in progress")
+
+    prev_status = _server_status
+    _server_status = "swapping"
+    swap_start = time.time()
+    logger.info("[swap] Starting model swap: %s → %s", MODEL_DIR, new_path)
+
+    try:
+        # 1. Stop ZMQ tasks
+        if _interface is not None:
+            await _interface.stop_zmq_tasks()
+
+        # 2. Shutdown old interface (kills workers, frees VRAM)
+        if _interface is not None:
+            _interface.shutdown()
+            _interface = None
+
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("[swap] Old model released, VRAM freed")
+
+        # 3. Load new model
+        MODEL_DIR = new_path
+        _active_model_name = req.model
+        interface = get_interface()
+        tokenizer = get_tokenizer()
+        interface.speech_tokenizer = tokenizer
+        await interface.start_zmq_tasks()
+        logger.info("[swap] New model loaded: %s", MODEL_DIR)
+
+        # 4. Re-precompute voice clone prompts
+        _voice_clone_prompts.clear()
+        _has_speaker_encoder = False
+        try:
+            interface._load_speaker_encoder()
+            _has_speaker_encoder = True
+        except Exception:
+            pass
+
+        if _has_speaker_encoder:
+            import soundfile as sf
+            for lang, (path, ref_text) in _REF_AUDIO_LANG_CONFIG.items():
+                logger.info("[swap] Loading ref audio for %s: %s", lang, path)
+                ref_audio, ref_sr = sf.read(path)
+                if ref_audio.ndim > 1:
+                    ref_audio = np.mean(ref_audio, axis=-1)
+                _voice_clone_prompts[lang] = interface.create_voice_clone_prompt(
+                    ref_audio=(ref_audio, ref_sr),
+                    ref_text=ref_text,
+                    x_vector_only_mode=X_VECTOR_ONLY,
+                )
+            if REF_AUDIO_PATH is not None:
+                ref_audio, ref_sr = sf.read(REF_AUDIO_PATH)
+                if ref_audio.ndim > 1:
+                    ref_audio = np.mean(ref_audio, axis=-1)
+                _voice_clone_prompts[None] = interface.create_voice_clone_prompt(
+                    ref_audio=(ref_audio, ref_sr),
+                    ref_text=REF_TEXT,
+                    x_vector_only_mode=X_VECTOR_ONLY,
+                )
+
+        # 5. Re-allocate KV cache (reuse last budget)
+        _server_status = "weights_ready"
+        if _last_kv_budget_mb > 0:
+            logger.info("[swap] Re-allocating KV cache with budget=%d MB", _last_kv_budget_mb)
+            result = await allocate_kv_cache(budget_mb=_last_kv_budget_mb)
+            logger.info("[swap] KV cache allocated: %s", result)
+        else:
+            logger.warning("[swap] No saved KV budget — calling allocate with auto")
+            result = await allocate_kv_cache(budget_mb=0)
+
+        elapsed = time.time() - swap_start
+        logger.info("[swap] Complete in %.1fs: %s", elapsed, MODEL_DIR)
+
+        return {
+            "status": "ready",
+            "model": req.model,
+            "model_dir": MODEL_DIR,
+            "swap_time_s": round(elapsed, 1),
+        }
+
+    except Exception as e:
+        logger.error("[swap] FAILED: %s", e, exc_info=True)
+        _server_status = "error"
+        raise HTTPException(status_code=500, detail=f"Model swap failed: {e}")
+
+
+@app.get("/models")
+async def list_models():
+    """List available TTS models and which is currently loaded."""
+    current_name = None
+    for name, path in AVAILABLE_MODELS.items():
+        if path == MODEL_DIR:
+            current_name = name
+            break
+    return {
+        "available": list(AVAILABLE_MODELS.keys()),
+        "current": current_name,
+        "current_dir": MODEL_DIR,
+        "status": _server_status,
+    }
+
+
 @app.delete("/sessions/{session_id}")
 async def delete_session_context(session_id: str):
-    """Remove cached decoder context for a session."""
-    removed = _session_codec_cache.pop(session_id, None) is not None
-    if removed:
-        logger.info("[session_cache] cleared context for session %s", session_id)
-    return {"session_id": session_id, "removed": removed}
+    """Remove all cached state for a session (decoder context + voice prompt)."""
+    codec_removed = _session_codec_cache.pop(session_id, None) is not None
+    voice_removed = _session_voice_prompts.pop(session_id, None) is not None
+    if codec_removed or voice_removed:
+        logger.info(
+            "[session_cache] cleared session %s (codec=%s, voice=%s)",
+            session_id, codec_removed, voice_removed,
+        )
+    return {"session_id": session_id, "codec_removed": codec_removed, "voice_removed": voice_removed}
+
+
+def _download_ref_audio(url: str) -> tuple[np.ndarray, int]:
+    """Download reference audio from a signed URL. Returns (waveform, sample_rate).
+
+    Supports any format ffmpeg can decode (WAV, WebM, MP3, OGG, M4A, etc.)
+    via soundfile with pydub/ffmpeg fallback.
+    """
+    import requests
+    import soundfile as sf
+
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+
+    buf = io.BytesIO(resp.content)
+    try:
+        audio, sr = sf.read(buf)
+    except Exception:
+        # Fallback: use pydub (ffmpeg) for formats soundfile can't handle (WebM, M4A, etc.)
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
+            tmp_in.write(resp.content)
+            tmp_in_path = tmp_in.name
+
+        tmp_out_path = tmp_in_path + ".wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp_in_path, "-ar", "16000", "-ac", "1", tmp_out_path],
+                capture_output=True, check=True, timeout=30,
+            )
+            audio, sr = sf.read(tmp_out_path)
+        finally:
+            os.unlink(tmp_in_path)
+            if os.path.exists(tmp_out_path):
+                os.unlink(tmp_out_path)
+
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=-1)
+
+    return audio.astype(np.float32), sr
+
+
+class InitVoiceRequest(BaseModel):
+    session_id: str
+    ref_audio_url: str
+    ref_text: str | None = None
+    x_vector_only: bool = False
+
+
+@app.post("/sessions/init_voice")
+async def init_session_voice(req: InitVoiceRequest):
+    """Download reference audio and create a per-session voice clone prompt.
+
+    Requires the base model (with speaker_encoder) to be loaded.
+    """
+    if _server_status != "ready":
+        raise HTTPException(status_code=503, detail=f"Server not ready: {_server_status}")
+
+    interface = get_interface()
+
+    # Check if model supports voice cloning
+    has_encoder = getattr(interface, '_speaker_encoder_loaded', False)
+    if not has_encoder:
+        try:
+            interface._load_speaker_encoder()
+            has_encoder = True
+        except Exception:
+            has_encoder = False
+
+    if not has_encoder:
+        raise HTTPException(
+            status_code=400,
+            detail="Current model does not support voice cloning (no speaker_encoder). "
+                   "Call ensure_model('base') or POST /swap_model first.",
+        )
+
+    # Download reference audio from signed URL
+    loop = asyncio.get_event_loop()
+    try:
+        ref_audio, ref_sr = await loop.run_in_executor(
+            None, _download_ref_audio, req.ref_audio_url,
+        )
+    except Exception as e:
+        logger.error("[voice_clone] Failed to download ref audio for session %s: %s", req.session_id, e)
+        raise HTTPException(status_code=400, detail=f"Failed to download ref audio: {e}")
+
+    logger.info(
+        "[voice_clone] Session %s: downloaded ref audio (%.1fs, %dHz)",
+        req.session_id, len(ref_audio) / ref_sr, ref_sr,
+    )
+
+    # Create voice clone prompt (CPU/GPU-bound, run in executor)
+    x_vector_only = req.x_vector_only or (req.ref_text is None)
+    try:
+        prompt = await loop.run_in_executor(
+            None,
+            lambda: interface.create_voice_clone_prompt(
+                ref_audio=(ref_audio, ref_sr),
+                ref_text=req.ref_text,
+                x_vector_only_mode=x_vector_only,
+            ),
+        )
+    except Exception as e:
+        logger.error("[voice_clone] Failed to create prompt for session %s: %s", req.session_id, e)
+        raise HTTPException(status_code=500, detail=f"Failed to create voice clone prompt: {e}")
+
+    # Cache for this session
+    _session_voice_prompts[req.session_id] = (prompt, time.time())
+
+    mode = "x_vector_only" if x_vector_only else "ICL"
+    logger.info(
+        "[voice_clone] Session %s: prompt created (mode=%s, ref_text=%s)",
+        req.session_id, mode, repr(req.ref_text)[:60] if req.ref_text else "None",
+    )
+
+    return {"status": "ok", "session_id": req.session_id, "mode": mode}
 
 
 @app.post("/synthesize/stream")
@@ -965,7 +1333,7 @@ async def synthesize_stream(req: SynthesizeRequest):
     speaker = req.speaker or SPEAKER_MAP.get(lang_key, DEFAULT_SPEAKER)
 
     return StreamingResponse(
-        _generate_speech_stream(text, language, speaker, session_id=req.session_id, instruct=req.instruct),
+        _generate_speech_stream(text, language, speaker, session_id=req.session_id, instruct=req.instruct, mode=req.mode),
         media_type="application/octet-stream",
         headers={
             "x-sample-rate": str(TARGET_SAMPLE_RATE),
@@ -995,19 +1363,10 @@ async def synthesize(req: SynthesizeRequest, request: Request):
     # Collect all audio codes from the model (no windowed decode)
     interface = get_interface()
     gen_text = text
-    logger.info("[synthesize] text=%d chars speaker=%s lang=%s", len(text), speaker, language)
+    logger.info("[synthesize] text=%d chars speaker=%s lang=%s session=%s mode=%s", len(text), speaker, language, req.session_id, req.mode)
 
     audio_codes = []
-    clone_prompt = _voice_clone_prompts.get(language) or _voice_clone_prompts.get(None)
-    if clone_prompt is not None:
-        gen = interface.generate_voice_clone_async(
-            text=gen_text, language=language, voice_clone_prompt=clone_prompt,
-        )
-    else:
-        gen = interface.generate_custom_voice_async(
-            text=gen_text, language=language, speaker=speaker,
-            instruct=req.instruct,
-        )
+    gen = _create_generator(interface, gen_text, language, speaker, req.instruct, req.session_id, req.mode)
     async for audio_code in gen:
         audio_codes.append(audio_code)
 

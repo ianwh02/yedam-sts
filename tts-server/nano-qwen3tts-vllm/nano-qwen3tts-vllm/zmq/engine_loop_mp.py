@@ -31,11 +31,15 @@ async def run_talker_loop_mp(
     queues_lock: asyncio.Lock,
     talker_ready: set,
     kv_ready: asyncio.Event | None = None,
+    step_trigger: asyncio.Event | None = None,
 ) -> None:
     """
-    Replacement for run_talker_loop when using multiprocess talker.
-    Waits until talker_ready matches active requests (or timeout), sends run_step, awaits result,
-    dispatches (engine_type, msg_type, payload) to request_queues[request_id].
+    Event-driven talker step loop for multiprocess talker.
+
+    Instead of polling talker_ready, waits on step_trigger (set by send_add_request
+    and after each non-empty step result). ZMQ FIFO guarantees the worker has
+    processed add_request before the run_step that follows, eliminating the race
+    condition where run_step arrives before the request is in the scheduler.
     """
     # Wait for KV cache allocation before sending any steps to the worker.
     if kv_ready is not None:
@@ -44,24 +48,33 @@ async def run_talker_loop_mp(
         logger.info("[talker_loop_mp] KV ready, starting step loop")
 
     step_count = 0
-    last_batch_size = 0  # Track previous batch size for adaptive collection
+    last_batch_size = 0
+    consecutive_empty = 0  # track empty results to detect stale state
     while True:
-        await asyncio.sleep(0.0005)
+        # Wait for work — set by send_add_request() or after a non-empty step
+        if step_trigger is not None and not talker_ready:
+            step_trigger.clear()
+            try:
+                await asyncio.wait_for(step_trigger.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+        else:
+            await asyncio.sleep(0.0005)
+
         async with queues_lock:
             active = set(request_queues.keys())
         if not talker_ready:
             continue
+
         # Orphan detection: discard talker_ready entries whose request_queues are gone
-        # (safety net for race between clear_request and the ready set)
         orphans = talker_ready - active
         if orphans:
             logger.warning(f"[talker_loop_mp] discarding {len(orphans)} orphan(s) from talker_ready: {list(orphans)[:3]!r}")
             talker_ready -= orphans
         if not talker_ready:
             continue
+
         # Adaptive collection: use longer window for decode steps (previous batch > 1)
-        # to allow all concurrent requests to complete their predictor feedback cycle
-        # (~33ms) before running the next talker step.
         if len(talker_ready) < len(active):
             collect_ms = DECODE_COLLECT_MS if last_batch_size > 1 else PREFILL_COLLECT_MS
             t_start = time.perf_counter()
@@ -73,13 +86,8 @@ async def run_talker_loop_mp(
                     break
         if not talker_ready:
             continue
-        # Run step with whoever is ready; do not wait for all active, so chunk-2
-        # / time-to-first-audio stays low when many requests are concurrent.
+
         try:
-            logger.debug(
-                f"[talker_loop_mp] run_step active={len(active)} talker_ready={len(talker_ready)} "
-                f"request_ids={list(talker_ready)[:3]!r}"
-            )
             future = talker_client.run_step_async()
             _, outputs_all = await future
         except asyncio.CancelledError:
@@ -89,9 +97,27 @@ async def run_talker_loop_mp(
             continue
 
         if not outputs_all:
+            # Worker has nothing — some talker_ready entries may be stale (not yet
+            # in the worker's scheduler). Only discard entries that have no active
+            # generate_async consumer (not in request_queues). Entries that ARE in
+            # request_queues are legitimate — the worker just hasn't ingested them yet.
+            async with queues_lock:
+                active = set(request_queues.keys())
+            stale = talker_ready - active
+            if stale:
+                logger.warning(
+                    f"[talker_loop_mp] empty batch, removing {len(stale)} stale entries "
+                    f"from talker_ready: {list(stale)[:3]!r}"
+                )
+                talker_ready -= stale
+            # Yield to event loop so pending add_request messages reach the worker
+            await asyncio.sleep(0.01)
             continue
-
         step_count += 1
+        # Signal the loop to step again immediately (more work likely)
+        if step_trigger is not None:
+            step_trigger.set()
+
         completed_this_step = set()
         for item in outputs_all:
             request_id, seq_id, token_ids, hidden_states, is_finished = item

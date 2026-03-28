@@ -1159,9 +1159,12 @@ class Qwen3TTSInterface:
         )
         self._mp_holder = holder
         self._kv_ready_event = asyncio.Event()
+        self._talker_step_trigger = asyncio.Event()
+        holder.talker_client._step_trigger = self._talker_step_trigger
         t1 = asyncio.create_task(run_talker_loop_mp(
             holder.talker_client, self._request_queues, self._queues_lock, holder.talker_ready,
             kv_ready=self._kv_ready_event,
+            step_trigger=self._talker_step_trigger,
         ))
         t2 = asyncio.create_task(run_predictor_loop_mp(
             holder.predictor_client, self._request_queues, self._queues_lock, holder.predictor_ready,

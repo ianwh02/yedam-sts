@@ -35,8 +35,9 @@ class TalkerModeModelRunner(ModelRunner):
 
     # Minimum decode steps before EOS is allowed.
     # Suppresses EOS with -inf for the first N steps to prevent premature termination.
-    # At 12Hz codec rate, 12 steps ≈ 1.0s — no valid sentence-level TTS output is shorter.
-    _eos_min_steps: int = int(os.environ.get("TTS_EOS_MIN_STEPS", "12"))
+    # Disabled by default: Qwen3-TTS does not prematurely EOS, and suppressing it
+    # causes short sentences (e.g. "Hello.") to overshoot and generate garbage.
+    _eos_min_steps: int = int(os.environ.get("TTS_EOS_MIN_STEPS", "0"))
 
     # Progressive EOS logit boost: linearly ramp an additive boost on EOS logits
     # from 0 to _eos_boost_max between _eos_boost_start_step and max_generation_steps.

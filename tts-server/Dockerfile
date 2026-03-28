@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Qwen3-TTS Python server for yedam-sts pipeline
 # Uses nano-qwen3tts-vllm (vLLM-style continuous batching + CUDA graphs)
-# Model: Qwen3-TTS-12Hz-0.6B-CustomVoice (~2GB VRAM)
+# Models: Qwen3-TTS-12Hz-1.7B-Base (~3.5GB) + 1.7B-CustomVoice (~3.5GB)
 #
 # Build: docker compose build tts
 # Run:   docker compose up tts
@@ -44,12 +44,17 @@ RUN python3 -c "import torch; v=torch.__version__; print(f'torch={v}'); assert v
 ARG HF_TOKEN=
 ENV HF_TOKEN=${HF_TOKEN}
 
-# CustomVoice model (preset speakers: ryan, sohee, etc.)
 # Base model (voice clone mode with reference audio)
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-Base', \
-local_dir='/app/models/Qwen3-TTS-12Hz-0.6B-Base')"
+snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base', \
+local_dir='/app/models/Qwen3-TTS-12Hz-1.7B-Base')"
+
+# CustomVoice model (preset speakers + instruction control)
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', \
+local_dir='/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice')"
 
 # 48kHz decoder: drop-in replacement, same codec, higher-fidelity waveform reconstruction
 RUN python3 -c "\
@@ -71,7 +76,7 @@ COPY server.py .
 
 EXPOSE 7860
 
-ENV MODEL_DIR=/app/models/Qwen3-TTS-12Hz-0.6B-CustomVoice
+ENV MODEL_DIR=/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ENV TOKENIZER_DIR=/app/models/Qwen3-TTS-Tokenizer-12Hz-48kHz
 ENV PORT=7860
 

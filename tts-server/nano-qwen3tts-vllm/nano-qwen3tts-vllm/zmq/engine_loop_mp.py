@@ -120,36 +120,60 @@ async def run_talker_loop_mp(
 
         completed_this_step = set()
         for item in outputs_all:
-            request_id, seq_id, token_ids, hidden_states, is_finished = item
+            # 6-tuple: (request_id, seq_id, token_ids, hidden_states, is_finished, is_paused)
+            # Backward compat: 5-tuple still works (is_paused defaults to False)
+            request_id = item[0]
+            seq_id = item[1]
+            token_ids = item[2]
+            hidden_states = item[3]
+            is_finished = item[4] if len(item) > 4 else False
+            is_paused = item[5] if len(item) > 5 else False
+
             completed_this_step.add(request_id)
             payload = {"token_ids": token_ids, "hidden_states": hidden_states}
             async with queues_lock:
                 q = request_queues.get(request_id)
             if q is not None:
                 last_id = token_ids[-1] if token_ids else -1
-                try:
-                    q.put_nowait(("talker", "token", payload))
-                    if step_count <= 1:
-                        logger.debug(f"[talker_loop_mp] dispatched token to request_id={request_id[:8]} token_ids={token_ids[:5]!r}")
-                except asyncio.QueueFull:
-                    if last_id == 2150:
-                        await q.put(("talker", "token", payload))
-                        logger.warning(f"[talker_loop_mp] queue full but forced EOS delivery for {request_id[:8]}")
-                    else:
-                        logger.error(
-                            f"[talker_loop_mp] DROPPED talker token for {request_id[:8]}! "
-                            f"Queue full (size={q.qsize()}, last_id={last_id}). "
-                            f"This may cause a hang in generate_async."
-                        )
-            if is_finished:
-                async with queues_lock:
-                    q = request_queues.get(request_id)
-                if q is not None:
+                # Skip emitting EOS token when paused — the "paused" message below
+                # is the signal. Emitting the EOS token would cause generate_continuous_async
+                # to see it first and exit before receiving the "paused" message.
+                if not (is_paused and last_id in (2150, 2157)):
                     try:
-                        q.put_nowait(("talker", "done", {}))
+                        q.put_nowait(("talker", "token", payload))
+                        if step_count <= 1:
+                            logger.debug(f"[talker_loop_mp] dispatched token to request_id={request_id[:8]} token_ids={token_ids[:5]!r}")
                     except asyncio.QueueFull:
-                        await q.put(("talker", "done", {}))
-                        logger.warning(f"[talker_loop_mp] queue full but forced done delivery for {request_id[:8]}")
+                        if last_id == 2150:
+                            await q.put(("talker", "token", payload))
+                            logger.warning(f"[talker_loop_mp] queue full but forced EOS delivery for {request_id[:8]}")
+                        else:
+                            logger.error(
+                                f"[talker_loop_mp] DROPPED talker token for {request_id[:8]}! "
+                                f"Queue full (size={q.qsize()}, last_id={last_id}). "
+                                f"This may cause a hang in generate_async."
+                            )
+            if is_finished:
+                if is_paused:
+                    # Soft EOS (keep_alive): send "paused" instead of "done"
+                    # The generator will wait for new text before resuming
+                    async with queues_lock:
+                        q = request_queues.get(request_id)
+                    if q is not None:
+                        try:
+                            q.put_nowait(("talker", "paused", {}))
+                        except asyncio.QueueFull:
+                            await q.put(("talker", "paused", {}))
+                else:
+                    # Hard EOS: request fully finished
+                    async with queues_lock:
+                        q = request_queues.get(request_id)
+                    if q is not None:
+                        try:
+                            q.put_nowait(("talker", "done", {}))
+                        except asyncio.QueueFull:
+                            await q.put(("talker", "done", {}))
+                            logger.warning(f"[talker_loop_mp] queue full but forced done delivery for {request_id[:8]}")
 
         # Clear only the request_ids that were in this step (they've been served)
         talker_ready -= completed_this_step

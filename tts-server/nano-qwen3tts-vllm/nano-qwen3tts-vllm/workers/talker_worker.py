@@ -21,6 +21,7 @@ from nano_qwen3tts_vllm.workers.protocol import (
     CMD_ADD_REQUEST,
     CMD_RUN_STEP,
     CMD_CLEAR_REQUEST,
+    CMD_PAUSE_REQUEST,
     CMD_SHUTDOWN,
     CMD_ALLOCATE_KV_CACHE,
 )
@@ -143,11 +144,16 @@ def run_talker_worker(
                 request_id = cmd["request_id"]
                 inputs_embeds_np = cmd["inputs_embeds"]
                 sp_dict = cmd.get("sampling_params", {})
+                keep_alive = cmd.get("keep_alive", False)
                 inputs_embeds = [
                     torch.from_numpy(arr).to(device) for arr in inputs_embeds_np
                 ]
                 sp = _sampling_params_from_dict(sp_dict)
-                talker_llm.add_request(inputs_embeds, sp, request_id=request_id)
+                talker_llm.add_request(inputs_embeds, sp, request_id=request_id, keep_alive=keep_alive)
+                continue
+
+            if cmd.get("cmd") == CMD_PAUSE_REQUEST:
+                talker_llm.scheduler.pause_request(cmd["request_id"])
                 continue
 
             if cmd.get("cmd") == CMD_CLEAR_REQUEST:

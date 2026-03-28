@@ -22,6 +22,7 @@ from nano_qwen3tts_vllm.workers.protocol import (
     serialize_talker_add_request,
     serialize_talker_run_step,
     serialize_clear_request,
+    serialize_pause_request,
     serialize_shutdown,
     serialize_allocate_kv_cache,
     deserialize_talker_result,
@@ -134,13 +135,18 @@ class TalkerWorkerClient:
         self._push.send(serialize_allocate_kv_cache(budget_bytes))
         return future
 
-    def send_add_request(self, request_id: str, inputs_embeds, sampling_params) -> None:
+    def send_add_request(self, request_id: str, inputs_embeds, sampling_params, keep_alive: bool = False) -> None:
         sp_dict = _sampling_params_to_dict(sampling_params)
-        payload = serialize_talker_add_request(request_id, inputs_embeds, sp_dict)
+        payload = serialize_talker_add_request(request_id, inputs_embeds, sp_dict, keep_alive=keep_alive)
         self._push.send(payload)  # ZMQ FIFO: worker receives add_request before any subsequent run_step
         self._talker_ready.add(request_id)
         if self._step_trigger is not None:
             self._step_trigger.set()  # wake the talker loop
+
+    def send_pause_request(self, request_id: str) -> None:
+        """Pause request: keeps KV cache alive, removes from scheduling."""
+        self._push.send(serialize_pause_request(request_id))
+        self._talker_ready.discard(request_id)
 
     def send_clear_request(self, request_id: str) -> None:
         self._push.send(serialize_clear_request(request_id))

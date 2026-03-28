@@ -13,6 +13,8 @@ from nano_qwen3tts_vllm.config import Config
 logger = logging.getLogger(__name__)
 
 class TalkerScheduler(Scheduler):
+    CODEC_EOS_TOKEN_ID = 2150
+
     def __init__(self, config: Config):
         super().__init__(config)
         self.request_id_to_seq: dict[str, Sequence] = {}
@@ -62,6 +64,25 @@ class TalkerScheduler(Scheduler):
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+    def pause_request(self, request_id: str):
+        """Pause sequence: remove from running but keep KV cache blocks allocated."""
+        seq = self.request_id_to_seq.get(request_id)
+        if seq and seq.status == SequenceStatus.RUNNING:
+            seq.status = SequenceStatus.PAUSED
+            seq.decode_input_embeds = None
+            if seq in self.running:
+                self.running.remove(seq)
+            logger.info(f"[scheduler] paused request {request_id} (blocks={len(seq.block_table)}, tokens={len(seq)})")
+
+    def resume_request(self, request_id: str, decode_input_embeds):
+        """Resume a paused sequence with new input embeddings."""
+        seq = self.request_id_to_seq.get(request_id)
+        if seq and seq.status == SequenceStatus.PAUSED:
+            seq.status = SequenceStatus.RUNNING
+            seq.decode_input_embeds = decode_input_embeds
+            self.running.append(seq)
+            logger.info(f"[scheduler] resumed request {request_id} (tokens={len(seq)})")
+
     def clear_request(self, request_id: str):
         if request_id in self.request_id_to_seq:
             seq = self.request_id_to_seq.pop(request_id)
@@ -75,6 +96,17 @@ class TalkerScheduler(Scheduler):
             seq.append_token(token_id, hidden_states[idx])
             seq.decode_input_embeds = None
             idx += 1
+
+            # For keep_alive sequences (continuous TTS): check EOS to pause
+            # Require at least 4 decode steps before allowing EOS (prevents premature stop)
+            if seq.keep_alive and seq.request_id is not None:
+                seq.generation_steps += 1
+                if not seq.ignore_eos and token_id == self.CODEC_EOS_TOKEN_ID and seq.generation_steps > 4:
+                    logger.info(f"[postprocess] keep_alive EOS detected: request={seq.request_id[:8]} token={token_id} gen_step={seq.generation_steps}")
+                    self.pause_request(seq.request_id)
+                continue  # skip normal finish logic — interface manages the step loop
+
+            # For regular sequences: use original finish logic (eos=-1, so only max_tokens triggers)
             if seq.request_id is not None:
                 finish = not seq.ignore_eos and token_id == self.eos
             else:
@@ -99,15 +131,20 @@ class TalkerLLMEngine(LLMEngine):
         inputs_embeds: list[torch.Tensor],
         sampling_params: SamplingParams | list[SamplingParams],
         request_id: str | None = None,
+        keep_alive: bool = False,
     ):
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(inputs_embeds)
         for inp_embeds, sp in zip(inputs_embeds, sampling_params):
             if request_id is not None and request_id in self.scheduler.request_id_to_seq:
                 seq = self.scheduler.request_id_to_seq[request_id]
-                seq.decode_input_embeds = inp_embeds
+                # Resume if paused (continuation after soft EOS)
+                if seq.status == SequenceStatus.PAUSED:
+                    self.scheduler.resume_request(request_id, inp_embeds)
+                else:
+                    seq.decode_input_embeds = inp_embeds
                 return
-            seq = Sequence([], input_embeds=inp_embeds, sampling_params=sp, request_id=request_id)
+            seq = Sequence([], input_embeds=inp_embeds, sampling_params=sp, request_id=request_id, keep_alive=keep_alive)
             if request_id is not None:
                 self.scheduler.request_id_to_seq[request_id] = seq
             self.scheduler.add(seq)
@@ -129,11 +166,12 @@ class TalkerLLMEngine(LLMEngine):
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
             return [], 0, []
-        
+
         token_ids, hidden_states = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, hidden_states)
         outputs = [(seq.request_id, seq.seq_id, seq.completion_token_ids, seq.last_hidden_state) for seq in seqs if seq.is_finished]
-        outputs_all = [(seq.request_id, seq.seq_id, seq.completion_token_ids, seq.last_hidden_state, seq.is_finished) for seq in seqs]
+        # is_finished includes both FINISHED and PAUSED (both mean "this step produced a terminal token")
+        outputs_all = [(seq.request_id, seq.seq_id, seq.completion_token_ids, seq.last_hidden_state, seq.is_finished or seq.is_paused, seq.is_paused) for seq in seqs]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens, outputs_all
             

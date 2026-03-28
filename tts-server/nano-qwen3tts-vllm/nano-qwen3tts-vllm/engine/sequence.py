@@ -9,6 +9,7 @@ from nano_qwen3tts_vllm.sampling_params import SamplingParams
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
+    PAUSED = auto()     # KV cache preserved, waiting for continuation text
     FINISHED = auto()
 
 
@@ -16,11 +17,12 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: Optional[list[int]], sampling_params = SamplingParams(), input_embeds: Optional[torch.Tensor] = None, request_id: Optional[str] = None):
+    def __init__(self, token_ids: Optional[list[int]], sampling_params = SamplingParams(), input_embeds: Optional[torch.Tensor] = None, request_id: Optional[str] = None, keep_alive: bool = False):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.input_embeds = input_embeds
         self.request_id = request_id
+        self.keep_alive = keep_alive  # if True, EOS pauses instead of finishing
         self.decode_input_embeds: Optional[torch.Tensor] = None
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1] if token_ids else None
@@ -43,6 +45,10 @@ class Sequence:
     @property
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
+
+    @property
+    def is_paused(self):
+        return self.status == SequenceStatus.PAUSED
 
     @property
     def num_completion_tokens(self):

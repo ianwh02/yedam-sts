@@ -61,18 +61,16 @@ def build_translation_prompt(
     """
     system = _load_system_prompt(source_lang, target_lang)
 
-    # Add recent context for continuity
+    # Add recent Korean context for continuity (no English — including
+    # prior translations creates copy targets that cause repetition loops)
     if recent_segments:
         context_lines = []
         for seg in recent_segments[-settings.llm_context_window_segments:]:
-            if seg.get("english"):
-                context_lines.append(
-                    f"Korean: {seg['korean']}\nEnglish: {seg['english']}"
-                )
+            context_lines.append(seg["korean"])
         if context_lines:
             system += (
-                "\n\nRecent translation context for continuity:\n"
-                + "\n---\n".join(context_lines)
+                "\n\nRecent source text for context:\n"
+                + "\n".join(context_lines)
             )
 
     if previous_chunk:

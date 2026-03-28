@@ -39,7 +39,7 @@ class LLMClient:
         self,
         messages: list[dict],
         max_tokens: int = 200,
-        temperature: float = 0.3,
+        temperature: float = 0.5,
     ) -> AsyncGenerator[str, None]:
         """Stream chat completion tokens from vLLM.
 
@@ -50,6 +50,7 @@ class LLMClient:
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "frequency_penalty": 0.3,
             "stream": True,
             "chat_template_kwargs": {"enable_thinking": False},
         }

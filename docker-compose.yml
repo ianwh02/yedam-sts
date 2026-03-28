@@ -44,7 +44,7 @@ services:
       - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
     command:
       - "--model"
-      - "${LLM_MODEL:-Qwen/Qwen3-4B-AWQ}"
+      - "${LLM_MODEL:-Qwen/Qwen3-8B-AWQ}"
       - "--quantization"
       - "${LLM_QUANTIZATION:-awq_marlin}"
       - "--kv-cache-dtype"
@@ -58,7 +58,7 @@ services:
       - "--enable-prefix-caching"
       - "--enforce-eager"
       - "--attention-backend"
-      - "${LLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+      - "${LLM_ATTENTION_BACKEND:-FLASH_ATTN}"
       - "--performance-mode"
       - "interactivity"
     expose:
@@ -86,7 +86,7 @@ services:
     container_name: yedam-tts
     restart: unless-stopped
     environment:
-      - MODEL_DIR=${TTS_MODEL_DIR:-/app/models/Qwen3-TTS-12Hz-0.6B-Base}
+      - MODEL_DIR=${TTS_MODEL_DIR:-/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice}
       - TOKENIZER_DIR=${TTS_TOKENIZER_DIR:-/app/models/Qwen3-TTS-Tokenizer-12Hz-48kHz}
       - TARGET_SAMPLE_RATE=${TARGET_SAMPLE_RATE:-48000}
       - SHARE_SPEECH_TOKENIZER=1
@@ -108,7 +108,7 @@ services:
       - TTS_REPETITION_PENALTY=${TTS_REPETITION_PENALTY:-1.1}
       - TTS_REPETITION_PENALTY_WINDOW=${TTS_REPETITION_PENALTY_WINDOW:-100}
       - TTS_SUPPRESS_MASK=${TTS_SUPPRESS_MASK:-1}
-      - TTS_EOS_MIN_STEPS=${TTS_EOS_MIN_STEPS:-12}
+      - TTS_EOS_MIN_STEPS=${TTS_EOS_MIN_STEPS:-0}
       - TTS_EOS_BOOST_MAX=${TTS_EOS_BOOST_MAX:-3.0}
       - TTS_EOS_BOOST_START_STEP=${TTS_EOS_BOOST_START_STEP:-35}
       - TTS_EOS_BOOST_MAX_STEP=${TTS_EOS_BOOST_MAX_STEP:-300}
@@ -123,7 +123,7 @@ services:
     volumes:
       - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
       - ${REF_AUDIO_DIR:-./tts-server/ref_audio}:/app/ref_audio:ro
-      - ./tts-server/models/Qwen3-TTS-12Hz-0.6B-CustomVoice:/app/models/Qwen3-TTS-12Hz-0.6B-CustomVoice:ro
+      - ./tts-server/models/Qwen3-TTS-12Hz-1.7B-CustomVoice:/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice:ro
     ports:
       - "${TTS_PORT:-7860}:7860"
     healthcheck:

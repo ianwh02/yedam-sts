@@ -10,37 +10,40 @@
 # Run: ./scripts/start.sh [--trt] [--dev]
 
 gpu:
-  reserved_mb: 800   # Desktop/Xorg (~200) + decoder scratch space (~100)
-                      # + fragmentation headroom (~500)
-                      # Set to 400 for headless servers
+  reserved_mb: 400   # Headless server: fragmentation headroom (~300) + scratch (~100)
+                      # Set to 800 for desktop with Xorg
 
 services:
   llm:
-    fixed_mb: 3300        # Qwen3-4B-AWQ weights (~2800) + CUDA context (~500)
+    fixed_mb: 5500        # Qwen3-8B-AWQ weights (~5000) + CUDA context (~500)
                           # Used to compute LLM_GPU_MEMORY_UTILIZATION env var
-    variable_priority: 1  # Low: short context (512 tokens), max 8 seqs — small KV cache needed
+    variable_priority: 1  # Low: short context, max 8 seqs — small KV cache needed
     min_variable_mb: 200
     # Output env: LLM_GPU_MEMORY_UTILIZATION
 
   stt:
-    fixed_mb: 2000        # Whisper large-v3-turbo int8_float16 (~1500) + CUDA context (~500)
+    fixed_mb: 1000        # Whisper small (komixv2) int8_float16 (~500) + CUDA context (~500)
                           # Documentation only — coordinator measures actual
     variable_priority: 1
     min_variable_mb: 50
     # No output env needed — faster-whisper allocates what it needs
 
   stt_trt:
-    fixed_mb: 2600        # TensorRT engines + CUDA context (measured: ~2660 MB)
+    fixed_mb: 1500        # Whisper small TRT engines (~800) + CUDA context (~500) + runtime (~200)
+                          # Was 2600 for large-v3-turbo; small is ~3x fewer params
                           # Documentation only — coordinator measures actual
     variable_priority: 1
     min_variable_mb: 100
     # Output env: STT_KV_CACHE_FREE_GPU_FRACTION (via coordinator)
 
   tts:
-    fixed_mb: 5900        # Main: embeddings + tokenizer + graphs (~2550)
-                          # Predictor: weights + context + graphs (~1150)
-                          # Talker: weights + context + graphs (~4560)
+    fixed_mb: 9200        # Qwen3-TTS-12Hz-1.7B (bf16):
+                          #   Main: text embeddings + tokenizer + CUDA graphs (~1770)
+                          #   Talker: 1.42B params * bf16 * 1.5x overhead (~5210)
+                          #   Predictor: weights + 15 lm_heads + 15 codec_emb * 1.7x (~600)
+                          #   CUDA contexts (3 TTS procs × ~200) (~600)
+                          #   Misc fragmentation + activations (~1020)
                           # Documentation only — coordinator measures actual
     variable_priority: 3  # Highest: TTS is the bottleneck, talker KV cache determines concurrency
-    min_variable_mb: 300
+    min_variable_mb: 500
     # Output env: TTS_VRAM_BUDGET_MB (via coordinator)

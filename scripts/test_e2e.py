@@ -260,7 +260,7 @@ async def run_e2e(args):
                 data = json.loads(message)
 
                 msg_type = data.get("type", data.get("message", ""))
-                if msg_type in ("buffer_cleared", "buffer_trimmed", "final_before_clear"):
+                if msg_type in ("buffer_cleared", "buffer_trimmed"):
                     completed_count = 0
                     last_partial = ""
                     continue

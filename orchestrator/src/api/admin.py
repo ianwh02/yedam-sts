@@ -14,10 +14,28 @@ rest_router = APIRouter()
 ws_router = APIRouter()
 
 
+class PipelineTTSConfig(BaseModel):
+    """Voice configuration from the platform."""
+    mode: str | None = None  # "preset" | "design" | "clone"
+    model: str | None = None
+    speaker: str | None = None
+    voice_prompt: str | None = None  # alias: instruct
+    instruct: str | None = None  # alias: voice_prompt (platform sends this)
+    reference_audio_url: str | None = None  # signed URL for voice cloning
+    reference_text: str | None = None  # transcript of the reference audio
+    params: dict | None = None
+
+    @property
+    def effective_voice_prompt(self) -> str | None:
+        """Return whichever field is set (voice_prompt or instruct)."""
+        return self.voice_prompt or self.instruct
+
+
 class CreateSessionRequest(BaseModel):
     source_lang: str = "ko"
     target_lang: str = "en"
     processor: str = "translation"
+    tts_config: PipelineTTSConfig | None = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -35,6 +53,7 @@ async def create_session(req: CreateSessionRequest, request: Request):
             source_lang=req.source_lang,
             target_lang=req.target_lang,
             processor_type=req.processor,
+            tts_config=req.tts_config,
         )
     except SessionLimitError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -43,6 +62,23 @@ async def create_session(req: CreateSessionRequest, request: Request):
         admin_ws_url=f"/ws/admin/{session.session_id}",
         listener_ws_url=f"/ws/listen/{session.session_id}",
     )
+
+
+@rest_router.patch("/sessions/{session_id}/tts")
+async def update_tts_config(session_id: str, req: PipelineTTSConfig, request: Request):
+    """Hot-swap voice configuration for an active session."""
+    manager: PipelineManager = request.app.state.pipeline_manager
+    session = manager.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        await manager.update_session_voice(session_id, req)
+    except Exception as e:
+        logger.exception("Failed to update TTS config for session %s", session_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"status": "ok", "session_id": session_id}
 
 
 @rest_router.delete("/sessions/{session_id}")

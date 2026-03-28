@@ -113,6 +113,7 @@ class SessionOrchestrator:
         self._stt: STTClient | None = None
         self._tasks: set[asyncio.Task] = set()
         self._previous_chunk: str | None = None  # last flushed Korean text for LLM context
+        self._segment_lock = asyncio.Lock()  # serialize segment processing to preserve TTS order
 
     async def start(self):
         """Create STT client and connect to WhisperLive."""
@@ -150,7 +151,15 @@ class SessionOrchestrator:
         task.add_done_callback(self._tasks.discard)
 
     async def _process_segment(self, korean_text: str):
-        """Full pipeline: record → callback → translate → TTS → callback."""
+        """Full pipeline: record → callback → translate → TTS → callback.
+
+        Serialized via _segment_lock so TTS enqueue order matches segment order.
+        Segment N+1's LLM+TTS waits for segment N to finish enqueuing all sentences.
+        """
+        async with self._segment_lock:
+            await self._process_segment_inner(korean_text)
+
+    async def _process_segment_inner(self, korean_text: str):
         session = self._session
         if session.is_cancelled:
             return

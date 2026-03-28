@@ -53,6 +53,13 @@ class TranslationSession:
     target_lang: str = "en"
     processor_type: str = "translation"
 
+    # Per-session voice config (from platform tts_config)
+    voice_mode: str | None = None  # "preset" | "design" | "clone" | None (use server default)
+    speaker: str | None = None  # preset speaker ID (e.g. "Ryan", "Sohee")
+    voice_prompt: str | None = None  # voice description (design) or style overlay (preset)
+    ref_audio_url: str | None = None  # signed URL for voice cloning ref audio
+    ref_text: str | None = None  # reference transcript for ICL mode
+
     # Admin connection (audio source)
     admin_ws: WebSocket | None = None
 

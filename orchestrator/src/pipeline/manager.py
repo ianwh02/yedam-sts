@@ -84,6 +84,7 @@ class PipelineManager:
         target_lang: str | None = None,
         processor_type: str | None = None,
         callbacks: SessionCallbacks | None = None,
+        tts_config=None,
     ) -> TranslationSession:
         if self.active_session_count >= settings.max_concurrent_sessions:
             raise SessionLimitError(
@@ -98,6 +99,15 @@ class PipelineManager:
             target_lang=target_lang or settings.default_target_lang,
             processor_type=proc_type,
         )
+
+        # Store voice config from platform
+        if tts_config is not None:
+            session.voice_mode = getattr(tts_config, "mode", None)
+            session.ref_audio_url = getattr(tts_config, "reference_audio_url", None)
+            session.ref_text = getattr(tts_config, "reference_text", None)
+            session.speaker = getattr(tts_config, "speaker", None)
+            session.voice_prompt = getattr(tts_config, "effective_voice_prompt", None) or getattr(tts_config, "voice_prompt", None)
+
         session.is_active = True
         self.sessions[session_id] = session
 
@@ -143,7 +153,42 @@ class PipelineManager:
             on_tts_audio=_broadcast_tts_audio,
         )
 
-        # Create and start the per-session orchestrator
+        # Ensure the TTS server has the right model loaded BEFORE starting the
+        # orchestrator (which connects STT WebSocket). Model swap can take ~30s
+        # and would cause the STT connection to timeout if done after.
+        if session.voice_mode:
+            try:
+                await self._tts_client.ensure_model(session.voice_mode)
+            except Exception:
+                logger.warning(
+                    "TTS model swap failed for session %s (mode=%s), using current model",
+                    session_id, session.voice_mode, exc_info=True,
+                )
+
+            instruct = session.voice_prompt
+            self._tts_client.set_session_voice_config(
+                session_id=session_id,
+                mode=session.voice_mode,
+                speaker=session.speaker,
+                instruct=instruct,
+            )
+
+        # For clone mode, init the voice clone prompt on TTS server
+        if session.voice_mode == "clone" and session.ref_audio_url:
+            try:
+                await self._tts_client.init_session_voice(
+                    session_id=session_id,
+                    ref_audio_url=session.ref_audio_url,
+                    ref_text=session.ref_text,
+                    timeout=settings.tts_voice_clone_init_timeout,
+                )
+            except Exception:
+                logger.warning(
+                    "Voice clone init failed for session %s, falling back to default voice",
+                    session_id, exc_info=True,
+                )
+
+        # Create and start the per-session orchestrator (connects STT WebSocket)
         processor = self._processors.get(proc_type, self._processors["translation"])
         orchestrator = SessionOrchestrator(
             session=session,
@@ -157,11 +202,12 @@ class PipelineManager:
         self._orchestrators[session_id] = orchestrator
 
         logger.info(
-            "Session %s created (%s → %s, processor=%s)",
+            "Session %s created (%s → %s, processor=%s, voice=%s)",
             session_id,
             session.source_lang,
             session.target_lang,
             session.processor_type,
+            session.voice_mode or "default",
         )
         return session
 
@@ -183,6 +229,41 @@ class PipelineManager:
             session.completed_segment_count,
         )
         return True
+
+    async def update_session_voice(self, session_id: str, tts_config) -> None:
+        """Hot-swap voice configuration for an active session."""
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Session {session_id} not found")
+
+        session.voice_mode = getattr(tts_config, "mode", None)
+        session.ref_audio_url = getattr(tts_config, "reference_audio_url", None)
+        session.ref_text = getattr(tts_config, "reference_text", None)
+        session.speaker = getattr(tts_config, "speaker", None)
+        session.voice_prompt = getattr(tts_config, "effective_voice_prompt", None) or getattr(tts_config, "voice_prompt", None)
+
+        # Ensure the TTS server has the right model loaded
+        if session.voice_mode:
+            await self._tts_client.ensure_model(session.voice_mode)
+
+            instruct = session.voice_prompt
+            self._tts_client.set_session_voice_config(
+                session_id=session_id,
+                mode=session.voice_mode,
+                speaker=session.speaker,
+                instruct=instruct,
+            )
+
+        # For clone mode, also re-init voice clone prompt on TTS server
+        if session.voice_mode == "clone" and session.ref_audio_url:
+            await self._tts_client.init_session_voice(
+                session_id=session_id,
+                ref_audio_url=session.ref_audio_url,
+                ref_text=session.ref_text,
+                timeout=settings.tts_voice_clone_init_timeout,
+            )
+
+        logger.info("Voice config updated for session %s (mode=%s)", session_id, session.voice_mode)
 
     def get_session(self, session_id: str) -> TranslationSession | None:
         return self.sessions.get(session_id)

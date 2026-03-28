@@ -1425,6 +1425,287 @@ class Qwen3TTSInterface:
             async with self._queues_lock:
                 self._request_queues.pop(request_id, None)
 
+    # ── Continuous streaming (cross-segment KV cache persistence) ──────
+
+    def _compute_text_hiddens(self, text: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute trailing_text_hiddens for a text chunk. Cheap: embedding + MLP only.
+
+        Returns (trailing_text_hiddens, tts_eos_embed, tts_pad_embed).
+        """
+        input_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        input_ids = _tokenize_texts([input_text], self.processor, self.device)
+        input_id = input_ids[0] if isinstance(input_ids, list) else input_ids
+
+        # Compute special token embeds
+        _, tts_eos_embed, tts_pad_embed = self.text_projection(
+            self.text_embedding(
+                torch.tensor(
+                    [[self.model_config.tts_bos_token_id,
+                      self.model_config.tts_eos_token_id,
+                      self.model_config.tts_pad_token_id]],
+                    device=self.device, dtype=input_id.dtype,
+                )
+            )
+        ).chunk(3, dim=1)
+
+        # Text token embeddings (strip special tokens: 4 prefix, 5 suffix)
+        text_tokens = input_id[:, 4:-5] if input_id.dim() == 2 else input_id[4:-5].unsqueeze(0)
+        trailing = torch.cat(
+            (self.text_projection(self.text_embedding(text_tokens)), tts_eos_embed),
+            dim=1,
+        )
+        return trailing, tts_eos_embed, tts_pad_embed
+
+    async def generate_continuous_async(
+        self,
+        text_channel: asyncio.Queue,  # Queue[str | None], None = end of stream
+        *,
+        initial_text: str,
+        language: str = "English",
+        mode: str = "preset",
+        speaker: str = "Vivian",
+        instruct: str | None = None,
+        voice_clone_prompt: dict | None = None,
+        non_streaming_mode: bool = True,
+        continuation_timeout: float = 5.0,
+    ):
+        """Async generator: fresh prompt per sentence through persistent WebSocket.
+
+        Each sentence from text_channel gets its own generation (full prefill + EOS).
+        Voice identity is consistent (same clone prompt). No prosodic carryover
+        between sentences — Qwen3-TTS requires full target text in the prefill.
+
+        Yields:
+            list[int]: codec tokens for audio decoding
+            "segment_boundary": emitted between sentences
+            "fallback": error, caller should switch to per-sentence HTTP mode
+        """
+        if not (self._use_mp_engines and self._mp_holder is not None):
+            raise RuntimeError("generate_continuous_async requires start_zmq_tasks()")
+
+        request_id = str(uuid.uuid4())
+        request_queue: asyncio.Queue = asyncio.Queue()
+        async with self._queues_lock:
+            self._request_queues[request_id] = request_queue
+
+        talker_sampling_params = SamplingParams(temperature=self.TTS_TALKER_TEMPERATURE, max_tokens=1)
+        predictor_sampling_params = SamplingParams(temperature=self.TTS_PREDICTOR_TEMPERATURE, max_tokens=17)
+        step_timeout = float(os.environ.get("TTS_STEP_TIMEOUT", "30.0"))
+        max_generation_steps = int(os.environ.get("MAX_GENERATION_STEPS", "300"))
+
+        current_text = initial_text
+        is_first_segment = True
+
+        # Clone mode helpers (defined once, reused per segment)
+        voice_clone_prompt_lists = None
+        generate_speaker_prompt_fn = None
+        generate_icl_prompt_fn = None
+        ref_text_for_ids = None
+
+        if mode == "clone" and voice_clone_prompt is not None:
+            vc_prompt = voice_clone_prompt
+            icl_mode_enabled = vc_prompt.get("icl_mode", False)
+            ref_text_for_ids = vc_prompt.get("ref_text") if icl_mode_enabled else None
+            voice_clone_prompt_lists = {
+                "ref_code": [vc_prompt["ref_code"]],
+                "ref_spk_embedding": [vc_prompt["ref_spk_embedding"]],
+                "x_vector_only_mode": [vc_prompt["x_vector_only_mode"]],
+                "icl_mode": [vc_prompt["icl_mode"]],
+            }
+            def generate_speaker_prompt_fn(prompt):
+                return generate_speaker_prompt(prompt, self.device)
+            def generate_icl_prompt_fn(text_id, ref_id, ref_code, tts_pad_embed, tts_eos_embed, non_streaming_mode):
+                return generate_icl_prompt(
+                    text_id=text_id, ref_id=ref_id, ref_code=ref_code,
+                    tts_pad_embed=tts_pad_embed, tts_eos_embed=tts_eos_embed,
+                    non_streaming_mode=non_streaming_mode, config=self.model_config,
+                    text_embedding=self.text_embedding, input_embedding=self.input_embedding,
+                    text_projection=self.text_projection,
+                    code_predictor_embeddings=self.predictor_input_embeddings,
+                    device=self.device,
+                )
+
+        segment_count = 0
+        try:
+            while current_text is not None:
+                segment_count += 1
+
+                # ── Prepare inputs for this sentence ──
+                if not is_first_segment:
+                    self._mp_holder.talker_client.send_clear_request(request_id)
+
+                if mode == "clone" and voice_clone_prompt_lists is not None:
+                    input_text = f"<|im_start|>assistant\n{current_text}<|im_end|>\n<|im_start|>assistant\n"
+                    input_ids = _tokenize_texts([input_text], self.processor, self.device)
+                    ref_ids = None
+                    if ref_text_for_ids:
+                        ref_tok = _tokenize_texts([self._build_ref_text(ref_text_for_ids)], self.processor, self.device)[0]
+                        ref_ids = [ref_tok]
+                    talker_input_embeds, trailing_text_hiddens, tts_pad_embed, _ = prepare_inputs(
+                        config=self.model_config, input_ids=input_ids, ref_ids=ref_ids,
+                        voice_clone_prompt=voice_clone_prompt_lists, languages=[language],
+                        non_streaming_mode=non_streaming_mode,
+                        text_embedding=self.text_embedding, input_embedding=self.input_embedding,
+                        text_projection=self.text_projection, device=self.device,
+                        generate_speaker_prompt_fn=generate_speaker_prompt_fn,
+                        generate_icl_prompt_fn=generate_icl_prompt_fn,
+                    )
+                elif mode == "design":
+                    input_text = f"<|im_start|>assistant\n{current_text}<|im_end|>\n<|im_start|>assistant\n"
+                    instruct_text = f"<|im_start|>user\n{instruct}<|im_end|>\n" if instruct else ""
+                    full_text = instruct_text + input_text
+                    input_ids = _tokenize_texts([full_text], self.processor, self.device)
+                    talker_input_embeds, trailing_text_hiddens, tts_pad_embed, _ = prepare_inputs(
+                        config=self.model_config, input_ids=input_ids, languages=[language],
+                        non_streaming_mode=non_streaming_mode,
+                        text_embedding=self.text_embedding, input_embedding=self.input_embedding,
+                        text_projection=self.text_projection, device=self.device,
+                    )
+                else:
+                    input_text = f"<|im_start|>assistant\n{current_text}<|im_end|>\n<|im_start|>assistant\n"
+                    input_ids = _tokenize_texts([input_text], self.processor, self.device)
+                    talker_input_embeds, trailing_text_hiddens, tts_pad_embed, _ = prepare_inputs(
+                        config=self.model_config, input_ids=input_ids,
+                        speakers=[speaker], languages=[language],
+                        non_streaming_mode=non_streaming_mode,
+                        text_embedding=self.text_embedding, input_embedding=self.input_embedding,
+                        text_projection=self.text_projection, device=self.device,
+                    )
+
+                next_talker_embeds = talker_input_embeds
+                if next_talker_embeds.dim() == 2:
+                    next_talker_embeds = next_talker_embeds.unsqueeze(0)
+
+                self._mp_holder.talker_client.send_add_request(
+                    request_id, [next_talker_embeds], talker_sampling_params, keep_alive=True
+                )
+                is_first_segment = False
+
+                logger.info(
+                    f"[continuous:{request_id[:8]}] segment #{segment_count}: "
+                    f"text={current_text[:40]!r}{'...' if len(current_text) > 40 else ''}"
+                )
+
+                # ── Generation loop for this sentence ──
+                text_step = 0
+                segment_step = 0
+
+                while True:
+                    if segment_step >= max_generation_steps:
+                        logger.warning(f"[continuous:{request_id[:8]}] hit max_generation_steps={max_generation_steps}")
+                        break
+
+                    try:
+                        engine_type, msg_type, payload = await asyncio.wait_for(
+                            request_queue.get(), timeout=step_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"[continuous:{request_id[:8]}] step timeout at segment_step={segment_step}")
+                        yield "fallback"
+                        return
+
+                    if engine_type == "talker" and msg_type == "paused":
+                        logger.info(f"[continuous:{request_id[:8]}] soft EOS at segment_step={segment_step}")
+                        yield "segment_boundary"
+                        try:
+                            next_text = await asyncio.wait_for(text_channel.get(), timeout=continuation_timeout)
+                        except asyncio.TimeoutError:
+                            next_text = None
+                        current_text = next_text
+                        break
+
+                    if engine_type == "talker" and msg_type == "done":
+                        logger.info(f"[continuous:{request_id[:8]}] hard EOS at segment_step={segment_step}")
+                        yield "segment_boundary"
+                        current_text = None
+                        break
+
+                    if engine_type == "talker" and msg_type == "token":
+                        token_ids = payload["token_ids"]
+                        hidden_states = payload.get("hidden_states")
+                        last_id = token_ids[-1]
+
+                        if last_id in (2150, 2157):
+                            yield "segment_boundary"
+                            current_text = None
+                            break
+
+                        if hidden_states is not None:
+                            h = torch.from_numpy(hidden_states.copy()).to(self.device)
+                            if h.dim() == 1:
+                                h = h.unsqueeze(0).unsqueeze(0)
+                            else:
+                                h = h.unsqueeze(0).unsqueeze(0)
+
+                        last_id_hidden = self.input_embedding(
+                            torch.tensor([last_id], device=self.device)
+                        ).unsqueeze(0)
+
+                        if hidden_states is not None:
+                            predictor_inputs_embeds = torch.cat((h, last_id_hidden), dim=1)
+                        else:
+                            predictor_inputs_embeds = torch.cat((last_id_hidden.unsqueeze(0), last_id_hidden), dim=1)
+
+                        self._mp_holder.predictor_client.send_add_request(
+                            request_id, [predictor_inputs_embeds], predictor_sampling_params,
+                        )
+
+                        try:
+                            pred_engine, pred_msg, payload2 = await asyncio.wait_for(
+                                request_queue.get(), timeout=step_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(f"[continuous:{request_id[:8]}] predictor timeout")
+                            yield "fallback"
+                            return
+
+                        if pred_engine == "talker" and pred_msg == "paused":
+                            logger.info(f"[continuous:{request_id[:8]}] soft EOS (predictor wait) at step={segment_step}")
+                            yield "segment_boundary"
+                            try:
+                                next_text = await asyncio.wait_for(text_channel.get(), timeout=continuation_timeout)
+                            except asyncio.TimeoutError:
+                                next_text = None
+                            current_text = next_text
+                            break
+
+                        pred_token_ids = payload2.get("token_ids", [])
+                        codebook_ids = [last_id] + pred_token_ids
+                        if segment_step % 10 == 0:
+                            logger.info(f"[continuous:{request_id[:8]}] step={segment_step} yielding {len(codebook_ids)} codes")
+                        yield codebook_ids
+
+                        codec_hiddens = torch.cat(
+                            [last_id_hidden]
+                            + [self.predictor_input_embeddings[i](
+                                torch.tensor([pred_token_ids[i]], device=self.device)
+                            ).unsqueeze(0) for i in range(15)],
+                            dim=1,
+                        )
+                        next_talker_embeds = codec_hiddens.sum(1, keepdim=True)
+
+                        if text_step < trailing_text_hiddens.shape[1]:
+                            next_talker_embeds = next_talker_embeds + trailing_text_hiddens[:, text_step].unsqueeze(1)
+                        else:
+                            next_talker_embeds = next_talker_embeds + tts_pad_embed
+
+                        text_step += 1
+                        segment_step += 1
+
+                        self._mp_holder.talker_client.send_add_request(
+                            request_id, [next_talker_embeds], talker_sampling_params, keep_alive=True
+                        )
+
+        finally:
+            try:
+                if self._mp_holder is not None:
+                    self._mp_holder.talker_client.send_clear_request(request_id)
+                    self._mp_holder.predictor_client.send_clear_request(request_id)
+            except Exception:
+                pass
+            async with self._queues_lock:
+                self._request_queues.pop(request_id, None)
+
     def _generate_caller_driven(
         self,
         inputs_embeds: torch.Tensor,

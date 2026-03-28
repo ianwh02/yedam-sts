@@ -28,7 +28,7 @@ import multiprocessing as mp
 from math import gcd
 from scipy.signal import butter, resample_poly, sosfilt
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -1198,7 +1198,7 @@ async def delete_session_context(session_id: str):
 
 
 def _download_ref_audio(url: str) -> tuple[np.ndarray, int]:
-    """Download reference audio from a signed URL. Returns (waveform, sample_rate).
+    """Download reference audio from a signed URL or base64 data URI. Returns (waveform, sample_rate).
 
     Supports any format ffmpeg can decode (WAV, WebM, MP3, OGG, M4A, etc.)
     via soundfile with pydub/ffmpeg fallback.
@@ -1206,10 +1206,16 @@ def _download_ref_audio(url: str) -> tuple[np.ndarray, int]:
     import requests
     import soundfile as sf
 
-    resp = requests.get(url, timeout=20)
-    resp.raise_for_status()
-
-    buf = io.BytesIO(resp.content)
+    if url.startswith("data:"):
+        # Handle base64 data URI: data:audio/wav;base64,<data>
+        import base64 as b64mod
+        header, encoded = url.split(",", 1)
+        raw = b64mod.b64decode(encoded)
+        buf = io.BytesIO(raw)
+    else:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        buf = io.BytesIO(resp.content)
     try:
         audio, sr = sf.read(buf)
     except Exception:
@@ -1217,8 +1223,9 @@ def _download_ref_audio(url: str) -> tuple[np.ndarray, int]:
         import subprocess
         import tempfile
 
+        raw_bytes = buf.getvalue()
         with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
-            tmp_in.write(resp.content)
+            tmp_in.write(raw_bytes)
             tmp_in_path = tmp_in.name
 
         tmp_out_path = tmp_in_path + ".wav"
@@ -1236,7 +1243,15 @@ def _download_ref_audio(url: str) -> tuple[np.ndarray, int]:
     if audio.ndim > 1:
         audio = np.mean(audio, axis=-1)
 
-    return audio.astype(np.float32), sr
+    audio = audio.astype(np.float32)
+
+    # Resample to 16kHz — the speech tokenizer expects 16kHz input
+    if sr != 16000:
+        import librosa
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        sr = 16000
+
+    return audio, sr
 
 
 class InitVoiceRequest(BaseModel):
@@ -1512,6 +1527,208 @@ async def synthesize_voice_design(req: VoiceDesignRequest, request: Request):
         pcm16_array = np.frombuffer(raw_pcm, dtype=np.int16)
         wav_bytes = _to_wav_bytes(pcm16_array, TARGET_SAMPLE_RATE)
         return Response(content=wav_bytes, media_type="audio/wav")
+
+
+# ---------------------------------------------------------------------------
+# Continuous TTS WebSocket — persistent stream with KV cache across segments
+# ---------------------------------------------------------------------------
+
+# Active continuous sessions: session_id -> text_channel queue
+_continuous_sessions: dict[str, asyncio.Queue] = {}
+
+
+@app.websocket("/synthesize/continuous/{session_id}")
+async def ws_continuous_synthesize(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint for continuous TTS streaming.
+
+    Maintains talker KV cache across sentence boundaries for prosodic continuity.
+
+    Protocol:
+      Client → Server (JSON):
+        {"type": "text", "text": "Hello world.", "language": "en"}
+        {"type": "end"}
+      Server → Client (binary): s16le PCM audio chunks at TARGET_SAMPLE_RATE
+      Server → Client (JSON):
+        {"type": "segment_boundary"}
+        {"type": "ready"}
+        {"type": "error", "detail": "..."}
+    """
+    if _server_status != "ready":
+        await websocket.close(code=1013, reason=f"Server not ready: {_server_status}")
+        return
+
+    await websocket.accept()
+    interface = get_interface()
+
+    text_channel: asyncio.Queue[str | None] = asyncio.Queue()
+    _continuous_sessions[session_id] = text_channel
+
+    # Resolve voice mode/config from session
+    clone_prompt = _get_voice_clone_prompt(session_id, "English")
+    effective_mode = _active_model_name or "preset"
+    if clone_prompt is not None:
+        effective_mode = "clone"
+
+    logger.info("[ws_continuous] session %s connected (mode=%s)", session_id, effective_mode)
+
+    # Wait for initial text message to start generation
+    try:
+        initial_msg = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
+    except (asyncio.TimeoutError, WebSocketDisconnect):
+        logger.warning("[ws_continuous] session %s: no initial text within 30s", session_id)
+        _continuous_sessions.pop(session_id, None)
+        return
+
+    if initial_msg.get("type") != "text" or not initial_msg.get("text"):
+        await websocket.send_json({"type": "error", "detail": "First message must be {type: 'text', text: '...'}"})
+        _continuous_sessions.pop(session_id, None)
+        return
+
+    initial_text = initial_msg["text"]
+    raw_lang = initial_msg.get("language", "English")
+    language = SUPPORTED_LANGUAGES.get(raw_lang.lower(), raw_lang) if raw_lang else "English"
+    speaker = initial_msg.get("speaker", DEFAULT_SPEAKER)
+    instruct = initial_msg.get("instruct")
+    mode = initial_msg.get("mode", effective_mode)
+
+    await websocket.send_json({"type": "ready"})
+
+    # Background task: read text messages from client → push to text_channel
+    async def text_reader():
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                msg_type = msg.get("type")
+                if msg_type == "text" and msg.get("text"):
+                    await text_channel.put(msg["text"])
+                elif msg_type == "end":
+                    await text_channel.put(None)
+                    break
+        except WebSocketDisconnect:
+            await text_channel.put(None)
+        except Exception as e:
+            logger.warning("[ws_continuous] text_reader error: %s", e)
+            await text_channel.put(None)
+
+    reader_task = asyncio.create_task(text_reader())
+
+    # Generate audio using continuous generator
+    try:
+        gen = interface.generate_continuous_async(
+            text_channel,
+            initial_text=initial_text,
+            language=language,
+            mode=mode,
+            speaker=speaker,
+            instruct=instruct,
+            voice_clone_prompt=clone_prompt,
+        )
+
+        # Decode pipeline (reuses existing streaming decode logic)
+        audio_codes = []
+        prev_code_pos = 0
+        chunk_index = 0
+        prev_tail = None
+
+        async for item in gen:
+            if isinstance(item, str):
+                if item == "segment_boundary":
+                    if prev_tail is not None:
+                        trimmed = _trim_trailing_silence(prev_tail / 32768.0) * 32768.0
+                        out = np.clip(trimmed, -32768, 32767).astype(np.int16)
+                        await websocket.send_bytes(out.tobytes())
+                        prev_tail = None
+                    await websocket.send_json({"type": "segment_boundary"})
+                    _set_session_warmup(session_id, audio_codes)
+                    audio_codes = []
+                    prev_code_pos = 0
+                    chunk_index = 0
+                    continue
+                elif item == "fallback":
+                    await websocket.send_json({"type": "error", "detail": "Continuous mode failed, use per-sentence fallback"})
+                    break
+                continue
+
+            # item is codebook_ids (list[int])
+            audio_codes.append(item)
+            n = len(audio_codes)
+
+            # Chunk accumulation (same thresholds as HTTP streaming)
+            should_decode = False
+            if n <= _first_codes_threshold:
+                if n % FIRST_CHUNK_SIZE == 0:
+                    should_decode = True
+            else:
+                if n % STREAMING_CHUNK_SIZE == 0:
+                    should_decode = True
+
+            if not should_decode:
+                continue
+
+            # Decode to PCM
+            start_ctx = max(0, prev_code_pos - STREAMING_CONTEXT_SIZE)
+            window = audio_codes[start_ctx:]
+            context_frames = prev_code_pos - start_ctx
+
+            if chunk_index == 0 and DECODER_WARMUP_FRAMES > 0 and len(window) > 0:
+                session_warmup = _get_session_warmup(session_id)
+                if session_warmup is not None:
+                    warmup = session_warmup
+                elif _warmup_codec_frames is not None:
+                    warmup = _warmup_codec_frames[:DECODER_WARMUP_FRAMES]
+                else:
+                    warmup = [window[0]] * DECODER_WARMUP_FRAMES
+                window = warmup + window
+                context_frames += len(warmup)
+
+            pcm16, _ = await _decode_batched(window, left_context_frames=context_frames)
+            prev_code_pos = len(audio_codes)
+
+            if len(pcm16) == 0:
+                continue
+
+            audio_f32 = pcm16.astype(np.float32)
+
+            # Hann crossfade
+            if prev_tail is not None and len(audio_f32) > BLEND_SAMPLES:
+                fade_in, fade_out = _get_hann_windows()
+                blended = prev_tail * fade_out + audio_f32[:BLEND_SAMPLES] * fade_in
+                audio_f32 = np.concatenate([blended, audio_f32[BLEND_SAMPLES:]])
+            elif chunk_index == 0 and len(audio_f32) > BLEND_SAMPLES:
+                fade_in, _ = _get_hann_windows()
+                audio_f32[:BLEND_SAMPLES] *= fade_in
+
+            if len(audio_f32) > BLEND_SAMPLES:
+                prev_tail = audio_f32[-BLEND_SAMPLES:].copy()
+                emit = audio_f32[:-BLEND_SAMPLES]
+            else:
+                prev_tail = None
+                emit = audio_f32
+
+            chunk_index += 1
+            out = np.clip(emit, -32768, 32767).astype(np.int16)
+            await websocket.send_bytes(out.tobytes())
+
+        # Final tail
+        if prev_tail is not None:
+            trimmed = _trim_trailing_silence(prev_tail / 32768.0) * 32768.0
+            out = np.clip(trimmed, -32768, 32767).astype(np.int16)
+            await websocket.send_bytes(out.tobytes())
+
+        _set_session_warmup(session_id, audio_codes)
+
+    except WebSocketDisconnect:
+        logger.info("[ws_continuous] session %s disconnected", session_id)
+    except Exception as e:
+        logger.exception("[ws_continuous] session %s error: %s", session_id, e)
+        try:
+            await websocket.send_json({"type": "error", "detail": str(e)})
+        except Exception:
+            pass
+    finally:
+        reader_task.cancel()
+        _continuous_sessions.pop(session_id, None)
+        logger.info("[ws_continuous] session %s cleaned up", session_id)
 
 
 # ---------------------------------------------------------------------------

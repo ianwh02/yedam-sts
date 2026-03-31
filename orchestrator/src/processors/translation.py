@@ -44,7 +44,7 @@ class TranslationProcessor(BaseProcessor):
 
         async for token in self._llm.stream_chat(
             messages=messages,
-            max_tokens=512,
+            max_tokens=200,
             temperature=0.3,
         ):
             yield token

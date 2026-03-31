@@ -52,6 +52,7 @@ class LLMClient:
             "temperature": temperature,
             "frequency_penalty": 0.3,
             "stream": True,
+            "stop": ["\n\n", "Note:", "Translation:"],
             "chat_template_kwargs": {"enable_thinking": False},
         }
 

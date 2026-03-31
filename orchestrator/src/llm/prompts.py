@@ -44,7 +44,12 @@ def build_translation_prompt(
     recent_segments: list[dict] | None = None,
     previous_chunk: str | None = None,
 ) -> list[dict]:
-    """Build the LLM prompt with sliding context window.
+    """Build the LLM prompt with conversation-turn context window.
+
+    Uses alternating user/assistant turns for recent segments instead of
+    appending raw Korean to the system prompt. This leverages the chat
+    format the model was trained on, making the task unambiguous and
+    preventing the model from confusing context with current input.
 
     Args:
         text: The Korean text to translate.
@@ -61,27 +66,17 @@ def build_translation_prompt(
     """
     system = _load_system_prompt(source_lang, target_lang)
 
-    # Add recent Korean context for continuity (no English — including
-    # prior translations creates copy targets that cause repetition loops)
+    messages: list[dict] = [{"role": "system", "content": system}]
+
+    # Build context as conversation turns — model sees user=Korean,
+    # assistant=English pairs, making the translation task unambiguous.
+    # This prevents the model from confusing context with input to translate.
     if recent_segments:
-        context_lines = []
         for seg in recent_segments[-settings.llm_context_window_segments:]:
-            context_lines.append(seg["korean"])
-        if context_lines:
-            system += (
-                "\n\nRecent source text for context:\n"
-                + "\n".join(context_lines)
-            )
+            if seg.get("english"):
+                messages.append({"role": "user", "content": seg["korean"]})
+                messages.append({"role": "assistant", "content": seg["english"]})
 
-    if previous_chunk:
-        user_content = (
-            f"[Previous chunk for context: {previous_chunk}]\n"
-            f"Translate ONLY the following text:\n{text}"
-        )
-    else:
-        user_content = text
+    messages.append({"role": "user", "content": text})
 
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_content},
-    ]
+    return messages

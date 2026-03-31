@@ -54,7 +54,8 @@ class TTSClient:
 
     def __init__(self):
         self._client: httpx.AsyncClient | None = None
-        self._on_audio: dict[str, list] = {}  # session_id -> callbacks
+        self._on_audio: dict[str, list] = {}  # session_id -> audio callbacks
+        self._on_sentence_done: dict[str, list] = {}  # session_id -> sentence-done callbacks
         self._session_queues: dict[str, asyncio.Queue[TTSQueueItem | None]] = {}
         self._session_consumers: dict[str, asyncio.Task] = {}
         self._semaphore: asyncio.Semaphore | None = None
@@ -63,6 +64,8 @@ class TTSClient:
         self._continuous_ws: dict[str, websockets.WebSocketClientProtocol] = {}
         self._continuous_readers: dict[str, asyncio.Task] = {}
         self._continuous_ready: dict[str, asyncio.Event] = {}
+        self._continuous_swapping: set[str] = set()  # sessions currently swapping models
+        self._continuous_pending: dict[str, list[tuple[str, str]]] = {}  # session_id -> [(text, lang)]
 
     async def initialize(self):
         self._client = httpx.AsyncClient(
@@ -94,6 +97,10 @@ class TTSClient:
             session_id, mode, speaker, instruct[:50] if instruct else None,
         )
 
+    def register_sentence_done_callback(self, session_id: str, callback):
+        """Register a callback fired when a TTS sentence finishes."""
+        self._on_sentence_done.setdefault(session_id, []).append(callback)
+
     def register_audio_callback(self, session_id: str, callback):
         """Register a callback and start a per-session consumer."""
         self._on_audio.setdefault(session_id, []).append(callback)
@@ -106,6 +113,7 @@ class TTSClient:
 
     def unregister_audio_callbacks(self, session_id: str):
         self._on_audio.pop(session_id, None)
+        self._on_sentence_done.pop(session_id, None)
         self._session_voice_configs.pop(session_id, None)
         asyncio.create_task(self._stop_session_consumer(session_id))
         if session_id in self._continuous_ws:
@@ -127,7 +135,7 @@ class TTSClient:
     # Map voice modes to required TTS model names
     _MODE_TO_MODEL = {"preset": "custom", "design": "design", "clone": "base"}
 
-    async def ensure_model(self, voice_mode: str, timeout: float = 60.0):
+    async def ensure_model(self, voice_mode: str, timeout: float = 120.0):
         """Ensure the TTS server has the right model loaded for the given voice mode.
 
         Checks the current model and triggers a swap if needed (~30s).
@@ -248,6 +256,20 @@ class TTSClient:
         )
         self._continuous_readers[session_id] = reader_task
 
+        # Keepalive ping prevents TTS server's continuation_timeout (120s)
+        # from closing the stream during idle periods
+        async def _keepalive():
+            try:
+                while session_id in self._continuous_ws:
+                    await asyncio.sleep(60)
+                    if session_id in self._continuous_ws:
+                        await ws.ping()
+            except Exception:
+                pass
+
+        self._continuous_keepalives = getattr(self, "_continuous_keepalives", {})
+        self._continuous_keepalives[session_id] = asyncio.create_task(_keepalive())
+
         try:
             await asyncio.wait_for(ready_event.wait(), timeout=90.0)
         except asyncio.TimeoutError:
@@ -262,7 +284,15 @@ class TTSClient:
 
         Lazily opens the stream on the first call — the first text becomes
         the initial_text for the continuous generator.
+        During model swaps, text is buffered and flushed when the stream reopens.
         """
+        # Buffer text during model swap
+        if session_id in self._continuous_swapping:
+            pending = self._continuous_pending.setdefault(session_id, [])
+            pending.append((text, language))
+            logger.info("Buffered text during swap for session %s (%d pending)", session_id, len(pending))
+            return
+
         if session_id not in self._continuous_ws:
             # First text chunk — open the continuous stream
             try:
@@ -281,8 +311,10 @@ class TTSClient:
 
         ws = self._continuous_ws.get(session_id)
         if ws is None:
+            logger.warning("[DIAG] send_text_chunk: ws is None for %s, text=%s", session_id, text[:30])
             return
         try:
+            logger.info("[DIAG] A send_text_chunk text=%s", text[:30])
             await ws.send(json.dumps({"type": "text", "text": text}))
         except Exception:
             # WebSocket died (server closed after continuation_timeout) — reconnect
@@ -306,6 +338,10 @@ class TTSClient:
         ws = self._continuous_ws.pop(session_id, None)
         reader = self._continuous_readers.pop(session_id, None)
         self._continuous_ready.pop(session_id, None)
+        keepalives = getattr(self, "_continuous_keepalives", {})
+        ka = keepalives.pop(session_id, None)
+        if ka:
+            ka.cancel()
         if ws:
             try:
                 await ws.send(json.dumps({"type": "end"}))
@@ -315,6 +351,20 @@ class TTSClient:
         if reader:
             reader.cancel()
         logger.info("Continuous TTS stream closed for session %s", session_id)
+
+    def mark_swap_start(self, session_id: str):
+        """Mark session as swapping — text chunks will be buffered."""
+        self._continuous_swapping.add(session_id)
+        logger.info("Swap started for session %s — buffering text", session_id)
+
+    async def mark_swap_done(self, session_id: str):
+        """Mark swap complete — flush buffered text to the (lazily reopened) stream."""
+        self._continuous_swapping.discard(session_id)
+        pending = self._continuous_pending.pop(session_id, [])
+        if pending:
+            logger.info("Swap done for session %s — flushing %d buffered texts", session_id, len(pending))
+            for text, lang in pending:
+                await self.send_text_chunk(session_id, text, lang)
 
     def has_continuous_stream(self, session_id: str) -> bool:
         """Check if continuous streaming is enabled and available for this session."""
@@ -327,9 +377,13 @@ class TTSClient:
     async def _continuous_audio_reader(self, session_id: str, ws):
         """Background task: read audio/control messages from TTS WebSocket."""
         segment_idx = 0
+        _first_audio_after_boundary = True
         try:
             async for message in ws:
                 if isinstance(message, bytes):
+                    if _first_audio_after_boundary:
+                        logger.info("[DIAG] B first_audio_received len=%d", len(message))
+                        _first_audio_after_boundary = False
                     # Binary = PCM audio chunk
                     callbacks = self._on_audio.get(session_id, [])
                     item = TTSQueueItem(
@@ -348,7 +402,10 @@ class TTSClient:
                             event.set()
                     elif msg_type == "segment_boundary":
                         segment_idx += 1
-                        logger.debug("Continuous TTS segment boundary for session %s", session_id)
+                        _first_audio_after_boundary = True
+                        logger.info("[DIAG] segment_boundary received, seg_idx=%d", segment_idx)
+                        for cb in self._on_sentence_done.get(session_id, []):
+                            await cb()
                     elif msg_type == "error":
                         logger.error(
                             "Continuous TTS error for session %s: %s",
@@ -361,6 +418,11 @@ class TTSClient:
             pass
         except Exception:
             logger.exception("Continuous TTS reader error for session %s", session_id)
+        finally:
+            # Clean up so send_text_chunk knows the stream is dead and reopens
+            self._continuous_ws.pop(session_id, None)
+            self._continuous_readers.pop(session_id, None)
+            self._continuous_ready.pop(session_id, None)
 
     def _make_silence(self, duration_ms: int, sample_rate: int = 48000) -> bytes:
         """Generate s16le silence of the given duration."""
@@ -408,6 +470,10 @@ class TTSClient:
                         callbacks = self._on_audio.get(item.session_id, [])
                         for cb in callbacks:
                             await cb(pause, item)
+
+                    # Signal sentence done (triggers silence mode in audio streams)
+                    for cb in self._on_sentence_done.get(item.session_id, []):
+                        await cb()
                 except Exception:
                     logger.exception("TTS synthesis failed for: %s...", item.text[:50])
 

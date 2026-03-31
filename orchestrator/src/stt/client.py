@@ -64,7 +64,7 @@ class STTClient:
     async def connect(self):
         """Connect to WhisperLive and send config."""
         url = settings.stt_ws_url
-        self._ws = await websockets.connect(url)
+        self._ws = await websockets.connect(url, ping_timeout=None)
 
         config = {
             "uid": self.session_id,

@@ -55,6 +55,7 @@ class ServeClientTensorRT(ServeClientBase):
         # "punctuation" = language-agnostic punctuation detection
         self.flush_mode = flush_mode
         self._detector = None
+        self._last_unflushed_text = ""  # track partial text for clip-flush
         if flush_mode in ("korean", "korean_sermon"):  # korean_sermon kept for backward compat
             import os
             from whisper_live.korean_endings import KoreanEndingDetector
@@ -270,6 +271,7 @@ class ServeClientTensorRT(ServeClientBase):
 
         # Send the unflushed portion as a partial
         unflushed = full_text[partial_offset:].strip()
+        self._last_unflushed_text = unflushed  # track for clip-flush
         if unflushed:
             segment = self.format_segment(
                 self.timestamp_offset,
@@ -333,6 +335,58 @@ class ServeClientTensorRT(ServeClientBase):
                 }))
             except Exception as e:
                 logging.error(f"[ERROR]: Sending partial segment: {e}")
+
+    def clip_audio_if_no_valid_segment(self):
+        """Override to flush pending partial text before clipping audio.
+
+        The base class silently advances timestamp_offset, discarding audio
+        that was backing the current partial transcription. In flush modes
+        (korean/punctuation), this causes the unflushed text to vanish without
+        ever reaching the translation pipeline.
+
+        Fix: send the accumulated partial as a completed segment before
+        clipping, so the text is preserved through the pipeline.
+        """
+        with self.lock:
+            if self.frames_np is None:
+                return
+            remaining = self.frames_np[int((self.timestamp_offset - self.frames_offset) * self.RATE):]
+            if remaining.shape[0] <= 25 * self.RATE:
+                return
+            clip_text = self._last_unflushed_text
+
+        # Flush the pending partial text as completed before clipping
+        if clip_text:
+            segment = self.format_segment(
+                self.timestamp_offset,
+                self.timestamp_offset + remaining.shape[0] / self.RATE,
+                clip_text,
+                completed=True,
+            )
+            segment["flush_type"] = "clip"
+            try:
+                self.websocket.send(json.dumps({
+                    "uid": self.client_uid,
+                    "segments": [segment],
+                }))
+            except Exception as e:
+                logging.error(f"[ERROR]: Sending clip-flushed segment: {e}")
+            logging.info(
+                f"[{self.client_uid}] Clip flush: {len(clip_text)} chars "
+                f"(buffer {remaining.shape[0] / self.RATE:.1f}s)"
+            )
+            self._last_unflushed_text = ""
+
+        # Now clip: advance timestamp to keep only last 5 seconds
+        with self.lock:
+            if self.frames_np is None:
+                return
+            duration = self.frames_np.shape[0] / self.RATE
+            self.timestamp_offset = self.frames_offset + duration - 5
+
+        # Reset detector state since the text backing was clipped
+        if self._detector:
+            self._detector.reset()
 
     def _internal_trim(self):
         """Trim already-processed audio after a sentence flush.

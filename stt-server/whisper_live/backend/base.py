@@ -224,6 +224,8 @@ class ServeClientBase(object):
         no valid segment for the last 30 seconds from whisper
         """
         with self.lock:
+            if self.frames_np is None:
+                return
             if self.frames_np[int((self.timestamp_offset - self.frames_offset)*self.RATE):].shape[0] > 25 * self.RATE:
                 duration = self.frames_np.shape[0] / self.RATE
                 self.timestamp_offset = self.frames_offset + duration - 5

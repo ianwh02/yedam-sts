@@ -141,7 +141,7 @@ class KoreanEndingDetector:
     min_phrase_chars: int = 15      # min chars since last flush for phrase flush
     min_sentence_chars: int = 6     # min chars since last flush for sentence flush
     stability_count: int = 2        # consecutive stable detections before flushing
-    max_no_flush_s: float = 25.0    # emergency fallback: force flush after this many seconds (Whisper hallucinates ~30s)
+    max_no_flush_s: float = 15.0    # emergency fallback: force flush after this many seconds (must be < 25s clip threshold)
     extra_flush_markers: set[str] = field(default_factory=set)  # domain-specific markers (e.g. 아멘, 할렐루야)
 
     # ── Internal state ──
@@ -407,7 +407,7 @@ class PunctuationFlushDetector:
     min_sentence_chars: int = 10     # min chars since last flush for sentence flush
     min_clause_chars: int = 30       # min chars for clause flush (comma/semicolon)
     stability_count: int = 4         # consecutive stable detections before flushing
-    max_no_flush_s: float = 25.0     # emergency fallback: force flush after this many seconds
+    max_no_flush_s: float = 15.0     # emergency fallback: force flush after this many seconds (must be < 25s clip threshold)
 
     # ── Internal state ──
     flushed_len: int = field(default=0, init=False)

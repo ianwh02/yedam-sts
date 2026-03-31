@@ -20,8 +20,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install pytest torch --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy xxhash
+          pip install pytest pytest-asyncio numpy xxhash scipy pydantic pydantic-settings
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
           # Install nano-qwen3tts-vllm in editable mode (no-deps to skip GPU packages)
           pip install --no-deps -e tts-server/nano-qwen3tts-vllm/
 

@@ -38,6 +38,15 @@ if [ -z "$GPU_TOTAL_MB" ]; then
 fi
 log "GPU total: ${GPU_TOTAL_MB} MB"
 
+# Detect GPU compute capability and set arch-specific TRT engine path
+GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+if [ -n "$GPU_ARCH" ]; then
+    ARCH_ENGINE_DIR="${TRT_ENGINE_DIR:-/models/trt_engines}/sm_${GPU_ARCH}"
+    export TRT_ENGINE_DIR="$ARCH_ENGINE_DIR"
+    mkdir -p "$ARCH_ENGINE_DIR"
+    log "TRT engine path: $ARCH_ENGINE_DIR (sm_${GPU_ARCH})"
+fi
+
 STT_BUDGET_FLAG=""
 if [ "${STT_BACKEND:-tensorrt}" = "tensorrt" ]; then
     STT_BUDGET_FLAG="--stt-backend trt"
@@ -126,7 +135,7 @@ if [ "${STT_BACKEND:-tensorrt}" = "tensorrt" ]; then
         --batch_max_size 8 \
         --batch_window_ms 25 \
         --beam_size 1 \
-        > /tmp/stt.log 2>&1 &
+        2>&1 | tee /tmp/stt.log &
 else
     python3 run_server.py \
         --port 9090 \
@@ -139,14 +148,14 @@ else
         --batch_max_size 8 \
         --batch_window_ms 25 \
         --beam_size 1 \
-        > /tmp/stt.log 2>&1 &
+        2>&1 | tee /tmp/stt.log &
 fi
 STT_PID=$!
 PIDS+=($STT_PID)
 
 cd /app/tts-server
 python3 server.py \
-    > /tmp/tts.log 2>&1 &
+    2>&1 | tee /tmp/tts.log &
 TTS_PID=$!
 PIDS+=($TTS_PID)
 
@@ -197,11 +206,12 @@ log "TTS weights loaded (${ELAPSED}s)."
 # ── Phase 2: Allocate TTS KV cache ──
 log "=== Phase 2: Allocating TTS KV cache ==="
 FREE_MB=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
-log "Free VRAM: ${FREE_MB} MB — letting TTS workers auto-detect available KV cache"
+log "Free VRAM: ${FREE_MB} MB"
 
-# budget_mb=0: workers use torch.cuda.mem_get_info() to determine actual free VRAM
-# This avoids overcommitting based on nvidia-smi (which includes fragmented/reserved memory)
-ALLOC_RESULT=$(curl -s --max-time 300 -X POST "http://localhost:7860/allocate_kv_cache?budget_mb=0" 2>&1) || true
+# budget_mb=0 triggers auto-detect in workers (torch.cuda.mem_get_info).
+# Override with TTS_KV_BUDGET_MB env var if needed.
+TTS_KV_BUDGET_MB="${TTS_KV_BUDGET_MB:-0}"
+ALLOC_RESULT=$(curl -s --max-time 300 -X POST "http://localhost:7860/allocate_kv_cache?budget_mb=${TTS_KV_BUDGET_MB}" 2>&1) || true
 log "TTS KV allocation: ${ALLOC_RESULT}"
 
 # Wait for TTS fully ready (warmup completes)
@@ -228,7 +238,7 @@ cd /app/orchestrator
 python3 -m uvicorn src.main:app \
     --host 0.0.0.0 \
     --port "${ORCHESTRATOR_PORT:-8080}" \
-    > /tmp/orchestrator.log 2>&1 &
+    2>&1 | tee /tmp/orchestrator.log &
 ORCH_PID=$!
 PIDS+=($ORCH_PID)
 

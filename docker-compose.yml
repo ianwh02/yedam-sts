@@ -124,6 +124,7 @@ services:
       - ${MPS_PIPE_DIR:-/tmp/nvidia-mps}:/tmp/nvidia-mps
       - ${REF_AUDIO_DIR:-./tts-server/ref_audio}:/app/ref_audio:ro
       - ./tts-server/models/Qwen3-TTS-12Hz-1.7B-CustomVoice:/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice:ro
+      - ./tts-server/models/Qwen3-TTS-12Hz-1.7B-VoiceDesign:/app/models/Qwen3-TTS-12Hz-1.7B-VoiceDesign:ro
     ports:
       - "${TTS_PORT:-7860}:7860"
     healthcheck:
@@ -155,7 +156,7 @@ services:
       - DEFAULT_SOURCE_LANG=${DEFAULT_SOURCE_LANG:-ko}
       - DEFAULT_TARGET_LANG=${DEFAULT_TARGET_LANG:-en}
       - DEFAULT_PROCESSOR=${DEFAULT_PROCESSOR:-translation}
-      - LLM_CONTEXT_WINDOW_SEGMENTS=${LLM_CONTEXT_WINDOW_SEGMENTS:-5}
+      - LLM_CONTEXT_WINDOW_SEGMENTS=${LLM_CONTEXT_WINDOW_SEGMENTS:-3}
       - STT_INITIAL_PROMPT_SEGMENTS=${STT_INITIAL_PROMPT_SEGMENTS:-3}
       - LLM_SYSTEM_PROMPT_PATH=${LLM_SYSTEM_PROMPT_PATH:-}
       - STT_INITIAL_PROMPT_VOCAB=${STT_INITIAL_PROMPT_VOCAB:-}

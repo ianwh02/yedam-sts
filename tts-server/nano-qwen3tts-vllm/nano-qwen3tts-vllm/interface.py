@@ -1551,12 +1551,15 @@ class Qwen3TTSInterface:
                         generate_icl_prompt_fn=generate_icl_prompt_fn,
                     )
                 elif mode == "design":
-                    input_text = f"<|im_start|>assistant\n{current_text}<|im_end|>\n<|im_start|>assistant\n"
-                    instruct_text = f"<|im_start|>user\n{instruct}<|im_end|>\n" if instruct else ""
-                    full_text = instruct_text + input_text
-                    input_ids = _tokenize_texts([full_text], self.processor, self.device)
+                    input_ids, instruct_ids_list, _, design_langs = prepare_custom_voice_prompt(
+                        text=current_text, language=language, speaker="",
+                        instruct=instruct,
+                        processor=self.processor, device=self.device,
+                    )
                     talker_input_embeds, trailing_text_hiddens, tts_pad_embed, _ = prepare_inputs(
-                        config=self.model_config, input_ids=input_ids, languages=[language],
+                        config=self.model_config, input_ids=input_ids,
+                        instruct_ids=instruct_ids_list,
+                        languages=design_langs, speakers=None,
                         non_streaming_mode=non_streaming_mode,
                         text_embedding=self.text_embedding, input_embedding=self.input_embedding,
                         text_projection=self.text_projection, device=self.device,

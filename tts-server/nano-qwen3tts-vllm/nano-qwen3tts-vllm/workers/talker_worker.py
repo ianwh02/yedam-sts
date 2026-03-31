@@ -169,7 +169,14 @@ def run_talker_worker(
                     push.send(payload)
                     step_count += 1
                     if step_count % 50 == 1:
-                        logger.info(f"[talker_worker] step#{step_count} batch_size={len(outputs_all)}")
+                        bm = talker_llm.scheduler.block_manager
+                        n_seqs = len(talker_llm.scheduler.request_id_to_seq)
+                        n_running = len(talker_llm.scheduler.running)
+                        logger.info(
+                            f"[talker_worker] step#{step_count} batch_size={len(outputs_all)} "
+                            f"free_blocks={len(bm.free_block_ids)}/{len(bm.blocks)} "
+                            f"seqs={n_seqs} running={n_running}"
+                        )
                 except Exception as e:
                     logger.exception(f"[talker_worker] step failed: {e}")
                     # Send empty result so main doesn't hang, but keep the worker alive.

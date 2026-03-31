@@ -160,7 +160,7 @@ class ModelRunner:
         # Reserve for CUDA graph capture (decode + prefill) that runs after KV alloc.
         graph_reserve = int(os.environ.get("TTS_GRAPH_RESERVE_MB", "256")) * 1024 * 1024
 
-        if budget_bytes is not None:
+        if budget_bytes is not None and budget_bytes > 0:
             # Explicit budget from coordinator — use it directly.
             raw_blocks = int(budget_bytes - graph_reserve) // block_bytes
             logger.info(

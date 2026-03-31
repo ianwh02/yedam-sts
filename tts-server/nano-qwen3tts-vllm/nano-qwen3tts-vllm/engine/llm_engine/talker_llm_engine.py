@@ -144,6 +144,13 @@ class TalkerLLMEngine(LLMEngine):
                 else:
                     seq.decode_input_embeds = inp_embeds
                 return
+            # Request not found — could mean clear_request already ran, or first add
+            if request_id is not None and keep_alive:
+                bm = self.scheduler.block_manager
+                logger.debug(
+                    f"[add_request] new seq request={request_id[:8]} "
+                    f"free_blocks={len(bm.free_block_ids)}/{len(bm.blocks)}"
+                )
             seq = Sequence([], input_embeds=inp_embeds, sampling_params=sp, request_id=request_id, keep_alive=keep_alive)
             if request_id is not None:
                 self.scheduler.request_id_to_seq[request_id] = seq

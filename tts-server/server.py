@@ -1706,6 +1706,8 @@ async def ws_continuous_synthesize(websocket: WebSocket, session_id: str):
                 emit = audio_f32
 
             chunk_index += 1
+            if chunk_index == 1:
+                logger.info("[DIAG] E tts_first_send_bytes len=%d", len(emit) * 2)
             out = np.clip(emit, -32768, 32767).astype(np.int16)
             await websocket.send_bytes(out.tobytes())
 

@@ -4,8 +4,8 @@ from fastapi import FastAPI
 
 from .api.admin import rest_router as admin_rest_router
 from .api.admin import ws_router as admin_ws_router
+from .api.audio_stream import router as audio_stream_router
 from .api.listener import router as listener_router
-from .audio.opus import OpusEncoder
 from .audio.preprocess import AudioPreprocessor
 from .config import settings
 from .pipeline.manager import PipelineManager
@@ -33,17 +33,12 @@ async def startup():
     await preprocessor.initialize()
     await tts_client.initialize()
 
-    # Optional Opus encoding (set TTS_OPUS_ENABLED=true to enable)
-    audio_encoder = None
-    if settings.tts_opus_enabled:
-        audio_encoder = OpusEncoder()
-        await audio_encoder.initialize()
-
     # Initialize pipeline manager with shared deps
+    # (Audio encoding is now handled per-endpoint: MP3 for HTTP listeners,
+    # raw PCM for admin WebSocket. Opus encoding is no longer used.)
     await pipeline_manager.initialize(
         preprocessor=preprocessor,
         tts_client=tts_client,
-        audio_encoder=audio_encoder,
     )
     app.state.pipeline_manager = pipeline_manager
 
@@ -68,5 +63,7 @@ async def health():
 app.include_router(admin_rest_router, prefix="/api", tags=["admin"])
 # WebSocket (admin audio input)
 app.include_router(admin_ws_router, prefix="/ws/admin", tags=["admin-ws"])
-# WebSocket (listener output: text + TTS audio)
+# WebSocket (listener output: text transcripts only)
 app.include_router(listener_router, prefix="/ws/listen", tags=["listener-ws"])
+# HTTP (listener audio stream: MP3 via <audio> element)
+app.include_router(audio_stream_router, prefix="/api/listen", tags=["listener-audio"])

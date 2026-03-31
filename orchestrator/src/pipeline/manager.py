@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
 import httpx
 
-from ..audio.opus import OpusEncoder
 from ..audio.preprocess import AudioPreprocessor
 from ..config import settings
 from ..processors.passthrough import PassthroughProcessor
@@ -33,22 +33,20 @@ class PipelineManager:
         self.sessions: dict[str, TranslationSession] = {}
         self._orchestrators: dict[str, SessionOrchestrator] = {}
         self._http_client: httpx.AsyncClient | None = None
+        self._watchdog_task: asyncio.Task | None = None
 
         # Shared components (set via initialize)
         self._preprocessor: AudioPreprocessor | None = None
         self._tts_client: TTSClient | None = None
-        self._audio_encoder: OpusEncoder | None = None
         self._processors: dict[str, TranslationProcessor | PassthroughProcessor] = {}
 
     async def initialize(
         self,
         preprocessor: AudioPreprocessor,
         tts_client: TTSClient,
-        audio_encoder: OpusEncoder | None = None,
     ):
         self._preprocessor = preprocessor
         self._tts_client = tts_client
-        self._audio_encoder = audio_encoder
         self._http_client = httpx.AsyncClient(timeout=10.0)
 
         # Initialize processors
@@ -60,9 +58,25 @@ class PipelineManager:
         await passthrough.initialize()
         self._processors["passthrough"] = passthrough
 
+        self._watchdog_task = asyncio.create_task(self._session_watchdog())
         logger.info("PipelineManager initialized")
 
+    async def _session_watchdog(self):
+        """Periodically check for sessions that exceeded max duration."""
+        max_duration = settings.max_session_duration_seconds
+        while True:
+            await asyncio.sleep(60)  # check every minute
+            for sid, session in list(self.sessions.items()):
+                if session.duration_seconds >= max_duration:
+                    logger.warning(
+                        "Session %s exceeded max duration (%.0fs >= %ds), auto-stopping",
+                        sid, session.duration_seconds, max_duration,
+                    )
+                    await self.stop_session(sid)
+
     async def shutdown(self):
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
         for session_id in list(self.sessions):
             await self.stop_session(session_id)
 
@@ -141,9 +155,21 @@ class PipelineManager:
                 await callbacks.on_processor_final(text, segment_index)
 
         async def _broadcast_tts_audio(pcm_bytes: bytes, segment_index: int, sentence_index: int):
-            await broadcast.broadcast_binary(pcm_bytes)
+            # Opus-encode once, distribute to all HTTP listener streams
+            await broadcast.broadcast_audio(pcm_bytes)
+
+            # Raw PCM to admin WebSocket for monitoring / translation devices
+            if session.admin_ws:
+                try:
+                    await session.admin_ws.send_bytes(pcm_bytes)
+                except Exception:
+                    pass  # admin disconnected — non-fatal
+
             if callbacks and callbacks.on_tts_audio:
                 await callbacks.on_tts_audio(pcm_bytes, segment_index, sentence_index)
+
+        async def _broadcast_tts_sentence_done():
+            await broadcast.signal_silence()
 
         broadcast_callbacks = SessionCallbacks(
             on_stt_partial=_broadcast_stt_partial,
@@ -151,6 +177,7 @@ class PipelineManager:
             on_processor_partial=_broadcast_translation_partial,
             on_processor_final=_broadcast_translation_final,
             on_tts_audio=_broadcast_tts_audio,
+            on_tts_sentence_done=_broadcast_tts_sentence_done,
         )
 
         # Ensure the TTS server has the right model loaded BEFORE starting the
@@ -196,7 +223,6 @@ class PipelineManager:
             processor=processor,
             tts_client=self._tts_client,
             callbacks=broadcast_callbacks,
-            audio_encoder=self._audio_encoder,
         )
         await orchestrator.start()
         self._orchestrators[session_id] = orchestrator
@@ -212,7 +238,7 @@ class PipelineManager:
         return session
 
     async def stop_session(self, session_id: str) -> bool:
-        # Stop orchestrator first
+        # Stop orchestrator first (cancels tasks, disconnects STT, closes TTS)
         orchestrator = self._orchestrators.pop(session_id, None)
         if orchestrator:
             await orchestrator.stop()
@@ -222,6 +248,19 @@ class PipelineManager:
             return False
         session.cancel()
         session.is_active = False
+
+        # Close all listener connections and signal audio stream consumers.
+        # Done AFTER orchestrator.stop() so no new audio is produced during close.
+        await session.broadcast.close_all()
+
+        # Close admin WebSocket if still connected
+        if session.admin_ws:
+            try:
+                await session.admin_ws.close(code=1000, reason="Session ended")
+            except Exception:
+                pass
+            session.admin_ws = None
+
         logger.info(
             "Session %s stopped (duration=%.0fs, segments=%d)",
             session_id,
@@ -242,28 +281,39 @@ class PipelineManager:
         session.speaker = getattr(tts_config, "speaker", None)
         session.voice_prompt = getattr(tts_config, "effective_voice_prompt", None) or getattr(tts_config, "voice_prompt", None)
 
-        # Ensure the TTS server has the right model loaded
-        if session.voice_mode:
-            await self._tts_client.ensure_model(session.voice_mode)
+        # Mark swap start — text chunks will be buffered during the swap
+        self._tts_client.mark_swap_start(session_id)
 
-            instruct = session.voice_prompt
-            self._tts_client.set_session_voice_config(
-                session_id=session_id,
-                mode=session.voice_mode,
-                speaker=session.speaker,
-                instruct=instruct,
-            )
+        try:
+            # Close continuous stream before model swap (swap resets _mp_holder,
+            # which would crash the existing generator on next text chunk)
+            await self._tts_client.close_continuous_stream(session_id)
 
-        # For clone mode, also re-init voice clone prompt on TTS server
-        if session.voice_mode == "clone" and session.ref_audio_url:
-            await self._tts_client.init_session_voice(
-                session_id=session_id,
-                ref_audio_url=session.ref_audio_url,
-                ref_text=session.ref_text,
-                timeout=settings.tts_voice_clone_init_timeout,
-            )
+            # Ensure the TTS server has the right model loaded
+            if session.voice_mode:
+                await self._tts_client.ensure_model(session.voice_mode)
 
-        logger.info("Voice config updated for session %s (mode=%s)", session_id, session.voice_mode)
+                instruct = session.voice_prompt
+                self._tts_client.set_session_voice_config(
+                    session_id=session_id,
+                    mode=session.voice_mode,
+                    speaker=session.speaker,
+                    instruct=instruct,
+                )
+
+            # For clone mode, also re-init voice clone prompt on TTS server
+            if session.voice_mode == "clone" and session.ref_audio_url:
+                await self._tts_client.init_session_voice(
+                    session_id=session_id,
+                    ref_audio_url=session.ref_audio_url,
+                    ref_text=session.ref_text,
+                    timeout=settings.tts_voice_clone_init_timeout,
+                )
+
+            logger.info("Voice config updated for session %s (mode=%s)", session_id, session.voice_mode)
+        finally:
+            # Flush buffered text — stream will lazily reopen on first chunk
+            await self._tts_client.mark_swap_done(session_id)
 
     def get_session(self, session_id: str) -> TranslationSession | None:
         return self.sessions.get(session_id)

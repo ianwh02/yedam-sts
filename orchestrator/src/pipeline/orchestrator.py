@@ -4,7 +4,6 @@ import asyncio
 import logging
 import re
 
-from ..audio.opus import OpusEncoder
 from ..audio.preprocess import AudioPreprocessor
 from ..config import settings
 from ..processors.base import BaseProcessor
@@ -104,14 +103,12 @@ class SessionOrchestrator:
         processor: BaseProcessor,
         tts_client: TTSClient,
         callbacks: SessionCallbacks | None = None,
-        audio_encoder: OpusEncoder | None = None,
     ):
         self._session = session
         self._preprocessor = preprocessor
         self._processor = processor
         self._tts_client = tts_client
         self._callbacks = callbacks or SessionCallbacks()
-        self._audio_encoder = audio_encoder
         self._stt: STTClient | None = None
         self._tasks: set[asyncio.Task] = set()
         self._previous_chunk: str | None = None  # last flushed Korean text for LLM context
@@ -132,6 +129,9 @@ class SessionOrchestrator:
         # Register TTS audio callback for this session
         self._tts_client.register_audio_callback(
             session.session_id, self._on_tts_audio
+        )
+        self._tts_client.register_sentence_done_callback(
+            session.session_id, self._on_tts_sentence_done
         )
 
         logger.info("SessionOrchestrator started for %s", session.session_id)
@@ -203,6 +203,7 @@ class SessionOrchestrator:
                 result = detector.feed(token)
                 if result:
                     sentence, sentence_idx = result
+                    logger.info("[DIAG] sentence_boundary detected: %s", sentence[:30])
                     if use_continuous:
                         await self._tts_client.send_text_chunk(session.session_id, sentence, language=session.target_lang)
                     else:
@@ -225,6 +226,7 @@ class SessionOrchestrator:
         result = detector.flush()
         if result:
             sentence, sentence_idx = result
+            logger.info("[DIAG] sentence_flush: %s", sentence[:30])
             if use_continuous:
                 await self._tts_client.send_text_chunk(session.session_id, sentence, language=session.target_lang)
             else:
@@ -244,12 +246,16 @@ class SessionOrchestrator:
             await self._callbacks.on_processor_final(translation, segment.index)
 
     async def _on_tts_audio(self, pcm_bytes: bytes, item: TTSQueueItem):
-        """Forward TTS audio to consumer callback (Opus-encoded if enabled)."""
+        """Forward raw PCM to consumer callback."""
         if self._callbacks.on_tts_audio:
-            data = self._audio_encoder.encode(pcm_bytes) if self._audio_encoder else pcm_bytes
             await self._callbacks.on_tts_audio(
-                data, item.segment_index, item.sentence_index
+                pcm_bytes, item.segment_index, item.sentence_index
             )
+
+    async def _on_tts_sentence_done(self):
+        """Signal that a TTS sentence is fully sent — audio streams enter silence mode."""
+        if self._callbacks.on_tts_sentence_done:
+            await self._callbacks.on_tts_sentence_done()
 
     async def stop(self):
         """Shutdown: cancel tasks, disconnect STT, unregister TTS."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -7,6 +8,8 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from pydantic import BaseModel
 
 from ..pipeline.manager import PipelineManager, SessionLimitError
+
+PING_INTERVAL = 30  # seconds — keeps connection alive through reverse proxies
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +114,24 @@ async def admin_websocket(websocket: WebSocket, session_id: str):
         await websocket.close(code=4004, reason="Session orchestrator not found")
         return
 
+    if session.admin_ws is not None:
+        await websocket.close(code=4009, reason="Another admin is already streaming audio")
+        return
+
     await websocket.accept()
     session.admin_ws = websocket
     logger.info("Admin connected to session %s", session_id)
+
+    async def _ping_loop():
+        """Send periodic pings to keep the connection alive through proxies."""
+        try:
+            while True:
+                await asyncio.sleep(PING_INTERVAL)
+                await websocket.send_json({"type": "ping"})
+        except Exception:
+            pass
+
+    ping_task = asyncio.create_task(_ping_loop())
 
     try:
         while True:
@@ -137,4 +155,5 @@ async def admin_websocket(websocket: WebSocket, session_id: str):
     except Exception:
         logger.exception("Error in admin WebSocket for session %s", session_id)
     finally:
+        ping_task.cancel()
         session.admin_ws = None

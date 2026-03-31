@@ -31,3 +31,6 @@ class SessionCallbacks:
 
     on_tts_audio: Callable[[bytes, int, int], Awaitable[None]] | None = None
     """Raw PCM audio from TTS. Args: pcm_bytes, segment_index, sentence_index"""
+
+    on_tts_sentence_done: Callable[[], Awaitable[None]] | None = None
+    """Fired after a TTS sentence's audio (+ inter-segment pause) is fully sent."""

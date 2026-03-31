@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -10,25 +11,25 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+PING_INTERVAL = 30  # seconds — keeps connection alive through reverse proxies
+
 
 @router.websocket("/{session_id}")
 async def listener_websocket(websocket: WebSocket, session_id: str):
-    """Listener WebSocket: receives translation text + TTS audio.
+    """Listener WebSocket: receives translation text (transcripts only).
+
+    Audio is delivered separately via HTTP streaming at
+    GET /api/listen/{session_id}/audio (MP3, <audio> element compatible).
 
     Protocol:
       Server → Client (text frames, JSON):
-        { type: "korean_partial", text: "..." }
-        { type: "korean_final", text: "...", segment_id: N }
-        { type: "translation_partial", text: "...", segment_id: N }
-        { type: "translation_final", text: "...", segment_id: N }
-        { type: "session_started" }
+        { type: "stt_partial", text: "..." }
+        { type: "stt_final", text: "...", segment_index: N }
+        { type: "translation_partial", token: "...", segment_index: N }
+        { type: "translation_final", text: "...", segment_index: N }
+        { type: "session_started", audio_url: "/api/listen/{id}/audio" }
         { type: "session_ended" }
-
-      Server → Client (binary frames):
-        Opus-encoded TTS audio bytes
-
-      Mute/unmute is handled client-side — all listeners receive
-      the same audio stream regardless.
+        { type: "ping" }
     """
     manager: PipelineManager = websocket.app.state.pipeline_manager
     session = manager.get_session(session_id)
@@ -46,6 +47,7 @@ async def listener_websocket(websocket: WebSocket, session_id: str):
         "source_lang": session.source_lang,
         "target_lang": session.target_lang,
         "listener_count": session.broadcast.count,
+        "audio_url": f"/api/listen/{session_id}/audio",
     })
 
     logger.info(
@@ -54,21 +56,29 @@ async def listener_websocket(websocket: WebSocket, session_id: str):
         session.broadcast.count,
     )
 
+    async def _ping_loop():
+        """Send periodic pings to keep the connection alive through proxies."""
+        try:
+            while True:
+                await asyncio.sleep(PING_INTERVAL)
+                await websocket.send_json({"type": "ping"})
+        except Exception:
+            pass  # Connection closed — ping loop exits
+
+    ping_task = asyncio.create_task(_ping_loop())
+
     try:
-        # Keep connection alive — listeners only receive, never send
-        # (except for keepalive pings handled by the WebSocket layer)
         while True:
             data = await websocket.receive()
-            # Listeners don't send meaningful data, but we need to
-            # keep the receive loop running to detect disconnects
             if "text" in data and data["text"]:
-                pass  # Ignore any client messages
+                pass  # Ignore client messages (pong, etc.)
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
     except Exception:
         logger.exception("Error in listener WebSocket for session %s", session_id)
     finally:
+        ping_task.cancel()
         await session.broadcast.remove(websocket)
         logger.info(
             "Listener left session %s (remaining: %d)",

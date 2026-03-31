@@ -3,7 +3,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for opuslib and rnnoise
+# Install system dependencies for opuslib (Opus encoding)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopus0 \
     libopus-dev \

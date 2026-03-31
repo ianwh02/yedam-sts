@@ -31,6 +31,7 @@ class Settings(BaseSettings):
 
     # Session limits
     max_concurrent_sessions: int = 5
+    max_session_duration_seconds: int = 3 * 60 * 60  # auto-stop after 3 hours
 
     # TTS
     tts_default_voice_en: str = "ryan"

@@ -115,7 +115,7 @@ async def test_continuous():
         while True:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=60)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 elapsed = time.time() - session_start
                 print(f"[{elapsed:.1f}s] Timeout")
                 if segment_audio:
@@ -153,7 +153,7 @@ async def test_continuous():
                                 msg = await asyncio.wait_for(ws.recv(), timeout=3)
                                 if isinstance(msg, bytes):
                                     all_audio.extend(msg)
-                        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+                        except (TimeoutError, websockets.exceptions.ConnectionClosed):
                             pass
                         break
 

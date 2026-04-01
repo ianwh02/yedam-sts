@@ -98,7 +98,7 @@ async def run_test(host: str, port: int, num_segments: int, session_id: str):
         # Wait for "ready"
         ready = json.loads(await ws.recv())
         assert ready["type"] == "ready", f"Expected 'ready', got {ready}"
-        print(f"  Server ready\n")
+        print("  Server ready\n")
 
         # Track stats
         segment_times = []
@@ -147,7 +147,7 @@ async def run_test(host: str, port: int, num_segments: int, session_id: str):
                     print(f"\n  ERROR from server: {data.get('detail', data)}")
                     break
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             elapsed = time.monotonic() - segment_start
             print(f"\n  TIMEOUT at segment #{current_segment} after {elapsed:.1f}s!")
         except websockets.ConnectionClosed as e:
@@ -169,14 +169,14 @@ async def run_test(host: str, port: int, num_segments: int, session_id: str):
 
             slow = [(i + 1, t) for i, t in enumerate(segment_times) if t > 10.0]
             if slow:
-                print(f"\n  SLOW segments (>10s):")
+                print("\n  SLOW segments (>10s):")
                 for seg, t in slow:
                     print(f"    Segment #{seg}: {t:.2f}s")
 
         if len(segment_times) < num_segments:
             print(f"\n  *** STALL/ERROR at segment #{current_segment} ***")
         else:
-            print(f"\n  All segments completed successfully!")
+            print("\n  All segments completed successfully!")
         print(f"{'=' * 60}")
 
 

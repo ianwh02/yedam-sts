@@ -16,10 +16,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import os
 import re
-import struct
 import time
 import wave
 from dataclasses import dataclass, field
@@ -353,7 +351,7 @@ def print_results(cr: ConcurrencyResult):
             )
 
     if failed:
-        print(f"\n  FAILURES:")
+        print("\n  FAILURES:")
         for r in failed:
             print(f"    {r.text[:50]}: {r.error}")
 
@@ -428,7 +426,7 @@ async def main():
 
     # Summary table
     print(f"\n{'='*70}")
-    print(f"  SUMMARY")
+    print("  SUMMARY")
     print(f"{'='*70}")
     print(f"  {'Mode':<20} {'Conc':>4} {'Avg Time':>9} {'Avg TTFB':>9} {'Avg RTF':>8} {'P95':>8}")
     print(f"  {'-'*20} {'-'*4} {'-'*9} {'-'*9} {'-'*8} {'-'*8}")
@@ -442,7 +440,7 @@ async def main():
             )
 
     # Scaling analysis
-    print(f"\n  Scaling factor (vs 1 concurrent):")
+    print("\n  Scaling factor (vs 1 concurrent):")
     baseline_streaming = next((cr for cr in all_results if cr.streaming and cr.concurrency == 1), None)
     baseline_non_streaming = next((cr for cr in all_results if not cr.streaming and cr.concurrency == 1), None)
 

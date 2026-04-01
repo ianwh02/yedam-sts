@@ -28,15 +28,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
-import struct
 import subprocess
 import sys
 import time
 import wave
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 import numpy as np
 
@@ -125,7 +122,7 @@ def find_test_audio() -> tuple[str, str]:
 # ============================================================
 
 
-def get_vram_mb() -> Optional[dict]:
+def get_vram_mb() -> dict | None:
     """Query nvidia-smi for current VRAM usage via docker exec."""
     for container in ("yedam-stt", "yedam-stt-trt"):
         try:
@@ -174,7 +171,7 @@ class STTResult:
     audio_duration_s: float = 0.0
     text: str = ""
     n_segments: int = 0
-    error: Optional[str] = None
+    error: str | None = None
 
 
 async def benchmark_single_session(
@@ -242,7 +239,6 @@ async def benchmark_single_session(
             # Wait up to (audio_duration + 10s) for transcription to complete
             deadline = t_start + audio_duration + 10.0
             silence_timeout = 3.0  # stop after 3s of no new segments
-            t_last_recv = time.monotonic()
 
             while time.monotonic() < deadline:
                 remaining = min(deadline - time.monotonic(), silence_timeout)
@@ -257,10 +253,9 @@ async def benchmark_single_session(
                         if t_first_segment is None:
                             t_first_segment = now
                         t_last_segment = now
-                        t_last_recv = now
                         n_segments = len(segments)
                         all_text = [s.get("text", "") for s in segments]
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # No more segments coming
                     break
 
@@ -289,7 +284,7 @@ async def benchmark_concurrent(
     concurrency: int,
     language: str = "en",
     burst: bool = False,
-) -> List[STTResult]:
+) -> list[STTResult]:
     """Run multiple concurrent STT sessions."""
     tasks = [
         benchmark_single_session(
@@ -307,11 +302,11 @@ async def benchmark_concurrent(
 
 
 def print_results(
-    results: List[STTResult],
+    results: list[STTResult],
     concurrency: int,
     iteration: int,
-    vram_before: Optional[dict],
-    vram_during: Optional[dict],
+    vram_before: dict | None,
+    vram_during: dict | None,
 ):
     """Print benchmark results for one run."""
     successful = [r for r in results if r.error is None and r.ttft_ms > 0]
@@ -374,7 +369,7 @@ def print_results(
             print(f"        ({len(no_output)} connected but got no transcription — likely server full or timeout)")
 
 
-def print_summary(all_results: dict[int, List[List[STTResult]]]):
+def print_summary(all_results: dict[int, list[list[STTResult]]]):
     """Print final summary table across all concurrency levels."""
     print("\n" + "=" * 80)
     print("SUMMARY")
@@ -459,7 +454,7 @@ async def main():
                 print(f"  Warmup {i+1}: TTFT={r.ttft_ms:.0f}ms, latency={r.full_latency_ms:.0f}ms")
 
     # Benchmark
-    all_results: dict[int, List[List[STTResult]]] = {}
+    all_results: dict[int, list[list[STTResult]]] = {}
 
     for ci, conc in enumerate(args.concurrency):
         # Pause between concurrency levels to let server sessions clean up

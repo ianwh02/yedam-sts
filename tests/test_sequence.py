@@ -1,7 +1,5 @@
 """Tests for Sequence and SequenceStatus (Phase 0.1)."""
 import torch
-import pytest
-
 from nano_qwen3tts_vllm.engine.sequence import Sequence, SequenceStatus
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import WebSocket
 
@@ -66,6 +67,8 @@ class BroadcastHub:
 
     async def broadcast_audio(self, pcm_bytes: bytes):
         """Encode PCM to Opus once, distribute frames to all queue subscribers."""
+        self._last_audio_t = time.monotonic()
+
         # Encode once (shared encoder)
         opus_frames = self._opus_encoder.feed_pcm(pcm_bytes)
 
@@ -80,7 +83,23 @@ class BroadcastHub:
 
     async def signal_silence(self):
         """Tell all audio stream consumers to enter silence mode."""
+        now = time.monotonic()
+        gap = now - getattr(self, "_last_audio_t", now)
+        logger.info("[LATENCY] signal_silence: gap_since_last_audio=%.3fs", gap)
+
+        # Flush any residual PCM in the encoder (prevents stale audio mixing
+        # into the next sentence's first frame)
+        residual_frames = self._opus_encoder.flush()
+
         async with self._lock:
+            # Send any residual audio frames first
+            for frame in residual_frames:
+                for q in self._audio_queues:
+                    try:
+                        q.put_nowait(frame)
+                    except asyncio.QueueFull:
+                        pass
+
             for q in self._audio_queues:
                 try:
                     q.put_nowait(SILENCE_SENTINEL)

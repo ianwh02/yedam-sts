@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,24 +20,26 @@ MAX_AUDIO_QUEUE = 500
 # One Opus frame = 20ms at 48kHz
 FRAME_DURATION_S = 0.02
 
+# iOS kills audio sessions after ~10-30s of no audio output (varies by
+# version). Modal's proxy may also timeout idle HTTP connections.
+# Send one silence frame every 8s to cover both. Accumulation: 20ms per
+# 8s = 0.15s per minute of silence — negligible.
+IOS_KEEPALIVE_S = 8.0
+
 
 async def _audio_generator(
     queue: asyncio.Queue,
     silence_frame: bytes,
 ):
-    """OGG/Opus stream — audio delivered immediately, silence for keepalive.
+    """OGG/Opus stream — audio delivered immediately, minimal silence.
 
-    Audio frames are yielded as fast as they arrive (no pacing). TTS
-    generating faster than real-time is a feature, not a bug — it means
-    lower TTFA. The browser buffers excess and plays at 1x. The buffer
-    self-corrects during natural speech pauses.
+    Audio frames are yielded as fast as they arrive. Between sentences,
+    nothing is sent — the browser stalls silently and resumes instantly
+    when new audio arrives (zero accumulated delay).
 
-    When SILENCE_SENTINEL arrives:
-    - If more audio is already queued (TTS behind): skip silence,
-      play sentences back-to-back.
-    - If queue is empty (TTS idle): enter silence mode for keepalive.
-      Silence is paced at real-time rate (monotonic clock) to prevent
-      the browser buffer from growing during idle periods.
+    After 25s of no audio, one silence frame is sent to prevent iOS
+    from killing the audio session on lock screen. This adds only 20ms
+    of buffer per 25 seconds — negligible accumulation.
 
     None sentinel = session ended, stop generator.
     """
@@ -47,62 +48,20 @@ async def _audio_generator(
 
     try:
         while True:
-            frame = await queue.get()
+            try:
+                frame = await asyncio.wait_for(
+                    queue.get(), timeout=IOS_KEEPALIVE_S,
+                )
+            except TimeoutError:
+                # No audio for 25s — send one keepalive frame for iOS
+                yield writer.wrap_frame(silence_frame)
+                continue
 
             if frame is None:
                 return
-
             if frame is SILENCE_SENTINEL:
-                # Check if more audio is already queued (TTS behind)
-                try:
-                    next_frame = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    next_frame = None
+                continue  # consume sentinel, send nothing
 
-                if next_frame is None and next_frame is not None:
-                    # Unreachable, but keeps the pattern clear
-                    pass
-                elif next_frame is not None and next_frame is not SILENCE_SENTINEL:
-                    # Audio waiting — skip silence, play back-to-back
-                    yield writer.wrap_frame(next_frame)
-                    continue
-                elif next_frame is None:
-                    # Queue truly empty — enter silence mode
-                    pass
-                else:
-                    # Another SILENCE_SENTINEL — enter silence mode
-                    pass
-
-                # --- Silence mode: paced at real-time rate ---
-                pacer = time.monotonic()
-                while True:
-                    pacer += FRAME_DURATION_S
-                    yield writer.wrap_frame(silence_frame)
-
-                    sleep_for = pacer - time.monotonic()
-                    if sleep_for > 0:
-                        try:
-                            frame = await asyncio.wait_for(
-                                queue.get(), timeout=sleep_for,
-                            )
-                        except asyncio.TimeoutError:
-                            continue
-                    else:
-                        try:
-                            frame = queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            continue
-
-                    if frame is None:
-                        return
-                    if frame is SILENCE_SENTINEL:
-                        continue
-                    yield writer.wrap_frame(frame)
-                    break  # got real audio — exit silence mode
-
-                continue
-
-            # --- Audio mode: yield immediately (no pacing) ---
             yield writer.wrap_frame(frame)
 
     except asyncio.CancelledError:
@@ -114,7 +73,7 @@ async def listen_audio_stream(session_id: str, request: Request):
     """HTTP audio stream for listeners.
 
     Returns a chunked OGG/Opus stream playable by an <audio> element.
-    Continuous silence padding keeps the stream alive during lock screen.
+    Sparse silence keepalive keeps the stream alive during lock screen.
 
     Opus encoding is shared (one encoder per session in BroadcastHub).
     This endpoint only does cheap OGG page wrapping per connection.

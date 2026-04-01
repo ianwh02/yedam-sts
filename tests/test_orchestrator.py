@@ -4,7 +4,6 @@ Tests session state, sentence boundary detection, prompt building,
 broadcast hub, and processor logic. No running services required.
 """
 
-import asyncio
 import json
 import sys
 from pathlib import Path
@@ -39,7 +38,6 @@ with patch.dict(sys.modules, {}):
     pass
 
 # We need to patch at the module level
-import importlib
 
 # Create a config module mock
 _config_mod = MagicMock()
@@ -72,10 +70,10 @@ try:
     sys.modules["src.config"] = src_config
 
     # Now do the imports
-    from src.pipeline.session import TranscriptSegment, TranslationSession
+    from src.llm.prompts import _DEFAULT_SYSTEM_PROMPT_TEMPLATE, _LANG_NAMES, build_translation_prompt
     from src.pipeline.broadcast import BroadcastHub
     from src.pipeline.orchestrator import SentenceBoundaryDetector
-    from src.llm.prompts import _DEFAULT_SYSTEM_PROMPT_TEMPLATE, _LANG_NAMES, build_translation_prompt
+    from src.pipeline.session import TranscriptSegment, TranslationSession
     from src.processors.passthrough import PassthroughProcessor
 
     HAS_ORCHESTRATOR = True

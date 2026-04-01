@@ -1,0 +1,20 @@
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = [
+    "E501",   # line length — not enforcing yet
+]
+
+[lint.per-file-ignores]
+# Modified upstream — minimize lint changes
+"tts-server/nano-qwen3tts-vllm/**" = ["ALL"]
+# Forked upstream — minimize lint changes
+"stt-server/whisper_live/**" = ["ALL"]
+# Deploy scripts
+"deploy/**" = ["ALL"]
+# Tests use module mocking that requires imports after sys.modules manipulation
+"tests/**" = ["E402"]
+# Config import must come after regex constant definition
+"orchestrator/src/llm/client.py" = ["E402"]

@@ -174,7 +174,7 @@ async def profile_stt_latency(n_runs: int = 3) -> list[LatencyResult]:
                                 first_text_time = time.perf_counter()
                             if seg.get("completed", False):
                                 break
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         break
 
                 if first_text_time is not None:
@@ -593,7 +593,7 @@ async def profile_individual_services():
         async with websockets.connect(STT_WS_URL) as ws:
             config = {"uid": "vram-test", "language": "ko", "task": "transcribe", "model": "large-v3", "use_vad": True}
             await ws.send(json.dumps(config))
-            response = await asyncio.wait_for(ws.recv(), timeout=10.0)
+            await asyncio.wait_for(ws.recv(), timeout=10.0)
             audio = generate_speech_audio(duration_s=2.0)
             await ws.send(audio)
             await asyncio.sleep(2.0)
@@ -605,7 +605,7 @@ async def profile_individual_services():
 
 async def profile_concurrent_sessions(n_sessions: int) -> dict:
     """Create N concurrent sessions and measure VRAM impact."""
-    print(f"\n" + "=" * 60)
+    print("\n" + "=" * 60)
     print(f"  {n_sessions} Concurrent Session(s) — VRAM")
     print("=" * 60)
 

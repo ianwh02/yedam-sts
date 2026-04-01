@@ -5,7 +5,10 @@ Prerequisites:
      curl -X POST http://localhost:7860/swap_model -H "Content-Type: application/json" -d '{"model": "design"}'
   2. No init_voice needed for design mode — just send text
 """
-import asyncio, json, sys, wave
+import asyncio
+import json
+import sys
+import wave
 
 try:
     import websockets
@@ -46,8 +49,8 @@ async def run():
             while True:
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                except asyncio.TimeoutError:
-                    print(f"  Timeout waiting for audio")
+                except TimeoutError:
+                    print("  Timeout waiting for audio")
                     break
                 if isinstance(msg, bytes):
                     seg_audio += msg

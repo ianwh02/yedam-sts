@@ -10,7 +10,6 @@ Usage:
 """
 
 import argparse
-import struct
 import sys
 import time
 import wave
@@ -59,7 +58,6 @@ def test_sentence(url: str, text: str, speaker: str, language: str = "en") -> di
 
     raw_pcm = resp.content
     sample_rate = int(resp.headers.get("x-sample-rate", "48000"))
-    steps = int(resp.headers.get("x-generation-time-ms", "0"))  # fallback
     audio_dur_ms = int(resp.headers.get("x-audio-duration-ms", "0"))
     rtf = resp.headers.get("x-rtf", "?")
     gen_time_ms = int(resp.headers.get("x-generation-time-ms", "0"))

@@ -38,6 +38,7 @@ def clean_ref_audio(
     target_sr = 24000
     if sr != target_sr:
         from math import gcd
+
         from scipy.signal import resample_poly
         up = target_sr // gcd(target_sr, sr)
         down = sr // gcd(target_sr, sr)
@@ -74,8 +75,8 @@ def clean_ref_audio(
             gated_frames += 1
 
     # De-esser: compress energy in 4-8kHz sibilant range
+    from scipy.fft import irfft, rfft
     from scipy.signal import butter, sosfilt
-    from scipy.fft import rfft, irfft
 
     frame_len_deess = int(sr * 0.02)  # 20ms frames
     deess_count = 0
@@ -110,7 +111,7 @@ def clean_ref_audio(
     print(f"  Trimmed:  {trimmed_len:.1f}s (removed {original_len - trimmed_len:.1f}s silence)")
     print(f"  Gated:    {gated_frames}/{total_frames} frames suppressed")
     print(f"  De-essed: {deess_count} sibilant frames attenuated")
-    print(f"  Low-pass: 8kHz applied")
+    print("  Low-pass: 8kHz applied")
     print(f"  RMS:      {np.sqrt(np.mean(audio ** 2)):.4f} (target {target_rms})")
 
     return audio, sr

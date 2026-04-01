@@ -26,11 +26,10 @@ for mod in _mock_modules:
         sys.modules[mod] = MagicMock()
 
 # Now we can import safely — the mocked modules prevent the GPU import chain
-import torch
 import pytest
-
-from nano_qwen3tts_vllm.engine.sequence import Sequence, SequenceStatus
+import torch
 from nano_qwen3tts_vllm.engine.block_manager import BlockManager
+from nano_qwen3tts_vllm.engine.sequence import Sequence, SequenceStatus
 from nano_qwen3tts_vllm.sampling_params import SamplingParams
 
 
@@ -176,7 +175,7 @@ class TestPauseResume:
         scheduler.resume_request("nonexistent", _make_embeds())  # no-op
 
     def test_clear_frees_paused_blocks(self, scheduler):
-        seq = _add_request(scheduler, "req-1", keep_alive=True)
+        _add_request(scheduler, "req-1", keep_alive=True)
         scheduler.schedule()
         free_before = len(scheduler.block_manager.free_block_ids)
 

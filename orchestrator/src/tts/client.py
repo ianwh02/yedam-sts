@@ -272,7 +272,7 @@ class TTSClient:
 
         try:
             await asyncio.wait_for(ready_event.wait(), timeout=90.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Continuous TTS ready timeout for session %s", session_id)
             await self.close_continuous_stream(session_id)
             raise
@@ -536,6 +536,7 @@ class TTSClient:
         else:
             # Fallback: WAV response (backwards compat)
             import io
+
             import soundfile as sf
 
             audio, _sample_rate = sf.read(io.BytesIO(response.content), dtype="int16")

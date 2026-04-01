@@ -42,11 +42,11 @@ Audio In → [STT] → confirmed text → [Processor] → translated text → [T
 
 | Service | Model | VRAM (weights + KV cache + CUDA overhead) | Role |
 |---------|-------|------|------|
-| **STT** | Whisper large-v3-turbo (int8_float16) | ~2.0 GB | Speech recognition |
-| **LLM** | Qwen3-4B-AWQ (4-bit) | ~3.3 GB | Translation / processing |
-| **TTS** | Qwen3-TTS 0.6B (FP16) + tokenizer + CUDA graphs | ~5.9 GB | Speech synthesis |
+| **STT** | Whisper small-komixv2 (int8_float16) | ~1.5 GB | Speech recognition |
+| **LLM** | Qwen3-8B-AWQ (4-bit) | ~5.5 GB | Translation / processing |
+| **TTS** | Qwen3-TTS 1.7B (BF16) + tokenizer + CUDA graphs | ~9.2 GB | Speech synthesis |
 | **Orchestrator** | — (CPU only) | 0 | Session management |
-| **Total** | | **~11.2 GB** | Fits 16GB with ~4 GB headroom |
+| **Total** | | **~16.2 GB** | Fits 24GB with headroom |
 
 ### Source Repos and Modifications
 
@@ -62,7 +62,7 @@ Changes made:
 
 **LLM Server** — [vLLM](https://github.com/vllm-project/vllm) (unmodified)
 
-Used as-is via Docker with Qwen3-4B-AWQ. The OpenAI-compatible API means swapping models is a one-line env var change. Continuous batching, prefix caching, and fp8 KV cache are enabled out of the box.
+Used as-is via Docker with Qwen3-8B-AWQ. The OpenAI-compatible API means swapping models is a one-line env var change. Continuous batching, prefix caching, and fp8 KV cache are enabled out of the box.
 
 **TTS Server** — built on [nano-qwen3tts-vllm](https://github.com/tsdocode/nano-qwen3tts-vllm) by tsdocode, with [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS) models by Alibaba
 
@@ -91,7 +91,7 @@ Python FastAPI service that wires STT → Processor → TTS via consumer callbac
 
 ### Prerequisites
 
-- NVIDIA GPU with 16GB+ VRAM (tested on RTX 5060 Ti)
+- NVIDIA GPU with 24GB+ VRAM for default config (tested on A5000). 16GB works with smaller models (4B LLM + 0.6B TTS).
 - Docker with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
 - `nvidia-smi` accessible from host
 
@@ -203,7 +203,7 @@ Copy `.env.example` to `.env` and customise. Key variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_MODEL` | `Qwen/Qwen3-4B-AWQ` | vLLM model (any OpenAI-compatible) |
+| `LLM_MODEL` | `Qwen/Qwen3-8B-AWQ` | vLLM model (any OpenAI-compatible) |
 | `WHISPER_MODEL_REPO` | turbo | Whisper model variant |
 | `MAX_CONCURRENT_SESSIONS` | 5 | Session limit (503 when exceeded) |
 | `TTS_TALKER_TEMPERATURE` | 0.7 | TTS generation temperature |
@@ -215,17 +215,17 @@ VRAM allocation is configured in `vram_budget.yml`:
 
 ```yaml
 gpu:
-  reserved_mb: 800    # OS/desktop overhead (400 for headless)
+  reserved_mb: 400    # Headless server (800 for desktop with Xorg)
 
 services:
   llm:
-    fixed_mb: 3300        # Model weights + CUDA context
+    fixed_mb: 5500        # Qwen3-8B-AWQ weights + CUDA context
     variable_priority: 1  # KV cache share (relative weight)
   tts:
-    fixed_mb: 5900
+    fixed_mb: 9200
     variable_priority: 3  # TTS gets most remaining VRAM
   stt:
-    fixed_mb: 2000
+    fixed_mb: 1000
     variable_priority: 1
 ```
 
@@ -246,7 +246,7 @@ Then update the VRAM budget in `vram_budget.yml` to match the new model's weight
 ```yaml
 services:
   llm:
-    fixed_mb: 5000  # Qwen2.5-7B-AWQ uses ~4-5 GB
+    fixed_mb: 5000  # Adjust to match new model's weight size
 ```
 
 For larger models, you may also need to adjust `LLM_MAX_MODEL_LEN` and `LLM_MAX_NUM_SEQS` in `docker-compose.yml` to fit within the budget.
@@ -297,7 +297,7 @@ WHISPER_MODEL_REPO=large-v3       # or: medium, small, turbo
 WHISPER_COMPUTE_TYPE=int8_float16  # or: float16 for higher accuracy
 ```
 
-Update VRAM budget accordingly — `small` uses ~0.5 GB, `medium` ~1 GB, `large-v3` ~1.5 GB, `large-v3-turbo` ~1.5 GB.
+Update VRAM budget accordingly — `small` uses ~0.5 GB, `medium` ~1 GB, `large-v3` ~1.5 GB, `large-v3-turbo` ~1.5 GB. The default production config uses `seastar105/whisper-small-komixv2` (Korean fine-tuned).
 
 The STT image downloads the model at build time, so rebuild after changing:
 
@@ -312,7 +312,7 @@ The TTS server supports two modes:
 **CustomVoice (preset speakers):** Uses built-in speakers like `ryan` (male EN) and `sohee` (female KO). No reference audio needed. Clean output, no artifacts.
 
 ```env
-TTS_MODEL_DIR=/app/models/Qwen3-TTS-12Hz-0.6B-CustomVoice
+TTS_MODEL_DIR=/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
 REF_AUDIO_PATH_EN=   # leave empty to use presets
 ```
 
@@ -320,10 +320,10 @@ Download the CustomVoice model to `tts-server/models/` and add a volume mount in
 
 ```yaml
 volumes:
-  - ./tts-server/models/Qwen3-TTS-12Hz-0.6B-CustomVoice:/app/models/Qwen3-TTS-12Hz-0.6B-CustomVoice:ro
+  - ./tts-server/models/Qwen3-TTS-12Hz-1.7B-CustomVoice:/app/models/Qwen3-TTS-12Hz-1.7B-CustomVoice:ro
 ```
 
-**Base + Voice Cloning:** Clone any voice from a reference audio recording. Uses the `Qwen3-TTS-12Hz-0.6B-Base` model (default).
+**Base + Voice Cloning:** Clone any voice from a reference audio recording. Uses the `Qwen3-TTS-12Hz-1.7B-Base` model.
 
 ```env
 REF_AUDIO_PATH_EN=/app/ref_audio/en.wav
@@ -345,7 +345,7 @@ curl -X POST http://localhost:7860/synthesize/voice-design \
   -d '{"text": "Hello world", "instruct": "Male, deep voice, calm", "language": "en"}'
 ```
 
-Note: the 0.6B model has limited instruction-following — it responds to pitch/pace cues but gender control is unreliable. The 1.7B model follows instructions much better but requires more VRAM.
+Note: the 0.6B model has limited instruction-following — it responds to pitch/pace cues but gender control is unreliable. The 1.7B model (default) follows instructions much better.
 
 ### VRAM Budget for Different GPUs
 
@@ -356,10 +356,10 @@ gpu:
   reserved_mb: 800   # Desktop with display (set to 400 for headless servers)
 ```
 
-For a 24GB GPU (e.g. RTX 4090), you have ~12 GB extra headroom. Options:
-- Use a larger LLM (7B-AWQ at ~5 GB instead of 4B-AWQ at ~3.3 GB)
-- Use the 1.7B TTS model (~3.9 GB instead of 0.6B at ~5.9 GB total with tokenizer)
-- Increase KV cache budgets for more concurrent sessions
+For a 16GB GPU, use smaller models:
+- LLM: Qwen3-4B-AWQ (~3.3 GB instead of 8B-AWQ at ~5.5 GB)
+- TTS: 0.6B model (~5.9 GB instead of 1.7B at ~9.2 GB)
+- Fits ~11 GB total with ~4 GB headroom for KV cache
 
 Run `./scripts/start.sh --dry` to preview the allocation without starting services.
 
@@ -371,10 +371,10 @@ All measurements on **NVIDIA RTX 5060 Ti 16GB**, Docker Compose, CUDA MPS enable
 
 | Service | Model | Measured VRAM |
 |---------|-------|--------------|
-| STT | Whisper large-v3-turbo (int8_float16) | ~1.5 GB |
-| LLM | Qwen3-4B-AWQ (4-bit) | ~3.3 GB |
-| TTS | Qwen3-TTS 0.6B (FP16) + tokenizer + CUDA graphs | ~5.9 GB |
-| **Total (5 sessions)** | | **~15.1 GB** (875 MB free) |
+| STT | Whisper small-komixv2 (int8_float16) | ~1.5 GB |
+| LLM | Qwen3-8B-AWQ (4-bit) | ~5.5 GB |
+| TTS | Qwen3-TTS 1.7B (BF16) + tokenizer + CUDA graphs | ~9.2 GB |
+| **Total (5 sessions)** | | **~16.2 GB** |
 
 ### TTS Latency and RTF
 
@@ -409,6 +409,7 @@ python scripts/profile_vram.py
 - [ ] Audio preprocessing (RNNoise noise suppression)
 - [ ] Legacy GPU compatibility (SM75 / T4 — TTS needs CUDA compute cap rebuild, vLLM needs `--dtype float16`)
 - [ ] Punctuation-based flush detector for non-Korean languages
+- [ ] Continuous TTS streaming (KV cache continuation across sentences for tonal consistency)
 
 ## Acknowledgements
 

@@ -26,8 +26,8 @@ import yaml
 try:
     import requests
 except ImportError:
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     class _FallbackRequests:
         """Minimal requests-like fallback using urllib."""

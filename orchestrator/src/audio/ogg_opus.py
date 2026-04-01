@@ -129,6 +129,14 @@ class OpusFrameEncoder:
             frames.append(self._encoder.encode(frame_pcm, FRAME_SIZE))
         return frames
 
+    def flush(self) -> list[bytes]:
+        """Flush remaining PCM as a zero-padded frame. Call at sentence boundaries."""
+        if len(self._buffer) == 0:
+            return []
+        padded = bytes(self._buffer) + bytes(FRAME_BYTES - len(self._buffer))
+        self._buffer.clear()
+        return [self._encoder.encode(padded, FRAME_SIZE)]
+
 
 # ---------------------------------------------------------------------------
 # OggPageWriter — per listener connection, cheap

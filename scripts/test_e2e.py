@@ -180,11 +180,10 @@ async def run_e2e(args):
     print(f"TTS: {TTS_URL}" if not args.no_tts else "TTS: disabled")
     print(f"Source: {source_desc}")
     print(f"Language: {args.source} → {args.target}")
-    print(f"Flush mode: korean (server-side)")
+    print("Flush mode: korean (server-side)")
     print("─" * 50)
     print("Press Ctrl+C to stop.\n")
 
-    loop = asyncio.get_event_loop()
     last_partial = ""
     flush_num = 0
     send_seq = 0

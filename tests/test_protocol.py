@@ -1,15 +1,13 @@
 """Tests for worker protocol serialization (Phase 0.4)."""
-import torch
 import numpy as np
-import pytest
-
+import torch
 from nano_qwen3tts_vllm.workers.protocol import (
     CMD_PAUSE_REQUEST,
+    deserialize_command,
+    deserialize_talker_result,
     serialize_pause_request,
     serialize_talker_add_request,
     serialize_talker_result,
-    deserialize_command,
-    deserialize_talker_result,
 )
 
 

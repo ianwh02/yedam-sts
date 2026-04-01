@@ -11,17 +11,13 @@ import pytest
 # Import directly — stt-server is added to path in conftest
 from whisper_live.korean_endings import (
     BIEUP,
-    BIEUP_NIDA_ENDINGS,
-    CLAUSE_CONNECTIVES,
     NIEUN,
     RIEUL,
-    FlushDecision,
     KoreanEndingDetector,
     PunctuationFlushDetector,
     get_jongseong,
     is_hangul,
 )
-
 
 # ── Jamo helpers ──────────────────────────────────────────────────────
 

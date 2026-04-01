@@ -34,8 +34,6 @@ models/
 # Logs
 logs/
 *.log
-*.txt
-!requirements*.txt
 
 # OS
 .DS_Store
@@ -70,3 +68,9 @@ PLAN-VLLM-OMNI-MIGRATION.md
 
 # Auto-generated VRAM budget
 .env.vram
+
+# Empty/legacy directories (local only)
+llm-server/
+supabase/
+test_continuous_output/
+test_eos_output/

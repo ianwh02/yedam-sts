@@ -4,12 +4,13 @@
 import os
 import sys
 import time
-sys.path.insert(0, os.path.dirname(__file__))
-from korean_endings import (
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stt-server"))
+from whisper_live.korean_endings import (
+    BIEUP,
     KoreanEndingDetector,
     get_jongseong,
     is_hangul,
-    BIEUP,
 )
 
 

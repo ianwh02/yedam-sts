@@ -90,7 +90,7 @@ def main():
     print(f"Context window: {args.context}")
     print(f"Streaming: {'yes' if args.stream else 'no'}")
     print(f"{'─' * 50}")
-    print(f"Type text to translate. Ctrl+C to quit.\n")
+    print("Type text to translate. Ctrl+C to quit.\n")
 
     context = []
     client = httpx.Client(timeout=30.0)

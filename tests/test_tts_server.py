@@ -6,19 +6,17 @@ No GPU or model loading required.
 """
 
 import io
-import struct
-import wave
-
-import numpy as np
-import pytest
 
 # ── Import TTS server helpers ────────────────────────────────────────
 # We import the functions directly from server.py. The server module
 # has side-effects at import time (torch, scipy), but those are
 # available in CI since torch is installed for the existing tests.
-
 import sys
+import wave
 from pathlib import Path
+
+import numpy as np
+import pytest
 
 # Add tts-server to path so we can import server module helpers
 _tts_root = Path(__file__).parent.parent / "tts-server"

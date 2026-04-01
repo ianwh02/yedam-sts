@@ -13,6 +13,7 @@ Endpoints:
 import asyncio
 import io
 import logging
+import multiprocessing as mp
 import os
 import re
 import struct
@@ -20,17 +21,16 @@ import time
 import uuid
 import wave
 from contextlib import asynccontextmanager
+from math import gcd
 from pathlib import Path
 
 import numpy as np
 import torch
-import multiprocessing as mp
-from math import gcd
-from scipy.signal import butter, resample_poly, sosfilt
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from scipy.signal import butter, resample_poly, sosfilt
 
 logging.basicConfig(
     level=logging.DEBUG if os.environ.get("DEBUG_TTS") else logging.INFO,
@@ -979,7 +979,7 @@ async def allocate_kv_cache(budget_mb: int = 0):
             asyncio.gather(talker_fut, predictor_fut),
             timeout=240.0,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise HTTPException(status_code=504, detail="KV cache allocation timed out (240s)")
 
     talker_ok = talker_ack.get("success", False)
@@ -1082,7 +1082,6 @@ async def swap_model(req: SwapModelRequest):
     if _server_status == "swapping":
         raise HTTPException(status_code=409, detail="A swap is already in progress")
 
-    prev_status = _server_status
     _server_status = "swapping"
     swap_start = time.time()
     logger.info("[swap] Starting model swap: %s → %s", MODEL_DIR, new_path)
@@ -1492,7 +1491,6 @@ async def synthesize_voice_design(req: VoiceDesignRequest, request: Request):
         raise HTTPException(status_code=503, detail=f"Server not ready: {_server_status}")
 
     interface = get_interface()
-    tokenizer = get_tokenizer()
     lang_key = req.language.lower()
     language = SUPPORTED_LANGUAGES.get(lang_key, "Auto")
 
@@ -1574,7 +1572,7 @@ async def ws_continuous_synthesize(websocket: WebSocket, session_id: str):
     # Wait for initial text message to start generation
     try:
         initial_msg = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
-    except (asyncio.TimeoutError, WebSocketDisconnect):
+    except (TimeoutError, WebSocketDisconnect):
         logger.warning("[ws_continuous] session %s: no initial text within 30s", session_id)
         _continuous_sessions.pop(session_id, None)
         return
@@ -1633,6 +1631,29 @@ async def ws_continuous_synthesize(websocket: WebSocket, session_id: str):
         async for item in gen:
             if isinstance(item, str):
                 if item == "segment_boundary":
+                    # Flush remaining undecoded codes (partial chunk at sentence end)
+                    if audio_codes and len(audio_codes) > prev_code_pos:
+                        start_ctx = max(0, prev_code_pos - STREAMING_CONTEXT_SIZE)
+                        window = audio_codes[start_ctx:]
+                        context_frames = prev_code_pos - start_ctx
+                        pcm16, _ = await _decode_batched(window, left_context_frames=context_frames)
+                        if len(pcm16) > 0:
+                            audio_f32 = pcm16.astype(np.float32)
+                            if prev_tail is not None and len(audio_f32) > BLEND_SAMPLES:
+                                fade_in, fade_out = _get_hann_windows()
+                                blended = prev_tail * fade_out + audio_f32[:BLEND_SAMPLES] * fade_in
+                                audio_f32 = np.concatenate([blended, audio_f32[BLEND_SAMPLES:]])
+                            if len(audio_f32) > BLEND_SAMPLES:
+                                prev_tail = audio_f32[-BLEND_SAMPLES:].copy()
+                                emit = audio_f32[:-BLEND_SAMPLES]
+                            else:
+                                prev_tail = None
+                                emit = audio_f32
+                            if len(emit) > 0:
+                                out = np.clip(emit, -32768, 32767).astype(np.int16)
+                                await websocket.send_bytes(out.tobytes())
+
+                    # Flush crossfade tail
                     if prev_tail is not None:
                         trimmed = _trim_trailing_silence(prev_tail / 32768.0) * 32768.0
                         out = np.clip(trimmed, -32768, 32767).astype(np.int16)

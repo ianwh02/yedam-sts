@@ -1,14 +1,5 @@
 import argparse
 import os
-import threading
-import logging
-from fastapi import FastAPI
-from fastapi import UploadFile, Form
-import uvicorn
-import tempfile
-import shutil
-import json
-from starlette.responses import PlainTextResponse, JSONResponse
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -14,7 +14,6 @@ import librosa
 import numpy as np
 import soundfile as sf
 import time
-import torch
 from librosa.filters import mel as librosa_mel_fn
 
 from nano_qwen3tts_vllm.utils.prompt import prepare_custom_voice_prompt, _ensure_list, _tokenize_texts

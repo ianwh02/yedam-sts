@@ -13,6 +13,27 @@ from ..config import settings
 
 logger = logging.getLogger(__name__)
 
+# Minimum repeated phrase length and repeat count to trigger loop detection.
+_REPEAT_MIN_PHRASE = 20
+_REPEAT_MIN_COUNT = 3
+# Only check after this many accumulated chars (avoids overhead on short outputs).
+_REPEAT_CHECK_AFTER = 80
+
+
+def _has_repetition_loop(text: str) -> bool:
+    """Detect if the tail of text contains a phrase repeated 3+ times consecutively."""
+    n = len(text)
+    if n < _REPEAT_MIN_PHRASE * _REPEAT_MIN_COUNT:
+        return False
+    max_phrase = n // _REPEAT_MIN_COUNT
+    for plen in range(_REPEAT_MIN_PHRASE, max_phrase + 1):
+        # Check if the last 3×plen chars are the same phrase repeated 3 times
+        start = n - plen * _REPEAT_MIN_COUNT
+        phrase = text[n - plen: n]
+        if text[start: n] == phrase * _REPEAT_MIN_COUNT:
+            return True
+    return False
+
 
 class LLMClient:
     """Async client for vLLM's OpenAI-compatible API.
@@ -51,7 +72,7 @@ class LLMClient:
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "frequency_penalty": 0.3,
+            "frequency_penalty": 0.5,
             "stream": True,
             "stop": ["\n\n", "Note:", "Translation:"],
             "chat_template_kwargs": {"enable_thinking": False},
@@ -59,6 +80,8 @@ class LLMClient:
 
         in_think = False
         think_buf = ""
+        accumulated = []  # track full output for repetition detection
+        acc_len = 0
         async with self._client.stream(
             "POST", "/chat/completions", json=payload
         ) as response:
@@ -84,9 +107,18 @@ class LLMClient:
                                 in_think = False
                                 think_buf = ""
                                 if after:
+                                    accumulated.append(after)
+                                    acc_len += len(after)
                                     yield after
                         elif "<think>" in content:
                             in_think = True
                             think_buf = content
                         else:
+                            accumulated.append(content)
+                            acc_len += len(content)
                             yield content
+
+                        # Periodically check for repetition loop
+                        if acc_len >= _REPEAT_CHECK_AFTER and _has_repetition_loop("".join(accumulated)):
+                            logger.warning("Repetition loop detected, truncating LLM output")
+                            return

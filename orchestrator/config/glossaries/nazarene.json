@@ -1,0 +1,117 @@
+{
+  "denomination": "Church of the Nazarene (Wesleyan-Holiness)",
+
+  "proper_nouns": {
+    "나사렛 교회": "Church of the Nazarene",
+    "나사렛 성결교회": "Church of the Nazarene",
+    "나사렛성결회": "Church of the Nazarene"
+  },
+
+  "titles": {
+    "목사님": "pastor",
+    "장로님": "elder (ordained minister, NOT lay elder)",
+    "집사님": "deacon (ordained credential, NOT lay role)",
+    "전도사님": "evangelist",
+    "총감독": "General Superintendent",
+    "지방감독": "District Superintendent",
+    "성도": "saints/believers",
+    "형제자매": "brothers and sisters",
+    "청년": "young adult/youth"
+  },
+
+  "theological_terms": {
+    "전적 성화": "entire sanctification",
+    "완전 성화": "entire sanctification",
+    "성결": "holiness",
+    "성결의 은혜": "sanctifying grace",
+    "성서적 성결": "scriptural holiness",
+    "은혜의 두 번째 역사": "second work of grace",
+    "두 번째 축복": "second blessing",
+    "선행 은혜": "prevenient grace",
+    "먼저 오는 은혜": "prevenient grace",
+    "칭의": "justification",
+    "중생": "regeneration/new birth",
+    "기독교적 완전": "Christian perfection",
+    "유전적 죄": "inbred sin",
+    "원죄": "original sin",
+    "성령 세례": "baptism of the Holy Spirit",
+    "성령의 열매": "fruit of the Spirit",
+    "속죄": "atonement",
+    "은혜": "grace",
+    "말씀": "the Word/Scripture",
+    "구원": "salvation",
+    "부활": "resurrection",
+    "회개": "repentance",
+    "영광": "glory",
+    "복음": "the gospel",
+    "용납": "acceptance/forbearance (NOT forgiveness)",
+    "온유": "gentleness/meekness",
+    "겸손": "humility",
+    "오래 참음": "patience/long-suffering",
+    "만유": "all things",
+    "바로잡다": "restore/correct",
+    "삼위일체": "the Trinity",
+    "성화": "sanctification",
+    "구속": "redemption",
+    "예배": "worship",
+    "제자도": "discipleship",
+    "선교": "mission",
+    "은혜의 수단": "means of grace",
+    "부흥회": "revival",
+    "십일조": "tithe",
+    "간증": "testimony",
+    "거룩": "holiness (NOT piety)"
+  },
+
+  "bible_books": {
+    "창세기": "Genesis",
+    "출애굽기": "Exodus",
+    "시편": "Psalms",
+    "잠언": "Proverbs",
+    "이사야": "Isaiah",
+    "예레미야": "Jeremiah",
+    "느헤미야": "Nehemiah",
+    "마태복음": "Matthew",
+    "마가복음": "Mark",
+    "누가복음": "Luke",
+    "요한복음": "John",
+    "사도행전": "Acts",
+    "로마서": "Romans",
+    "고린도전서": "1 Corinthians",
+    "고린도후서": "2 Corinthians",
+    "갈라디아서": "Galatians",
+    "에베소서": "Ephesians",
+    "빌립보서": "Philippians",
+    "골로새서": "Colossians",
+    "데살로니가전서": "1 Thessalonians",
+    "데살로니가후서": "2 Thessalonians",
+    "히브리서": "Hebrews",
+    "야고보서": "James",
+    "요한계시록": "Revelation"
+  },
+
+  "stt_corrections": {
+    "오뉴": "온유 (gentleness)",
+    "운유": "온유 (gentleness)",
+    "오누이": "온유 (gentleness)",
+    "우레탐": "오래 참음 (patience)",
+    "오레참": "오래 참음 (patience)",
+    "청룡": "성령 (Holy Spirit)",
+    "홍영": "성령 (Holy Spirit)",
+    "마뉴": "만유 (all things)",
+    "갈라비아서": "갈라디아서 (Galatians)",
+    "나사렛": "나사렛 (Nazarene)",
+    "전적성화": "전적 성화 (entire sanctification)"
+  },
+
+  "code_switch_english": {
+    "에이블": "able",
+    "히미": "Him",
+    "나와 투": "now to",
+    "후이즈": "who is"
+  },
+
+  "key_phrases": {
+    "능히 하신다": "He is able"
+  }
+}

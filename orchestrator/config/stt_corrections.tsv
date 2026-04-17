@@ -1,0 +1,75 @@
+# Korean STT domain corrections for church/sermon context
+# Format: wrong_text<TAB>correct_text
+# One replacement per line. Lines starting with # are comments.
+#
+# Add entries here as you discover consistent Whisper misrecognitions.
+# These are applied as simple string replacements (not regex).
+
+# Common Whisper spacing errors for compound church terms
+능히하신다	능히 하신다
+역사하신다	역사하신다
+하나님의말씀	하나님의 말씀
+
+# Whisper sometimes drops or merges particles on biblical names
+에배소	에베소
+에페소	에베소
+빌립보 서	빌립보서
+에베소 서	에베소서
+고린도 서	고린도서
+로마 서	로마서
+
+# Numeral/counter misrecognitions
+말씀 장	말씀 장
+1장	1장
+2장	2장
+3장	3장
+
+# Common homophone confusions in sermon context
+성령의	성령의
+예수그리스도	예수 그리스도
+아버지하나님	아버지 하나님
+
+# Place name misrecognitions (2026-04-05 Easter sermon transcript)
+# Galilee: consistently misheard as similar-sounding nonsense words
+갈릴레오	갈릴리
+알릴리	갈릴리
+앨리엘리	갈릴리
+# Jerusalem
+에디슬램	예루살렘
+일살렘	예루살렘
+
+# Church name: 예닮 (yedam = resemble Jesus), not 예담
+예담 교회	예닮 교회
+예담교회	예닮교회
+
+# Biblical name confusions
+야구부의 어머니	야고보의 어머니
+
+# Cross misheard as similar-sounding nonsense words
+시다가의	십자가의
+시야가의	십자가의
+
+# "Christ" truncation: Whisper drops 도 from 그리스도 → "그리스" (Greece)
+# Match common suffixes/particles that follow 그리스 in sermon context
+예수 그리스 이름	예수 그리스도 이름
+예수 그리스의 이름	예수 그리스도의 이름
+예수 그리스가	예수 그리스도가
+예수 그리스를	예수 그리스도를
+예수 그리스는	예수 그리스도는
+예수 그리스의	예수 그리스도의
+예수 그리스께서	예수 그리스도께서
+예수 그리스 안에	예수 그리스도 안에
+예수 그리스 안에서	예수 그리스도 안에서
+# Bare "그리스" without 도: handled by vocab anchoring (can't safely substring-match)
+그리스가	그리스도가
+그리스를	그리스도를
+그리스는	그리스도는
+그리스의	그리스도의
+그리스께서	그리스도께서
+그리스 안에	그리스도 안에
+그리스 안에서	그리스도 안에서
+
+# "Ephesians" hallucination: 에베소서 → "앱에서" (from the app)
+앱에서	에베소서
+애배소서	에베소서
+애베소서	에베소서

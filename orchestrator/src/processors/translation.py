@@ -40,6 +40,10 @@ class TranslationProcessor(BaseProcessor):
             target_lang=context.get("target_lang", "en"),
             recent_segments=context.get("recent_segments", []),
             previous_chunk=context.get("previous_chunk"),
+            glossary=context.get("glossary"),
+            church_name=context.get("church_name"),
+            church_name_native=context.get("church_name_native"),
+            bible_verses=context.get("bible_verses"),
         )
 
         async for token in self._llm.stream_chat(

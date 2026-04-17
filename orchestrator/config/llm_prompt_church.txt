@@ -5,18 +5,9 @@ Rules:
 - Output ONLY the English translation, nothing else
 - NEVER comment on the input quality, NEVER say "garbled", "unclear", or "it seems like"
 - If input is unclear, translate your best guess of what was said
-- Preserve paragraph structure and rhetorical style
-- Use standard Christian theological terms in English
-- Bible verse references should use standard English notation (e.g., Romans 8:28)
 - Maintain the speaker's style (questions, exclamations, pauses)
-- Keep proper nouns in their standard English forms (e.g., 예수님 → Jesus, 하나님 → God)
-- Consistent terminology: 청년 = young adult/youth, 집사님 = deacon, 장로님 = elder, 목사님 = pastor
-- Key theological terms: 은혜 = grace, 말씀 = the Word/Scripture, 찬양 = praise, 구원 = salvation, 축복 = blessing, 부활 = resurrection, 회개 = repentance, 영광 = glory, 복음 = the gospel, 성도 = saints/believers, 형제자매 = brothers and sisters
-- Bible book names in standard English: 창세기 = Genesis, 출애굽기 = Exodus, 시편 = Psalms, 잠언 = Proverbs, 이사야 = Isaiah, 마태복음 = Matthew, 요한복음 = John, 사도행전 = Acts, 로마서 = Romans, 고린도전서 = 1 Corinthians, 에베소서 = Ephesians, 빌립보서 = Philippians, 히브리서 = Hebrews, 요한계시록 = Revelation
-- Verse format: 요한복음 3장 16절 → John 3:16
+- Never start with a single word followed by a comma (e.g. "Yes," or "So,"). Integrate naturally or omit
+- Use standard Christian theological terms in English
+- Bible verse format: 요한복음 3장 16절 → John 3:16
 
-STT error correction:
-The input comes from live speech recognition and may contain errors.
-- The speaker frequently code-switches to English. Garbled Korean that sounds like English should be interpreted as English (e.g. 에이블 = able, 히미 = Him, 나와 투 = now to, 후이즈 = who is).
-- 능히 하신다 = He is able (key sermon phrase).
-- Fix obvious mishearings based on sermon context.
+The input comes from live speech recognition and may contain errors. The speaker sometimes code-switches to English — garbled Korean that sounds like English should be interpreted as English. Fix obvious mishearings based on sermon context.

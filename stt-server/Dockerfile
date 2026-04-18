@@ -38,6 +38,9 @@ RUN --mount=type=cache,target=/root/.cache/huggingface \
 # Store model path so CMD can reference it at runtime
 ENV WHISPER_MODEL_DIR=/app/models/${WHISPER_MODEL_NAME}
 
+# --- Phrase classifier model (KoELECTRA ONNX, ~55MB) ---
+COPY models/phrase-classifier/ ./models/phrase-classifier/
+
 # --- Source layer (rebuilds when code changes) ---
 COPY whisper_live/ ./whisper_live/
 COPY run_server.py .
@@ -58,4 +61,4 @@ CMD python -u run_server.py \
     --batch_inference \
     --batch_max_size 8 \
     --batch_window_ms 25 \
-    --beam_size 1
+    --beam_size "${BEAM_SIZE:-3}"

@@ -69,11 +69,12 @@ class BatchInferenceTRTWorker:
         transcriber,
         max_batch_size: int = 8,
         batch_window_ms: int = 50,
-        beam_size: int = 1,  # accepted for API compat with CTranslate2 worker; TRT beam width is set at engine build time
+        beam_size: int = 1,  # must match MAX_BEAM_WIDTH used at TRT engine build time
     ):
         self.transcriber = transcriber
         self.max_batch_size = max_batch_size
         self.batch_window_ms = batch_window_ms
+        self.beam_size = beam_size
         self._queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -157,7 +158,7 @@ class BatchInferenceTRTWorker:
                 f"<|startoftranscript|><|{req.language}|>"
                 f"<|{req.task}|><|notimestamps|>"
             )
-            result = self.transcriber.transcribe(mel, text_prefix=text_prefix)
+            result = self.transcriber.transcribe(mel, text_prefix=text_prefix, num_beams=self.beam_size)
 
             req.result = result or ""
             req.duration = duration
@@ -256,7 +257,7 @@ class BatchInferenceTRTWorker:
                     encoder_output_lengths,
                     self.transcriber.tokenizer.eot,
                     max_new_tokens=96,
-                    num_beams=1,
+                    num_beams=self.beam_size,
                 )
             else:
                 with torch.no_grad():
@@ -267,7 +268,7 @@ class BatchInferenceTRTWorker:
                         max_new_tokens=96,
                         end_id=self.transcriber.tokenizer.eot,
                         pad_id=self.transcriber.tokenizer.eot,
-                        num_beams=1,
+                        num_beams=self.beam_size,
                         output_sequence_lengths=True,
                         return_dict=True,
                     )

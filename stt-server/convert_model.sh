@@ -28,7 +28,7 @@ TRT_EXAMPLES="/app/trt-whisper-examples"
 INFERENCE_PRECISION="float16"
 QUANTIZATION="${QUANTIZATION:-none}"  # "int8" (weight-only, decoder only) or "none" (FP16)
 MAX_BATCH_SIZE=8
-MAX_BEAM_WIDTH=${MAX_BEAM_WIDTH:-1}
+MAX_BEAM_WIDTH=${MAX_BEAM_WIDTH:-3}
 # Decoder max_seq_len = prompt_len (14) + max_output_tokens (96) = 110, round up
 DECODER_MAX_SEQ_LEN=114
 DECODER_MAX_INPUT_LEN=14
@@ -44,9 +44,50 @@ echo "Batch size:   ${MAX_BATCH_SIZE}"
 echo "Beam width:   ${MAX_BEAM_WIDTH}"
 echo "============================================"
 
-# Skip if engines already exist
+# Skip if engines already exist AND were built for the same model + beam width
+MODEL_MARKER="${OUTPUT_DIR}/.model"
 if [ -f "${OUTPUT_DIR}/encoder/rank0.engine" ] && [ -f "${OUTPUT_DIR}/decoder/rank0.engine" ]; then
-    echo "Engines already exist at ${OUTPUT_DIR}, skipping conversion."
+    PREV_MODEL=$(grep '^MODEL=' "$MODEL_MARKER" 2>/dev/null | cut -d= -f2- || echo "")
+    # Read ACTUAL beam width from the decoder engine config (ground truth)
+    ACTUAL_BEAM=$($PYTHON -c "
+import json, sys
+try:
+    cfg = json.load(open('${OUTPUT_DIR}/decoder/config.json'))
+    # TRT-LLM stores build config in pretrained_config or build_config
+    bc = cfg.get('build_config', cfg)
+    print(bc.get('max_beam_width', 1))
+except: print(0)
+" 2>/dev/null || echo "0")
+    echo "Engine check: marker_model=${PREV_MODEL:-?}, actual_beam=${ACTUAL_BEAM}, want_beam=${MAX_BEAM_WIDTH}"
+    if [ "$PREV_MODEL" = "$MODEL_NAME" ] && [ "$ACTUAL_BEAM" = "$MAX_BEAM_WIDTH" ]; then
+        echo "Engines already exist for ${MODEL_NAME} (beam=${MAX_BEAM_WIDTH}), skipping."
+        exit 0
+    else
+        echo "Model/config changed (was: ${PREV_MODEL:-unknown} beam=${ACTUAL_BEAM}, now: ${MODEL_NAME} beam=${MAX_BEAM_WIDTH})"
+        # Archive old engines so we can switch back without rebuilding
+        SAFE_PREV="${PREV_MODEL:-unknown}"
+        SAFE_PREV="${SAFE_PREV//\//_}"
+        ARCHIVE_DIR="${OUTPUT_DIR}/.archived_${SAFE_PREV}_beam${ACTUAL_BEAM}"
+        echo "Archiving old engines to ${ARCHIVE_DIR}..."
+        rm -rf "${ARCHIVE_DIR}"
+        mkdir -p "${ARCHIVE_DIR}"
+        mv "${OUTPUT_DIR}/encoder" "${ARCHIVE_DIR}/encoder" 2>/dev/null || true
+        mv "${OUTPUT_DIR}/decoder" "${ARCHIVE_DIR}/decoder" 2>/dev/null || true
+        mv "$MODEL_MARKER" "${ARCHIVE_DIR}/.model" 2>/dev/null || true
+    fi
+fi
+
+# Check if a matching archive exists — restore instead of rebuilding
+SAFE_MODEL="${MODEL_NAME//\//_}"
+WANT_ARCHIVE="${OUTPUT_DIR}/.archived_${SAFE_MODEL}_beam${MAX_BEAM_WIDTH}"
+if [ ! -f "${OUTPUT_DIR}/encoder/rank0.engine" ] && \
+   [ -d "${WANT_ARCHIVE}/encoder" ] && [ -d "${WANT_ARCHIVE}/decoder" ]; then
+    echo "Restoring archived engines from ${WANT_ARCHIVE}..."
+    mv "${WANT_ARCHIVE}/encoder" "${OUTPUT_DIR}/encoder"
+    mv "${WANT_ARCHIVE}/decoder" "${OUTPUT_DIR}/decoder"
+    mv "${WANT_ARCHIVE}/.model" "${MODEL_MARKER}" 2>/dev/null || true
+    rm -rf "${WANT_ARCHIVE}"
+    echo "Engines restored for ${MODEL_NAME} (beam=${MAX_BEAM_WIDTH})."
     exit 0
 fi
 
@@ -243,6 +284,13 @@ $TRTLLM_BUILD \
 
 # Copy mel_filters.npz to output dir (needed at runtime)
 cp "${ASSETS_DIR}/mel_filters.npz" "${OUTPUT_DIR}/"
+
+# Write model marker for change detection on next boot
+cat > "${MODEL_MARKER}" <<EOF
+MODEL=${MODEL_NAME}
+MAX_BEAM_WIDTH=${MAX_BEAM_WIDTH}
+BUILT=$(date -u)
+EOF
 
 echo ""
 echo "============================================"

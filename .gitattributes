@@ -1,2 +1,4 @@
 # Force LF line endings for shell scripts (prevents CRLF breaking shebangs in Docker)
 *.sh text eol=lf
+stt-server/models/phrase-classifier/model.onnx.data filter=lfs diff=lfs merge=lfs -text
+stt-server/models/phrase-classifier/model.onnx filter=lfs diff=lfs merge=lfs -text

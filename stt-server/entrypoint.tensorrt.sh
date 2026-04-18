@@ -7,7 +7,7 @@ set -euo pipefail
 
 ENGINE_DIR="${ENGINE_DIR:-/app/engines}"
 MODEL_NAME="${WHISPER_MODEL:-large-v3-turbo}"
-BEAM_SIZE="${BEAM_SIZE:-1}"
+BEAM_SIZE="${BEAM_SIZE:-3}"
 
 echo "=== WhisperLive TensorRT Server ==="
 echo "Engine dir: ${ENGINE_DIR}"

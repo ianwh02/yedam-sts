@@ -649,6 +649,7 @@ class TranscriptionServer:
                     "Pre-loading TensorRT model at startup (defer_kv_cache=%s)...",
                     defer_kv,
                 )
+                trt_num_beams = self.batch_config.get('beam_size', 1) if self.batch_config else 1
                 transcriber = WhisperTRTLLM(
                     whisper_tensorrt_path,
                     assets_dir=assets_dir,
@@ -657,6 +658,7 @@ class TranscriptionServer:
                     language="en",
                     task="transcribe",
                     use_py_session=trt_py_session,
+                    num_beams=trt_num_beams,
                     max_output_len=96,
                     max_batch_size=trt_max_batch,
                     defer_kv_cache=defer_kv,
@@ -666,10 +668,10 @@ class TranscriptionServer:
                 if not defer_kv:
                     # Immediate mode: warmup now
                     warmup_audio = os.path.join(assets_dir, "jfk.flac")
-                    logging.info("Warming up TensorRT engine (10 steps)...")
+                    logging.info("Warming up TensorRT engine (10 steps, num_beams=%d)...", trt_num_beams)
                     mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
                     for _ in range(10):
-                        transcriber.transcribe(mel)
+                        transcriber.transcribe(mel, num_beams=trt_num_beams)
                     logging.info("TensorRT warmup complete.")
 
                     # Start batch worker immediately if batch inference is enabled
@@ -712,10 +714,11 @@ class TranscriptionServer:
 
                             _assets = os.environ.get("ASSETS_DIR", "/app/assets")
                             warmup_audio = os.path.join(_assets, "jfk.flac")
-                            logging.info("Warming up TensorRT engine (10 steps)...")
+                            _num_beams = self.batch_config.get('beam_size', 1) if self.batch_config else 1
+                            logging.info("Warming up TensorRT engine (10 steps, num_beams=%d)...", _num_beams)
                             mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
                             for _ in range(10):
-                                transcriber.transcribe(mel)
+                                transcriber.transcribe(mel, num_beams=_num_beams)
                             logging.info("TensorRT warmup complete.")
 
                             if self.batch_config is not None and ServeClientTensorRT.BATCH_WORKER is None:
@@ -788,10 +791,11 @@ class TranscriptionServer:
                     # Now do warmup
                     _assets = os.environ.get("ASSETS_DIR", "/app/assets")
                     warmup_audio = os.path.join(_assets, "jfk.flac")
-                    logging.info("Warming up TensorRT engine (10 steps)...")
+                    _num_beams = self.batch_config.get('beam_size', 1) if self.batch_config else 1
+                    logging.info("Warming up TensorRT engine (10 steps, num_beams=%d)...", _num_beams)
                     mel, _ = transcriber.log_mel_spectrogram(warmup_audio)
                     for _ in range(10):
-                        transcriber.transcribe(mel)
+                        transcriber.transcribe(mel, num_beams=_num_beams)
                     logging.info("TensorRT warmup complete.")
 
                     # Start batch worker if configured

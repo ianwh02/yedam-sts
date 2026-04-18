@@ -11,6 +11,8 @@ class ServeClientTensorRT(ServeClientBase):
     SINGLE_MODEL = None
     SINGLE_MODEL_LOCK = threading.Lock()
     BATCH_WORKER = None
+    _PHRASE_CLASSIFIER = None  # class-level singleton: loaded once, shared across sessions
+    _PHRASE_CLASSIFIER_LOADED = False
 
     def __init__(
         self,
@@ -50,6 +52,9 @@ class ServeClientTensorRT(ServeClientBase):
         self.eos = False
         self.max_new_tokens = max_new_tokens
         self.max_batch_size = max_batch_size
+        # Beam size for serial fallback path (batch worker has its own copy)
+        import os
+        self.num_beams = int(os.environ.get("BEAM_SIZE", "3"))
 
         # Flush mode: "default" = standard WhisperLive, "korean" = grammar-based,
         # "punctuation" = language-agnostic punctuation detection
@@ -61,11 +66,32 @@ class ServeClientTensorRT(ServeClientBase):
             from whisper_live.korean_endings import KoreanEndingDetector
             extra_markers_str = os.environ.get("STT_EXTRA_FLUSH_MARKERS", "")
             extra_markers = {m.strip() for m in extra_markers_str.split(",") if m.strip()} if extra_markers_str else set()
+            # Load phrase classifier once (shared across all sessions)
+            if not ServeClientTensorRT._PHRASE_CLASSIFIER_LOADED:
+                from whisper_live.phrase_classifier import load_phrase_classifier
+                ServeClientTensorRT._PHRASE_CLASSIFIER = load_phrase_classifier()
+                ServeClientTensorRT._PHRASE_CLASSIFIER_LOADED = True
+
+            # Build phrase gate callback from classifier
+            phrase_gate = None
+            clf = ServeClientTensorRT._PHRASE_CLASSIFIER
+            if clf is not None:
+                def _phrase_gate(text: str) -> bool:
+                    is_trans, conf = clf.predict(text)
+                    if not is_trans:
+                        logging.info(
+                            f"[{client_uid}] phrase BLOCKED by classifier: "
+                            f"conf={conf:.3f}, text='{text[:40]}'"
+                        )
+                    return is_trans
+                phrase_gate = _phrase_gate
+
             self._detector = KoreanEndingDetector(
                 min_phrase_chars=min_phrase_chars,
                 min_sentence_chars=min_sentence_chars,
                 stability_count=stability_count,
                 extra_flush_markers=extra_markers,
+                phrase_gate=phrase_gate,
             )
             self._last_flushed_text = ""  # dedup: skip re-transcription of just-flushed text
         elif flush_mode == "punctuation":
@@ -109,6 +135,7 @@ class ServeClientTensorRT(ServeClientBase):
             language=self.language,
             task=self.task,
             use_py_session=use_py_session,
+            num_beams=self.num_beams,
             max_output_len=self.max_new_tokens,
             max_batch_size=self.max_batch_size,
         )
@@ -124,7 +151,7 @@ class ServeClientTensorRT(ServeClientBase):
         logging.info(f"[INFO:] Warming up TensorRT engine ({warmup_steps} steps)...")
         mel, _ = self.transcriber.log_mel_spectrogram(warmup_audio)
         for i in range(warmup_steps):
-            self.transcriber.transcribe(mel)
+            self.transcriber.transcribe(mel, num_beams=self.num_beams)
 
     def _build_text_prefix(self):
         """Build decoder prompt with vocab anchoring + transcript context.
@@ -140,8 +167,9 @@ class ServeClientTensorRT(ServeClientBase):
         # Always include initial_prompt (vocab) for entity anchoring,
         # then append prev_transcript for linguistic continuity.
         # Vocab gets a reserved budget so it's never fully displaced.
-        max_chars = 400
-        vocab = self.initial_prompt[:200] if self.initial_prompt else ""
+        # Budget: ~224 Whisper tokens ≈ 500-600 Korean chars total.
+        max_chars = 550
+        vocab = self.initial_prompt[:350] if self.initial_prompt else ""
         transcript = self.prev_transcript[-(max_chars - len(vocab)):] if self.prev_transcript else ""
         context = f"{vocab} {transcript}".strip() if (vocab or transcript) else ""
 
@@ -205,6 +233,9 @@ class ServeClientTensorRT(ServeClientBase):
                 unflushed_check = full_text[self._detector.flushed_len:].strip()
                 last_clean = self._last_flushed_text.rstrip(".!? ")
                 if not unflushed_check or unflushed_check.rstrip(".!? ") == last_clean:
+                    # Preserve current unflushed text so clip_audio_if_no_valid_segment
+                    # can still flush it if the 25s clip fires during the dedup window.
+                    self._last_unflushed_text = unflushed_check or ""
                     return
                 self._last_flushed_text = ""
 
@@ -257,7 +288,18 @@ class ServeClientTensorRT(ServeClientBase):
                 # Sentence: always trim (sentence is complete)
                 # Phrase: trim if previous was also a phrase (consecutive phrases)
                 if decision.flush_type == "sentence":
-                    self.timestamp_offset += duration
+                    if decision.reason == "timeout":
+                        # Emergency timeout: Whisper may have hit max_new_tokens,
+                        # truncating transcription before the audio ended. Keep
+                        # overlap so un-transcribed audio tail gets re-transcribed.
+                        overlap = min(5.0, duration * 0.3)
+                        self.timestamp_offset += max(0, duration - overlap)
+                        logging.info(
+                            f"[{self.client_uid}] Timeout trim: keeping {overlap:.1f}s overlap "
+                            f"(duration={duration:.1f}s)"
+                        )
+                    else:
+                        self.timestamp_offset += duration
                     self._internal_trim()
                     self._last_flush_was_phrase = False
                     self._last_flushed_text = flush_text
@@ -269,26 +311,54 @@ class ServeClientTensorRT(ServeClientBase):
                         self._last_flushed_text = flush_text
                     self._last_flush_was_phrase = True
 
-        # Send the unflushed portion as a partial
+        # Send the unflushed portion as a partial — or as completed if VAD
+        # detected end-of-speech (EOS).  Without EOS handling here, text like
+        # "아멘" after a prayer hangs forever: silence means no new audio, so
+        # the detector's check() is never called and the timeout never fires.
         unflushed = full_text[partial_offset:].strip()
         self._last_unflushed_text = unflushed  # track for clip-flush
         if unflushed:
-            segment = self.format_segment(
-                self.timestamp_offset,
-                self.timestamp_offset + duration,
-                unflushed,
-                completed=False,
-            )
-            try:
-                self.websocket.send(json.dumps({
-                    "uid": self.client_uid,
-                    "segments": [segment],
-                }))
-            except Exception as e:
-                logging.error(f"[ERROR]: Sending partial segment: {e}")
+            if self.eos:
+                self._send_eos_flush(unflushed, duration)
+            else:
+                segment = self.format_segment(
+                    self.timestamp_offset,
+                    self.timestamp_offset + duration,
+                    unflushed,
+                    completed=False,
+                )
+                try:
+                    self.websocket.send(json.dumps({
+                        "uid": self.client_uid,
+                        "segments": [segment],
+                    }))
+                except Exception as e:
+                    logging.error(f"[ERROR]: Sending partial segment: {e}")
 
-        if self.eos:
-            self.update_timestamp_offset(last_segment, duration)
+    def _send_eos_flush(self, text, duration):
+        """Flush unflushed text as a completed segment on VAD end-of-speech.
+
+        Called when VAD silence is detected and there is still unflushed text
+        in Korean/punctuation flush mode.  The orchestrator's clear_buffer
+        response will reset the detector and audio buffer, so we only need
+        to deliver the text here.
+        """
+        segment = self.format_segment(
+            self.timestamp_offset,
+            self.timestamp_offset + duration,
+            text,
+            completed=True,
+        )
+        segment["flush_type"] = "eos"
+        try:
+            self.websocket.send(json.dumps({
+                "uid": self.client_uid,
+                "segments": [segment],
+            }))
+        except Exception as e:
+            logging.error(f"[ERROR]: Sending EOS segment: {e}")
+        logging.info(f"[{self.client_uid}] EOS flush: {len(text)} chars")
+        self._last_unflushed_text = ""
 
     def _handle_turn_based(self, last_segment, duration):
         """Handle transcription for turn-based chat mode.
@@ -458,6 +528,7 @@ class ServeClientTensorRT(ServeClientBase):
         last_segment = self.transcriber.transcribe(
             mel,
             text_prefix=text_prefix,
+            num_beams=self.num_beams,
         )
         if ServeClientTensorRT.SINGLE_MODEL:
             ServeClientTensorRT.SINGLE_MODEL_LOCK.release()
@@ -497,6 +568,13 @@ class ServeClientTensorRT(ServeClientBase):
             # Skip re-transcription if no new audio has arrived since last pass
             n_samples = len(input_bytes)
             if n_samples == last_transcribed_samples:
+                # No new audio.  If VAD detected end-of-speech and there's
+                # unflushed text, flush it now — no future transcription pass
+                # will trigger the detector since silence frames are dropped.
+                if (self.eos and self._detector is not None
+                        and self._last_unflushed_text):
+                    self._send_eos_flush(self._last_unflushed_text, duration)
+                    last_transcribed_samples = 0  # allow fresh start after flush
                 time.sleep(0.1)
                 continue
 

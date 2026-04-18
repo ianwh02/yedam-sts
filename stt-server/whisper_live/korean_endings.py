@@ -137,12 +137,19 @@ class KoreanEndingDetector:
     indicating whether to flush and at what boundary.
 
     Tracks flushed_len internally — only checks unflushed text.
+
+    Optional phrase_gate: a callable(text) -> bool that returns True if a
+    phrase flush should proceed. If False, the detector skips that boundary
+    and continues scanning for the next one. Sentence flushes bypass the gate.
     """
     min_phrase_chars: int = 15      # min chars since last flush for phrase flush
     min_sentence_chars: int = 6     # min chars since last flush for sentence flush
     stability_count: int = 2        # consecutive stable detections before flushing
-    max_no_flush_s: float = 15.0    # emergency fallback: force flush after this many seconds (must be < 25s clip threshold)
+    max_no_flush_s: float = 10.0    # emergency fallback: force flush after this many seconds
+                                    # (must be < 25s clip threshold; kept ≤10s so Whisper's
+                                    # max_new_tokens=96 is unlikely to truncate the buffer)
     extra_flush_markers: set[str] = field(default_factory=set)  # domain-specific markers (e.g. 아멘, 할렐루야)
+    phrase_gate: object = None  # Optional callable(str) -> bool; None = no gate
 
     # ── Internal state ──
     flushed_len: int = field(default=0, init=False)
@@ -154,6 +161,7 @@ class KoreanEndingDetector:
     _sentence_endings: list[str] = field(default_factory=list, init=False)
     _always_flush_markers: set[str] = field(default_factory=set, init=False)
     _standalone_ok: set[str] = field(default_factory=set, init=False)
+    _blocked_endings: set[str] = field(default_factory=set, init=False)  # endings rejected by phrase_gate
 
     def __post_init__(self):
         # Build instance-level copies with extra markers merged in
@@ -233,11 +241,22 @@ class KoreanEndingDetector:
             # Check phrase endings (only if no sentence ending on this token)
             phrase_ending = self._match_phrase_ending(clean)
             if phrase_ending:
+                # Skip endings previously rejected by the phrase gate —
+                # they must not participate in stability tracking.
+                if phrase_ending in self._blocked_endings:
+                    continue
                 chars_since_flush = token_end_pos
                 if chars_since_flush >= self.min_phrase_chars:
                     abs_pos = self.flushed_len + token_end_pos
                     if self._check_stability(phrase_ending, abs_pos):
                         flush_text = unflushed[:token_end_pos].strip()
+                        # Apply phrase gate: if gate rejects, remember
+                        # this ending and continue to the next boundary.
+                        if self.phrase_gate is not None:
+                            if not self.phrase_gate(flush_text):
+                                self._blocked_endings.add(phrase_ending)
+                                self._reset_stability()
+                                continue
                         self._prev_text = text
                         return FlushDecision("phrase", flush_text, abs_pos,
                                              f"~{phrase_ending}")
@@ -251,6 +270,10 @@ class KoreanEndingDetector:
                 if token_start >= self.min_phrase_chars:
                     flush_text = unflushed[:token_start].strip()
                     if flush_text:
+                        # Apply phrase gate to connective flushes too
+                        if self.phrase_gate is not None:
+                            if not self.phrase_gate(flush_text):
+                                continue
                         abs_pos = self.flushed_len + token_start
                         self._prev_text = text
                         return FlushDecision("phrase", flush_text, abs_pos,
@@ -264,12 +287,14 @@ class KoreanEndingDetector:
         # Always advance flushed_len — server-side doesn't clear buffer on flush
         self.flushed_len = end_pos
         self._reset_stability()
+        self._blocked_endings.clear()
         self._last_flush_time = time.monotonic()
 
     def reset(self):
         """Full reset (called when buffer is externally cleared)."""
         self.flushed_len = 0
         self._reset_stability()
+        self._blocked_endings.clear()
         self._last_flush_time = time.monotonic()
         self._prev_text = ""
 
@@ -407,7 +432,9 @@ class PunctuationFlushDetector:
     min_sentence_chars: int = 10     # min chars since last flush for sentence flush
     min_clause_chars: int = 30       # min chars for clause flush (comma/semicolon)
     stability_count: int = 4         # consecutive stable detections before flushing
-    max_no_flush_s: float = 15.0     # emergency fallback: force flush after this many seconds (must be < 25s clip threshold)
+    max_no_flush_s: float = 10.0     # emergency fallback: force flush after this many seconds
+                                     # (must be < 25s clip threshold; kept ≤10s so Whisper's
+                                     # max_new_tokens=96 is unlikely to truncate the buffer)
 
     # ── Internal state ──
     flushed_len: int = field(default=0, init=False)

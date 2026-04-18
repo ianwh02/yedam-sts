@@ -22,15 +22,15 @@ services:
     # Output env: LLM_GPU_MEMORY_UTILIZATION
 
   stt:
-    fixed_mb: 1000        # Whisper small (komixv2) int8_float16 (~500) + CUDA context (~500)
+    fixed_mb: 1800        # Whisper medium (komixv2) int8_float16 (~1300) + CUDA context (~500)
                           # Documentation only — coordinator measures actual
     variable_priority: 1
     min_variable_mb: 50
     # No output env needed — faster-whisper allocates what it needs
 
   stt_trt:
-    fixed_mb: 1500        # Whisper small TRT engines (~800) + CUDA context (~500) + runtime (~200)
-                          # Was 2600 for large-v3-turbo; small is ~3x fewer params
+    fixed_mb: 2500        # Whisper medium TRT engines (~1800) + CUDA context (~500) + runtime (~200)
+                          # Was 1500 for small; medium is ~3x more params
                           # Documentation only — coordinator measures actual
     variable_priority: 1
     min_variable_mb: 100

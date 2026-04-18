@@ -26,9 +26,13 @@ docker-compose.override.yml
 # Models (downloaded at runtime)
 models/
 !tts-server/nano-qwen3tts-vllm/nano-qwen3tts-vllm/models/
+!stt-server/models/
+stt-server/models/*
+!stt-server/models/phrase-classifier/
 *.bin
 *.pt
 *.onnx
+!stt-server/models/phrase-classifier/*.onnx
 *.safetensors
 
 # Logs
@@ -74,3 +78,7 @@ llm-server/
 supabase/
 test_continuous_output/
 test_eos_output/
+
+*.docx
+
+transcript-2026-04-05T16_14.txt

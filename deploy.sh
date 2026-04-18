@@ -7,6 +7,7 @@
 #   ./deploy.sh modal        # Modal only
 #   ./deploy.sh build        # build image only (no push/deploy)
 set -euo pipefail
+trap 'echo ""; read -rp "Press Enter to close..."' EXIT
 
 IMAGE="ghcr.io/ianwh02/yedam-sts:latest"
 TARGET="${1:-all}"

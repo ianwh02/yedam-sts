@@ -35,16 +35,44 @@ image = (
     modal.Image.from_registry(
         "ghcr.io/ianwh02/yedam-sts:latest",
         add_python="3.12",
-        force_build=True,  # Force re-pull from GHCR (remove after stabilizing)
+        # force_build=True,  # Uncomment to force re-pull from GHCR
     )
     .pip_install("huggingface_hub")
     .env({
-        "WHISPER_MODEL_DIR": f"{VOLUME_MOUNT}/whisper-small-komixv2-ct2",
+        "WHISPER_MODEL_DIR": f"{VOLUME_MOUNT}/whisper-medium-komixv2-ct2",
         "MODEL_DIR": f"{VOLUME_MOUNT}/Qwen3-TTS-12Hz-1.7B-Base",
         "TOKENIZER_DIR": f"{VOLUME_MOUNT}/Qwen3-TTS-Tokenizer-12Hz-48kHz",
         "LLM_MODEL": f"{VOLUME_MOUNT}/Qwen3-8B-AWQ",
         "TRT_ENGINE_DIR": f"{VOLUME_MOUNT}/trt_engines",
+        "LLM_GLOSSARIES_DIR": "/app/orchestrator/config/glossaries",
+        "LLM_DEFAULT_GLOSSARY": "nazarene",
+        "STT_INITIAL_PROMPT_VOCAB_PATH": "/app/orchestrator/config/stt_vocab_church.txt",
+        "STT_CORRECTIONS_PATH": "/app/orchestrator/config/stt_corrections.tsv",
     })
+    # Shell scripts need copy=True (baked into image) to preserve exec permissions.
+    .add_local_file("stt-server/convert_model.sh", remote_path="/app/stt-server/convert_model.sh", copy=True)
+    .add_local_file("stt-server/entrypoint.tensorrt.sh", remote_path="/app/stt-server/entrypoint.tensorrt.sh", copy=True)
+    .add_local_file("scripts/start_unified.sh", remote_path="/app/scripts/start_unified.sh", copy=True)
+    .add_local_file("scripts/download_models.sh", remote_path="/app/scripts/download_models.sh", copy=True)
+    .run_commands(
+        "chmod +x /app/stt-server/convert_model.sh /app/stt-server/entrypoint.tensorrt.sh "
+        "/app/scripts/start_unified.sh /app/scripts/download_models.sh"
+    )
+    .pip_install("supabase>=2.0")
+    # Overlay local source for fast iteration (seconds, not minutes).
+    # Mirrors Dockerfile.slim lines 132-151 ("changes frequently" layers).
+    # Only rebuild/re-push GHCR image for dependency changes.
+    # Must come AFTER all build steps (.pip_install, .env, .run_commands).
+    .add_local_dir("stt-server/whisper_live", remote_path="/app/stt-server/whisper_live")
+    .add_local_dir("stt-server/models/phrase-classifier", remote_path="/app/stt-server/models/phrase-classifier")
+    .add_local_file("stt-server/run_server.py", remote_path="/app/stt-server/run_server.py")
+    .add_local_file("tts-server/server.py", remote_path="/app/tts-server/server.py")
+    .add_local_dir("tts-server/ref_audio", remote_path="/app/tts-server/ref_audio")
+    .add_local_dir("tts-server/stage-configs", remote_path="/app/tts-server/stage-configs")
+    .add_local_dir("orchestrator/src", remote_path="/app/orchestrator/src")
+    .add_local_dir("orchestrator/config", remote_path="/app/orchestrator/config")
+    .add_local_file("vram_budget.yml", remote_path="/app/vram_budget.yml")
+    .add_local_file("scripts/vram_budget.py", remote_path="/app/scripts/vram_budget.py")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -79,12 +107,12 @@ def download_models():
 # --- Main service (all 4 services in one container) ---
 @app.function(
     volumes={VOLUME_MOUNT: models_volume},
-    gpu="L4",               # L4 (sm_89, cheapest 24GB option)
+    gpu="A10G",              # A10G (sm_86, 24GB, 2x memory bandwidth vs L4)
     timeout=86400,          # 24 hours max
     scaledown_window=300,   # 5 min idle before scale-to-zero
     min_containers=0,       # scale to zero when idle (set to 1 to keep warm)
     max_containers=1,       # single GPU instance for shared pipeline
-    secrets=[modal.Secret.from_dict({"PLACEHOLDER": "1"})],  # add real secrets via Modal dashboard
+    secrets=[modal.Secret.from_name("yedam-supabase", required_keys=["BIBLE_SUPABASE_URL", "BIBLE_SUPABASE_KEY"])],
 )
 @modal.concurrent(max_inputs=100)
 @modal.web_server(port=8080, startup_timeout=600)

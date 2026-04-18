@@ -131,6 +131,7 @@ RUN python3 -c "from nano_qwen3tts_vllm.interface import Qwen3TTSInterface; prin
 
 # ── Source code (changes frequently → last layers for fast rebuilds) ──
 COPY stt-server/whisper_live/ /app/stt-server/whisper_live/
+COPY stt-server/models/phrase-classifier/ /app/stt-server/models/phrase-classifier/
 COPY stt-server/run_server.py /app/stt-server/
 COPY stt-server/convert_model.sh /app/stt-server/
 COPY stt-server/entrypoint.tensorrt.sh /app/stt-server/
@@ -142,6 +143,7 @@ COPY tts-server/ref_audio/ /app/tts-server/ref_audio/
 COPY orchestrator/config/ /app/orchestrator/config/
 COPY orchestrator/src/ /app/orchestrator/src/
 RUN cd /app/orchestrator && pip install --no-cache-dir --no-deps ".[audio]"
+RUN pip install --no-cache-dir supabase>=2.0
 
 COPY vram_budget.yml /app/
 COPY scripts/vram_budget.py /app/scripts/
@@ -154,7 +156,7 @@ RUN chmod +x /app/scripts/start_unified.sh /app/scripts/download_models.sh
 # Volume disk persists on podStop (unlike container disk which is erased).
 # First boot: download_models.sh populates /models (~15 GB)
 # Subsequent boots: models already there after podResume
-ENV WHISPER_MODEL_DIR=/models/whisper-small-komixv2-ct2
+ENV WHISPER_MODEL_DIR=/models/whisper-medium-komixv2-ct2
 ENV MODEL_DIR=/models/Qwen3-TTS-12Hz-1.7B-Base
 ENV TOKENIZER_DIR=/models/Qwen3-TTS-Tokenizer-12Hz-48kHz
 ENV LLM_MODEL=/models/Qwen3-8B-AWQ
@@ -196,7 +198,8 @@ ENV STT_BACKEND=tensorrt
 ENV WHISPER_COMPUTE_TYPE=int8_float16
 ENV OMP_NUM_THREADS=4
 ENV TRT_ENGINE_DIR=/models/trt_engines
-ENV WHISPER_MODEL=seastar105/whisper-small-komixv2
+ENV WHISPER_MODEL=seastar105/whisper-medium-komixv2
+ENV BEAM_SIZE=3
 
 # Orchestrator defaults
 ENV STT_WS_URL=ws://localhost:9090
@@ -206,6 +209,8 @@ ENV DEFAULT_SOURCE_LANG=ko
 ENV DEFAULT_TARGET_LANG=en
 ENV DEFAULT_PROCESSOR=translation
 ENV LLM_SYSTEM_PROMPT_PATH=/app/orchestrator/config/llm_prompt_church.txt
+ENV LLM_GLOSSARIES_DIR=/app/orchestrator/config/glossaries
+ENV LLM_DEFAULT_GLOSSARY=nazarene
 ENV STT_INITIAL_PROMPT_VOCAB_PATH=/app/orchestrator/config/stt_vocab_church.txt
 
 # TF32 for TTS matmul throughput

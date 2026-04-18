@@ -16,7 +16,7 @@ services:
     environment:
       - OMP_NUM_THREADS=${WHISPER_OMP_NUM_THREADS:-4}
       - WHISPER_MODEL=${WHISPER_TRT_MODEL:-large-v3-turbo}
-      - BEAM_SIZE=${STT_BEAM_SIZE:-1}
+      - BEAM_SIZE=${STT_BEAM_SIZE:-3}
       - ENGINE_DIR=/app/engines
       - ASSETS_DIR=/app/assets
       - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps

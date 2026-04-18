@@ -29,6 +29,12 @@ if [ -x /app/scripts/download_models.sh ]; then
     /app/scripts/download_models.sh "/models"
 fi
 
+# ── NVIDIA MPS (disabled) ──
+# MPS would partition GPU compute across services, but RunPod containers
+# don't expose the required driver support. GPU compute is unpartitioned;
+# client-side audio buffering absorbs TTS RTF spikes instead.
+unset CUDA_MPS_PIPE_DIRECTORY CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 2>/dev/null || true
+
 # ── Phase 0: Compute VRAM budget ──
 log "=== Phase 0: Computing VRAM budget ==="
 GPU_TOTAL_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
@@ -105,22 +111,18 @@ log "=== Phase 1b: Starting STT + TTS ==="
 
 cd /app/stt-server
 if [ "${STT_BACKEND:-tensorrt}" = "tensorrt" ]; then
-    # Build TRT engines on first boot (cached on volume disk)
+    # Build/verify TRT engines (convert_model.sh handles skip-if-unchanged)
     ENGINE_DIR="${TRT_ENGINE_DIR:-/models/trt_engines}"
-    if [ ! -f "${ENGINE_DIR}/encoder/rank0.engine" ] || \
-       [ ! -f "${ENGINE_DIR}/decoder/rank0.engine" ]; then
-        log "Building TRT engines (first boot, ~10-15 min)..."
-        WHISPER_HF_MODEL="${WHISPER_MODEL:-seastar105/whisper-small-komixv2}"
-        # If HF model was downloaded to /models, use local path
-        if [ -d "/models/whisper-small-komixv2-hf" ]; then
-            WHISPER_HF_MODEL="/models/whisper-small-komixv2-hf"
-        fi
-        PATH="/opt/stt-trt-venv/bin:$PATH" \
-            ./convert_model.sh "${WHISPER_HF_MODEL}" "${ENGINE_DIR}"
-        log "TRT engines built at ${ENGINE_DIR}"
-    else
-        log "TRT engines found at ${ENGINE_DIR}, skipping build."
+    WHISPER_HF_MODEL="${WHISPER_MODEL:-seastar105/whisper-medium-komixv2}"
+    # If HF model was downloaded to /models, use local path
+    if [ -d "/models/whisper-medium-komixv2-hf" ]; then
+        WHISPER_HF_MODEL="/models/whisper-medium-komixv2-hf"
     fi
+    log "Checking TRT engines (model=${WHISPER_HF_MODEL}, beam=${BEAM_SIZE:-3})..."
+    MAX_BEAM_WIDTH="${BEAM_SIZE:-3}" \
+    PATH="/opt/stt-trt-venv/bin:$PATH" \
+        ./convert_model.sh "${WHISPER_HF_MODEL}" "${ENGINE_DIR}"
+    log "TRT engines ready at ${ENGINE_DIR}"
 
     /opt/stt-trt-venv/bin/python3 run_server.py \
         --port 9090 \
@@ -134,7 +136,7 @@ if [ "${STT_BACKEND:-tensorrt}" = "tensorrt" ]; then
         --batch_inference \
         --batch_max_size 8 \
         --batch_window_ms 25 \
-        --beam_size 1 \
+        --beam_size "${BEAM_SIZE:-3}" \
         2>&1 | tee /tmp/stt.log &
 else
     python3 run_server.py \
@@ -147,7 +149,7 @@ else
         --batch_inference \
         --batch_max_size 8 \
         --batch_window_ms 25 \
-        --beam_size 1 \
+        --beam_size "${BEAM_SIZE:-3}" \
         2>&1 | tee /tmp/stt.log &
 fi
 STT_PID=$!

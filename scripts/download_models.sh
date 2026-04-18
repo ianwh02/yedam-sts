@@ -11,9 +11,23 @@ SENTINEL="${MODELS_DIR}/.downloaded"
 
 log() { echo "$(date '+%H:%M:%S') [download] $*"; }
 
+# Check if STT model changed since last download (auto-invalidate stale STT cache)
+WHISPER_HF_REPO="${WHISPER_MODEL:-seastar105/whisper-medium-komixv2}"
 if [ -f "$SENTINEL" ]; then
-    log "Models already present (${SENTINEL} exists), skipping download."
-    exit 0
+    PREV_STT=$(grep '^WHISPER_MODEL=' "$SENTINEL" 2>/dev/null | cut -d= -f2- || echo "")
+    if [ "$PREV_STT" = "$WHISPER_HF_REPO" ]; then
+        log "Models already present and STT model unchanged (${WHISPER_HF_REPO}), skipping."
+        exit 0
+    elif [ -n "$PREV_STT" ]; then
+        log "STT model changed: ${PREV_STT} → ${WHISPER_HF_REPO}"
+        log "Removing stale STT artifacts..."
+        rm -rf "${MODELS_DIR}"/whisper-*-hf "${MODELS_DIR}"/whisper-*-ct2
+        rm -f "$SENTINEL"
+    else
+        # Old sentinel format (no model info) — re-download STT only
+        log "Sentinel exists but has no model info, checking STT..."
+        rm -f "$SENTINEL"
+    fi
 fi
 
 if [ -z "${HF_TOKEN:-}" ]; then
@@ -37,40 +51,39 @@ snapshot_download('${repo}', local_dir='${dest}')"
     log "  OK ${repo}"
 }
 
-# STT: Korean Whisper small (seastar105 fine-tuned on Korean datasets)
+# STT: Korean Whisper medium (seastar105 fine-tuned on Korean datasets)
 STT_BACKEND_MODE="${STT_BACKEND:-tensorrt}"
-WHISPER_HF_REPO="${WHISPER_MODEL:-seastar105/whisper-small-komixv2}"
 
 if [ "$STT_BACKEND_MODE" = "tensorrt" ]; then
     # TRT: download HF model only (engine conversion happens at startup on the GPU)
-    STT_HF_DIR="${MODELS_DIR}/whisper-small-komixv2-hf"
+    STT_HF_DIR="${MODELS_DIR}/whisper-medium-komixv2-hf"
     if [ -d "$STT_HF_DIR" ] && [ "$(ls -A "$STT_HF_DIR" 2>/dev/null)" ]; then
         log "  SKIP STT HF model → ${STT_HF_DIR} (already exists)"
     else
-        download "$WHISPER_HF_REPO" "whisper-small-komixv2-hf"
+        download "$WHISPER_HF_REPO" "whisper-medium-komixv2-hf"
     fi
 else
     # CTranslate2: download HF model and convert for faster-whisper
-    STT_CT2_DIR="${MODELS_DIR}/whisper-small-komixv2-ct2"
+    STT_CT2_DIR="${MODELS_DIR}/whisper-medium-komixv2-ct2"
     if [ -d "$STT_CT2_DIR" ] && [ "$(ls -A "$STT_CT2_DIR" 2>/dev/null)" ]; then
         log "  SKIP STT model → ${STT_CT2_DIR} (already exists)"
     else
-        download "$WHISPER_HF_REPO" "whisper-small-komixv2-hf"
-        if [ ! -f "${MODELS_DIR}/whisper-small-komixv2-hf/tokenizer.json" ]; then
+        download "$WHISPER_HF_REPO" "whisper-medium-komixv2-hf"
+        if [ ! -f "${MODELS_DIR}/whisper-medium-komixv2-hf/tokenizer.json" ]; then
             log "  Generating tokenizer.json from slow tokenizer files..."
             python3 -c "\
 from transformers import AutoTokenizer; \
-t = AutoTokenizer.from_pretrained('${MODELS_DIR}/whisper-small-komixv2-hf'); \
-t.save_pretrained('${MODELS_DIR}/whisper-small-komixv2-hf')"
+t = AutoTokenizer.from_pretrained('${MODELS_DIR}/whisper-medium-komixv2-hf'); \
+t.save_pretrained('${MODELS_DIR}/whisper-medium-komixv2-hf')"
         fi
         log "  Converting to CTranslate2 format (int8_float16)..."
         ct2-transformers-converter \
-            --model "${MODELS_DIR}/whisper-small-komixv2-hf" \
+            --model "${MODELS_DIR}/whisper-medium-komixv2-hf" \
             --output_dir "$STT_CT2_DIR" \
             --quantization int8_float16 \
             --copy_files tokenizer.json preprocessor_config.json
         log "  OK CTranslate2 conversion"
-        rm -rf "${MODELS_DIR}/whisper-small-komixv2-hf"
+        rm -rf "${MODELS_DIR}/whisper-medium-komixv2-hf"
     fi
 fi
 
@@ -89,6 +102,9 @@ download "takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz" "Qwen3-TTS-Tokenizer-12Hz-48
 # LLM: Qwen3-8B-AWQ (4-bit quantized, ~4.5 GB)
 download "Qwen/Qwen3-8B-AWQ" "Qwen3-8B-AWQ"
 
-# Write sentinel
-date -u > "$SENTINEL"
+# Write sentinel with model versions for change detection
+cat > "$SENTINEL" <<EOF
+WHISPER_MODEL=${WHISPER_HF_REPO}
+DOWNLOADED=$(date -u)
+EOF
 log "=== All models downloaded. Sentinel written to ${SENTINEL} ==="

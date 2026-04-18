@@ -159,8 +159,11 @@ services:
       - LLM_CONTEXT_WINDOW_SEGMENTS=${LLM_CONTEXT_WINDOW_SEGMENTS:-3}
       - STT_INITIAL_PROMPT_SEGMENTS=${STT_INITIAL_PROMPT_SEGMENTS:-3}
       - LLM_SYSTEM_PROMPT_PATH=${LLM_SYSTEM_PROMPT_PATH:-}
+      - LLM_GLOSSARIES_DIR=${LLM_GLOSSARIES_DIR:-/app/orchestrator/config/glossaries}
+      - LLM_DEFAULT_GLOSSARY=${LLM_DEFAULT_GLOSSARY:-nazarene}
       - STT_INITIAL_PROMPT_VOCAB=${STT_INITIAL_PROMPT_VOCAB:-}
       - STT_INITIAL_PROMPT_VOCAB_PATH=${STT_INITIAL_PROMPT_VOCAB_PATH:-}
+      - STT_CORRECTIONS_PATH=${STT_CORRECTIONS_PATH:-/app/orchestrator/config/stt_corrections.tsv}
     ports:
       - "${ORCHESTRATOR_PORT:-8080}:8080"
     # No depends_on — start.sh handles startup ordering:

@@ -23,11 +23,22 @@ class Settings(BaseSettings):
     stt_initial_prompt_vocab: str = ""  # inline domain vocabulary
     stt_initial_prompt_vocab_path: str = ""  # path to domain vocabulary file
 
+    # STT post-processing
+    stt_corrections_path: str = ""  # path to domain corrections TSV file (wrong<TAB>correct)
+    stt_spacing_enabled: bool = False  # enable pykospacing for Korean spacing correction (requires pip install pykospacing)
+
     # LLM context
     llm_system_prompt_path: str = ""  # path to custom system prompt file
+    llm_glossaries_dir: str = ""  # directory containing denomination glossary JSONs
+    llm_default_glossary: str = ""  # default glossary ID (filename without .json)
     llm_model: str = os.environ.get("LLM_MODEL", "Qwen/Qwen3-4B-AWQ")
     llm_context_window_segments: int = 3
     llm_summary_interval_segments: int = 10
+
+    # Bible verse lookup (Supabase)
+    bible_supabase_url: str = ""  # Supabase project URL
+    bible_supabase_key: str = ""  # Supabase anon key (public read)
+    bible_translation: str = "kjv"  # default Bible translation
 
     # Session limits
     max_concurrent_sessions: int = 5
@@ -41,8 +52,8 @@ class Settings(BaseSettings):
     tts_max_concurrent: int = 5  # max concurrent TTS HTTP requests (global semaphore)
     tts_streaming_enabled: bool = True  # use streaming TTS endpoint for lower TTFA
     tts_opus_enabled: bool = False  # encode TTS output to Opus before callbacks
-    tts_inter_segment_pause_ms: int = 300  # silence between TTS segments for natural pacing
-    tts_segment_gap_ms: int = 400  # minimum silence gap between continuous TTS segments (only added if segments arrive back-to-back)
+    # Delimiter-aware silence is now handled in TTSClient._consume_loop
+    # using _DELIMITER_SILENCE durations, only inserted when back-to-back.
     tts_voice_clone_init_timeout: float = 90.0  # timeout for per-session voice clone init (first call after boot can take ~40s)
     tts_continuous_enabled: bool = True  # use continuous TTS streaming (KV cache across segments)
 
@@ -52,7 +63,9 @@ class Settings(BaseSettings):
     tts_max_words_per_chunk: int = 35  # force split at this word count
 
     # Audio preprocessing
-    audio_rnnoise_enabled: bool = True
+    audio_denoise_enabled: bool = True  # spectral noise suppression via noisereduce
+    audio_denoise_stationary: bool = True  # True = fast stationary mode; False = adaptive (slower)
+    audio_denoise_prop_decrease: float = 0.8  # noise reduction strength (0.0-1.0, higher = more aggressive)
     audio_rms_normalize: bool = True
     audio_rms_target: float = 0.1
     audio_sample_rate: int = 16000

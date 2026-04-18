@@ -7,9 +7,11 @@ import uuid
 import httpx
 
 from ..audio.preprocess import AudioPreprocessor
+from ..bible.lookup import BibleLookup
 from ..config import settings
 from ..processors.passthrough import PassthroughProcessor
 from ..processors.translation import TranslationProcessor
+from ..text.korean_postprocess import KoreanPostProcessor
 from ..tts.client import TTSClient
 from .callbacks import SessionCallbacks
 from .orchestrator import SessionOrchestrator
@@ -38,6 +40,8 @@ class PipelineManager:
         # Shared components (set via initialize)
         self._preprocessor: AudioPreprocessor | None = None
         self._tts_client: TTSClient | None = None
+        self._korean_pp: KoreanPostProcessor | None = None
+        self._bible: BibleLookup | None = None
         self._processors: dict[str, TranslationProcessor | PassthroughProcessor] = {}
 
     async def initialize(
@@ -48,6 +52,24 @@ class PipelineManager:
         self._preprocessor = preprocessor
         self._tts_client = tts_client
         self._http_client = httpx.AsyncClient(timeout=10.0)
+
+        # Initialize Korean post-processor (domain corrections + optional spacing)
+        if settings.stt_corrections_path or settings.stt_spacing_enabled:
+            self._korean_pp = KoreanPostProcessor(
+                corrections_path=settings.stt_corrections_path,
+                use_spacing=settings.stt_spacing_enabled,
+            )
+            await self._korean_pp.initialize()
+
+        # Initialize Bible verse lookup (optional — needs Supabase config)
+        if settings.bible_supabase_url and settings.bible_supabase_key:
+            self._bible = BibleLookup(
+                supabase_url=settings.bible_supabase_url,
+                supabase_key=settings.bible_supabase_key,
+                translation=settings.bible_translation,
+            )
+            await self._bible.initialize()
+            logger.info("Bible lookup initialized (translation=%s)", settings.bible_translation)
 
         # Initialize processors
         translation = TranslationProcessor()
@@ -84,6 +106,8 @@ class PipelineManager:
             await processor.shutdown()
         self._processors.clear()
 
+        if self._bible:
+            await self._bible.shutdown()
         if self._http_client:
             await self._http_client.aclose()
         logger.info("PipelineManager shut down")
@@ -98,6 +122,9 @@ class PipelineManager:
         target_lang: str | None = None,
         processor_type: str | None = None,
         callbacks: SessionCallbacks | None = None,
+        glossary_id: str | None = None,
+        church_name: str | None = None,
+        church_name_native: str | None = None,
         tts_config=None,
     ) -> TranslationSession:
         if self.active_session_count >= settings.max_concurrent_sessions:
@@ -112,6 +139,9 @@ class PipelineManager:
             source_lang=source_lang or settings.default_source_lang,
             target_lang=target_lang or settings.default_target_lang,
             processor_type=proc_type,
+            glossary_id=glossary_id or settings.llm_default_glossary or None,
+            church_name=church_name,
+            church_name_native=church_name_native,
         )
 
         # Store voice config from platform
@@ -124,6 +154,10 @@ class PipelineManager:
 
         session.is_active = True
         self.sessions[session_id] = session
+        logger.info(
+            "Session %s created (glossary_id=%s, church=%s)",
+            session_id, session.glossary_id, session.church_name,
+        )
 
         # Wire broadcast callbacks for listener WebSockets
         broadcast = session.broadcast
@@ -154,16 +188,21 @@ class PipelineManager:
             if callbacks and callbacks.on_processor_final:
                 await callbacks.on_processor_final(text, segment_index)
 
+        async def _admin_send(pcm: bytes):
+            try:
+                await session.admin_ws.send_bytes(pcm)
+            except Exception:
+                pass
+
         async def _broadcast_tts_audio(pcm_bytes: bytes, segment_index: int, sentence_index: int):
-            # Opus-encode once, distribute to all HTTP listener streams
+            # Opus-encode once, enqueue raw frames to all listener WebSockets (non-blocking)
             await broadcast.broadcast_audio(pcm_bytes)
 
-            # Raw PCM to admin WebSocket for monitoring / translation devices
+            # Fire-and-forget PCM to admin for monitoring.  Must not block the
+            # TTS delivery loop — even a brief admin network hiccup would pause
+            # frame enqueuing and starve the listener drain tasks.
             if session.admin_ws:
-                try:
-                    await session.admin_ws.send_bytes(pcm_bytes)
-                except Exception:
-                    pass  # admin disconnected — non-fatal
+                asyncio.create_task(_admin_send(pcm_bytes))
 
             if callbacks and callbacks.on_tts_audio:
                 await callbacks.on_tts_audio(pcm_bytes, segment_index, sentence_index)
@@ -223,6 +262,8 @@ class PipelineManager:
             processor=processor,
             tts_client=self._tts_client,
             callbacks=broadcast_callbacks,
+            korean_postprocessor=self._korean_pp,
+            bible_lookup=self._bible,
         )
         await orchestrator.start()
         self._orchestrators[session_id] = orchestrator

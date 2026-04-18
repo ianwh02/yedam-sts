@@ -11,155 +11,143 @@ from ..audio.ogg_opus import OpusFrameEncoder
 
 logger = logging.getLogger(__name__)
 
-# Sentinel pushed into audio queues after a sentence's audio is fully sent.
-# Tells the stream generator: "no more audio coming right now, send silence."
-SILENCE_SENTINEL = object()
+# Per-listener buffer: 250 frames × 20ms = 5 seconds of audio.
+_QUEUE_SIZE = 250
+
+
+class _ListenerSlot:
+    """Per-listener outbound queue and independent drain loop."""
+
+    __slots__ = ("ws", "queue", "_task", "_dropped")
+
+    def __init__(self, ws: WebSocket, on_dead):
+        self.ws = ws
+        self.queue: asyncio.Queue[tuple[bytes | str, bool]] = asyncio.Queue(
+            maxsize=_QUEUE_SIZE,
+        )
+        self._dropped = 0
+        self._task = asyncio.create_task(self._drain(on_dead))
+
+    def enqueue(self, payload: bytes | str, binary: bool) -> None:
+        """Non-blocking enqueue.  Drops the frame if the queue is full."""
+        try:
+            self.queue.put_nowait((payload, binary))
+        except asyncio.QueueFull:
+            self._dropped += 1
+
+    async def _drain(self, on_dead):
+        ws_send_bytes = self.ws.send_bytes
+        ws_send_text = self.ws.send_text
+        queue = self.queue
+        try:
+            while True:
+                payload, binary = await queue.get()
+                try:
+                    await (ws_send_bytes(payload) if binary else ws_send_text(payload))
+                    # Batch: drain all immediately available frames without
+                    # yielding back to queue.get(), reducing event-loop overhead.
+                    while not queue.empty():
+                        payload, binary = queue.get_nowait()
+                        await (ws_send_bytes(payload) if binary else ws_send_text(payload))
+                except Exception:
+                    logger.warning(
+                        "Listener evicted: send failed (dropped %d frames prior)",
+                        self._dropped,
+                    )
+                    await on_dead(self.ws)
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def stop(self):
+        self._task.cancel()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        if self._dropped:
+            logger.info(
+                "Listener disconnected (dropped %d frames total)", self._dropped,
+            )
 
 
 class BroadcastHub:
     """Fan-out a single pipeline's output to N listeners.
 
-    Text messages (transcripts) go to WebSocket listeners.
-    Audio is Opus-encoded once (shared encoder) then distributed as
-    pre-encoded frames to asyncio.Queue subscribers. Each HTTP stream
-    endpoint wraps frames in OGG pages (cheap, per-connection).
+    Text messages (transcripts) go as JSON text frames.
+    Audio is Opus-encoded once (shared encoder) then each raw Opus frame
+    is sent as a binary WebSocket frame to all listeners.
+
+    Each listener gets an independent bounded queue with its own drain task,
+    so a slow listener never blocks the pipeline or other listeners.
     """
 
     def __init__(self):
-        self.listeners: set[WebSocket] = set()
-        self._audio_queues: set[asyncio.Queue] = set()
+        self._slots: dict[WebSocket, _ListenerSlot] = {}
         self._lock = asyncio.Lock()
         self._opus_encoder = OpusFrameEncoder()
 
     @property
     def count(self) -> int:
-        return len(self.listeners) + len(self._audio_queues)
+        return len(self._slots)
 
     async def add(self, ws: WebSocket):
         async with self._lock:
-            self.listeners.add(ws)
+            if ws not in self._slots:
+                self._slots[ws] = _ListenerSlot(ws, self._evict)
         logger.info("WS listener added (total: %d)", self.count)
 
     async def remove(self, ws: WebSocket):
         async with self._lock:
-            self.listeners.discard(ws)
+            slot = self._slots.pop(ws, None)
+        if slot:
+            await slot.stop()
         logger.info("WS listener removed (total: %d)", self.count)
 
-    async def add_audio_queue(self, q: asyncio.Queue) -> None:
-        async with self._lock:
-            self._audio_queues.add(q)
-        logger.info("Audio queue added (total: %d)", len(self._audio_queues))
-
-    async def remove_audio_queue(self, q: asyncio.Queue) -> None:
-        async with self._lock:
-            self._audio_queues.discard(q)
-        logger.info("Audio queue removed (total: %d)", len(self._audio_queues))
-
     async def broadcast_text(self, message: dict):
-        """Send a JSON text message to all WebSocket listeners."""
+        """Enqueue a JSON text message to all listeners (non-blocking)."""
         payload = json.dumps(message)
-        await self._send_to_all_ws(payload, binary=False)
-
-    @property
-    def silence_frame(self) -> bytes:
-        """Pre-encoded Opus silence frame for stream padding."""
-        return self._opus_encoder.silence_frame
+        self._enqueue_all(payload, binary=False)
 
     async def broadcast_audio(self, pcm_bytes: bytes):
-        """Encode PCM to Opus once, distribute frames to all queue subscribers."""
+        """Encode PCM to Opus once, enqueue frames to all listeners."""
         self._last_audio_t = time.monotonic()
-
-        # Encode once (shared encoder)
-        opus_frames = self._opus_encoder.feed_pcm(pcm_bytes)
-
-        # Distribute pre-encoded frames to all queues
-        async with self._lock:
-            for frame in opus_frames:
-                for q in self._audio_queues:
-                    try:
-                        q.put_nowait(frame)
-                    except asyncio.QueueFull:
-                        pass  # drop frame if consumer is slow
+        for frame in self._opus_encoder.feed_pcm(pcm_bytes):
+            self._enqueue_all(frame, binary=True)
 
     async def signal_silence(self):
-        """Tell all audio stream consumers to enter silence mode."""
+        """Flush residual PCM at sentence boundary."""
         now = time.monotonic()
         gap = now - getattr(self, "_last_audio_t", now)
         logger.info("[LATENCY] signal_silence: gap_since_last_audio=%.3fs", gap)
-
-        # Flush any residual PCM in the encoder (prevents stale audio mixing
-        # into the next sentence's first frame)
-        residual_frames = self._opus_encoder.flush()
-
-        async with self._lock:
-            # Send any residual audio frames first
-            for frame in residual_frames:
-                for q in self._audio_queues:
-                    try:
-                        q.put_nowait(frame)
-                    except asyncio.QueueFull:
-                        pass
-
-            for q in self._audio_queues:
-                try:
-                    q.put_nowait(SILENCE_SENTINEL)
-                except asyncio.QueueFull:
-                    pass
-
-    async def _send_to_all_ws(self, payload: str | bytes, binary: bool):
-        async with self._lock:
-            if not self.listeners:
-                return
-
-            dead: set[WebSocket] = set()
-            tasks = [
-                self._safe_send(ws, payload, binary, dead)
-                for ws in self.listeners
-            ]
-            await asyncio.gather(*tasks)
-
-            if dead:
-                self.listeners -= dead
-                logger.info(
-                    "Removed %d dead WS listeners (remaining: %d)",
-                    len(dead),
-                    len(self.listeners),
-                )
+        for frame in self._opus_encoder.flush():
+            self._enqueue_all(frame, binary=True)
 
     async def close_all(self):
         """Close all listener connections (called when session stops)."""
         async with self._lock:
-            for ws in list(self.listeners):
-                try:
-                    await ws.close(code=1000, reason="Session ended")
-                except Exception:
-                    pass
-            count = len(self.listeners)
-            self.listeners.clear()
-            if count:
-                logger.info("Closed %d WS listener(s) on session stop", count)
+            slots = list(self._slots.values())
+            self._slots.clear()
+        for slot in slots:
+            await slot.stop()
+            try:
+                await slot.ws.close(code=1000, reason="Session ended")
+            except Exception:
+                pass
+        if slots:
+            logger.info("Closed %d WS listener(s) on session stop", len(slots))
 
-            # Signal audio queues to stop — clear first to guarantee sentinel delivery
-            for q in self._audio_queues:
-                while not q.empty():
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                q.put_nowait(None)  # sentinel
-            self._audio_queues.clear()
+    def _enqueue_all(self, payload: bytes | str, binary: bool):
+        """Non-blocking fan-out to every listener queue."""
+        for slot in self._slots.values():
+            slot.enqueue(payload, binary)
 
-    @staticmethod
-    async def _safe_send(
-        ws: WebSocket,
-        payload: str | bytes,
-        binary: bool,
-        dead: set[WebSocket],
-    ):
+    async def _evict(self, ws: WebSocket):
+        """Remove a dead/slow listener (called from its own drain task)."""
+        async with self._lock:
+            self._slots.pop(ws, None)
         try:
-            if binary:
-                await ws.send_bytes(payload)
-            else:
-                await ws.send_text(payload)
+            await ws.close(code=1008, reason="Too slow")
         except Exception:
-            dead.add(ws)
+            pass
+        logger.info("Evicted slow listener (remaining: %d)", self.count)

@@ -53,6 +53,11 @@ class TranslationSession:
     target_lang: str = "en"
     processor_type: str = "translation"
 
+    # Per-session glossary (denomination glossary ID + optional church name override)
+    glossary_id: str | None = None
+    church_name: str | None = None
+    church_name_native: str | None = None
+
     # Per-session voice config (from platform tts_config)
     voice_mode: str | None = None  # "preset" | "design" | "clone" | None (use server default)
     speaker: str | None = None  # preset speaker ID (e.g. "Ryan", "Sohee")
@@ -69,6 +74,9 @@ class TranslationSession:
     # Transcript accumulator (for LLM context + storage)
     transcript: list[TranscriptSegment] = field(default_factory=list)
     completed_segment_count: int = 0
+
+    # Bible verses detected during this session (persist for all future LLM calls)
+    bible_verses: list[str] = field(default_factory=list)
 
     # State
     is_active: bool = False

@@ -188,3 +188,18 @@ class OggPageWriter:
         )
         self._page_seq += 1
         return page
+
+    def keepalive_page(self) -> bytes:
+        """Empty OGG page that keeps the HTTP connection alive.
+
+        Does NOT advance the granule position, so the browser sees no
+        time progression.  The page contains no audio packets — the
+        decoder ignores it but the HTTP chunked-transfer layer sees
+        bytes flowing, preventing proxy idle timeouts.
+        """
+        page = _make_ogg_page(
+            self._serial, self._page_seq, self._granule,
+            [],  # no packets
+        )
+        self._page_seq += 1
+        return page

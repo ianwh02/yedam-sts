@@ -5,9 +5,13 @@ import logging
 import re
 
 from ..audio.preprocess import AudioPreprocessor
+from ..bible.lookup import BibleLookup
 from ..config import settings
+from ..llm.glossary import get_glossary
 from ..processors.base import BaseProcessor
 from ..stt.client import STTClient
+from ..text.filters import strip_leading_fillers
+from ..text.korean_postprocess import KoreanPostProcessor
 from ..tts.client import TTSClient, TTSQueueItem
 from .callbacks import SessionCallbacks
 from .session import TranslationSession
@@ -39,29 +43,31 @@ class SentenceBoundaryDetector:
     def _word_count(self) -> int:
         return len(self._buffer.split())
 
-    def _emit(self) -> tuple[str, int]:
+    def _emit(self, delimiter: str = "") -> tuple[str, int, str]:
         sentence = self._buffer.strip()
         idx = self._sentence_index
         self._buffer = ""
         self._sentence_index += 1
-        return sentence, idx
+        return sentence, idx, delimiter
 
-    def feed(self, token: str) -> tuple[str, int] | None:
-        """Feed a token and return a complete sentence if boundary detected."""
+    def feed(self, token: str) -> tuple[str, int, str] | None:
+        """Feed a token and return (sentence, index, delimiter) if boundary detected."""
         self._buffer += token
 
         # Rule 1: sentence-ending punctuation splits (if buffer has enough words
         # for TTS to produce quality audio — short fragments like "Yes." get
         # combined with the next sentence)
-        if _SENTENCE_END.search(self._buffer) and self._word_count() >= settings.tts_min_words_sentence_split:
-            return self._emit()
+        m = _SENTENCE_END.search(self._buffer)
+        if m and self._word_count() >= settings.tts_min_words_sentence_split:
+            return self._emit(delimiter=m.group().strip())
 
         # Rule 2: comma boundary when buffer is long enough
+        m = _COMMA_BOUNDARY.search(self._buffer)
         if (
-            _COMMA_BOUNDARY.search(self._buffer)
+            m
             and self._word_count() >= settings.tts_min_words_comma_split
         ):
-            return self._emit()
+            return self._emit(delimiter=",")
 
         # Rule 3: hard max length — split at last space
         if self._word_count() >= settings.tts_max_words_per_chunk:
@@ -71,14 +77,14 @@ class SentenceBoundaryDetector:
                 self._buffer = self._buffer[last_space + 1:]
                 idx = self._sentence_index
                 self._sentence_index += 1
-                return sentence, idx
+                return sentence, idx, ""
 
         return None
 
-    def flush(self) -> tuple[str, int] | None:
+    def flush(self) -> tuple[str, int, str] | None:
         """Flush remaining buffer as a final sentence."""
         if self._buffer.strip():
-            return self._emit()
+            return self._emit(delimiter=".")
         return None
 
 
@@ -103,12 +109,16 @@ class SessionOrchestrator:
         processor: BaseProcessor,
         tts_client: TTSClient,
         callbacks: SessionCallbacks | None = None,
+        korean_postprocessor: KoreanPostProcessor | None = None,
+        bible_lookup: BibleLookup | None = None,
     ):
         self._session = session
         self._preprocessor = preprocessor
         self._processor = processor
         self._tts_client = tts_client
         self._callbacks = callbacks or SessionCallbacks()
+        self._korean_pp = korean_postprocessor
+        self._bible = bible_lookup
         self._stt: STTClient | None = None
         self._tasks: set[asyncio.Task] = set()
         self._previous_chunk: str | None = None  # last flushed Korean text for LLM context
@@ -166,6 +176,24 @@ class SessionOrchestrator:
         if session.is_cancelled:
             return
 
+        # Strip leading filler words (���, 네, 예, …) to prevent the LLM
+        # from producing short "single-word, comma" translations that
+        # destabilise TTS voice cloning.
+        cleaned = strip_leading_fillers(korean_text)
+        if cleaned is None:
+            logger.info("Segment is filler-only, skipping: %r", korean_text)
+            return
+        if cleaned != korean_text:
+            logger.info("Stripped fillers: %r → %r", korean_text, cleaned)
+            korean_text = cleaned
+
+        # Apply domain corrections and optional spacing fix
+        if self._korean_pp:
+            corrected = self._korean_pp.process(korean_text)
+            if corrected != korean_text:
+                logger.info("Post-processed: %r → %r", korean_text, corrected)
+                korean_text = corrected
+
         # Record confirmed Korean segment
         segment = session.add_segment(korean_text)
 
@@ -173,13 +201,26 @@ class SessionOrchestrator:
         if self._callbacks.on_stt_final:
             await self._callbacks.on_stt_final(korean_text, segment.index)
 
-        # Build processor context
+        # Bible verse lookup disabled — too buggy for now.
+        # if self._bible:
+        #     new_verses = await self._bible.lookup_from_text(korean_text)
+        #     for v in new_verses:
+        #         if v not in session.bible_verses:
+        #             session.bible_verses.append(v)
+        #             logger.info("Bible verse added to session: %s", v[:60])
+
+        # Build processor context (glossary resolved from session's glossary_id)
+        glossary = get_glossary(session.glossary_id) if session.glossary_id else None
         context = {
             "source_lang": session.source_lang,
             "target_lang": session.target_lang,
             "recent_segments": session.get_llm_context(),
             "segment_index": segment.index,
             "previous_chunk": self._previous_chunk,
+            "glossary": glossary,
+            "church_name": session.church_name,
+            "church_name_native": session.church_name_native,
+            "bible_verses": session.bible_verses or None,
         }
         self._previous_chunk = korean_text
 
@@ -202,8 +243,8 @@ class SessionOrchestrator:
                 # Check for sentence boundary → send to TTS
                 result = detector.feed(token)
                 if result:
-                    sentence, sentence_idx = result
-                    logger.info("[DIAG] sentence_boundary detected: %s", sentence[:30])
+                    sentence, sentence_idx, delimiter = result
+                    logger.info("[DIAG] sentence_boundary detected (%r): %s", delimiter, sentence[:30])
                     if use_continuous:
                         await self._tts_client.send_text_chunk(session.session_id, sentence, language=session.target_lang)
                     else:
@@ -213,6 +254,7 @@ class SessionOrchestrator:
                             segment_index=segment.index,
                             sentence_index=sentence_idx,
                             language=session.target_lang,
+                            delimiter=delimiter,
                         )
         except Exception:
             logger.exception(
@@ -225,7 +267,7 @@ class SessionOrchestrator:
         # Flush any remaining text to TTS
         result = detector.flush()
         if result:
-            sentence, sentence_idx = result
+            sentence, sentence_idx, delimiter = result
             logger.info("[DIAG] sentence_flush: %s", sentence[:30])
             if use_continuous:
                 await self._tts_client.send_text_chunk(session.session_id, sentence, language=session.target_lang)
@@ -236,6 +278,7 @@ class SessionOrchestrator:
                     segment_index=segment.index,
                     sentence_index=sentence_idx,
                     language=session.target_lang,
+                    delimiter=delimiter,
                 )
 
         # Record translation and notify consumer

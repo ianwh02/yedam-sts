@@ -7,6 +7,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
+from ..llm.glossary import get_glossary, list_glossaries
 from ..pipeline.manager import PipelineManager, SessionLimitError
 
 PING_INTERVAL = 30  # seconds — keeps connection alive through reverse proxies
@@ -38,6 +39,9 @@ class CreateSessionRequest(BaseModel):
     source_lang: str = "ko"
     target_lang: str = "en"
     processor: str = "translation"
+    glossary_id: str | None = None  # denomination glossary (e.g. "presbyterian", "nazarene")
+    church_name: str | None = None  # church name in English (for LLM prompt context)
+    church_name_native: str | None = None  # church name in source language (for STT matching)
     tts_config: PipelineTTSConfig | None = None
 
 
@@ -56,6 +60,9 @@ async def create_session(req: CreateSessionRequest, request: Request):
             source_lang=req.source_lang,
             target_lang=req.target_lang,
             processor_type=req.processor,
+            glossary_id=req.glossary_id,
+            church_name=req.church_name,
+            church_name_native=req.church_name_native,
             tts_config=req.tts_config,
         )
     except SessionLimitError as e:
@@ -82,6 +89,34 @@ async def update_tts_config(session_id: str, req: PipelineTTSConfig, request: Re
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"status": "ok", "session_id": session_id}
+
+
+@rest_router.get("/glossaries")
+async def get_glossaries():
+    """List available denomination glossaries."""
+    result = []
+    for gid in list_glossaries():
+        g = get_glossary(gid)
+        result.append({
+            "id": gid,
+            "denomination": g.get("denomination", ""),
+            "term_count": sum(
+                len(g.get(s, {}))
+                for s in ("theological_terms", "titles", "proper_nouns",
+                          "bible_books", "key_phrases", "stt_corrections",
+                          "code_switch_english")
+            ),
+        })
+    return result
+
+
+@rest_router.get("/glossaries/{glossary_id}")
+async def get_glossary_detail(glossary_id: str):
+    """Get full glossary content for editing."""
+    g = get_glossary(glossary_id)
+    if g is None:
+        raise HTTPException(status_code=404, detail="Glossary not found")
+    return {"id": glossary_id, **g}
 
 
 @rest_router.delete("/sessions/{session_id}")

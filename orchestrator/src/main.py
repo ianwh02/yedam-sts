@@ -1,13 +1,14 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .api.admin import rest_router as admin_rest_router
 from .api.admin import ws_router as admin_ws_router
-from .api.audio_stream import router as audio_stream_router
 from .api.listener import router as listener_router
 from .audio.preprocess import AudioPreprocessor
 from .config import settings
+from .llm.glossary import load_glossaries, load_glossaries_from_supabase
 from .pipeline.manager import PipelineManager
 from .tts.client import TTSClient
 
@@ -19,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Yedam STS Pipeline", version="0.1.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
 # Global singletons
 pipeline_manager = PipelineManager()
 preprocessor = AudioPreprocessor()
@@ -29,13 +38,25 @@ tts_client = TTSClient()
 async def startup():
     logger.info("Starting Yedam STS orchestrator")
 
+    # Load denomination glossaries: prefer Supabase, fall back to local JSON
+    glossary_count = 0
+    if settings.bible_supabase_url and settings.bible_supabase_key:
+        glossary_count = load_glossaries_from_supabase(
+            settings.bible_supabase_url, settings.bible_supabase_key,
+        )
+        if glossary_count:
+            logger.info("Loaded %d glossaries from Supabase", glossary_count)
+    if not glossary_count and settings.llm_glossaries_dir:
+        glossary_count = load_glossaries(settings.llm_glossaries_dir)
+        logger.info("Loaded %d glossaries from %s", glossary_count, settings.llm_glossaries_dir)
+
     # Initialize shared components
     await preprocessor.initialize()
     await tts_client.initialize()
 
     # Initialize pipeline manager with shared deps
-    # (Audio encoding is now handled per-endpoint: MP3 for HTTP listeners,
-    # raw PCM for admin WebSocket. Opus encoding is no longer used.)
+    # Audio: Opus-encoded once per session, OGG-wrapped per listener, sent as
+    # binary WebSocket frames on the same /ws/listen/{id} connection.
     await pipeline_manager.initialize(
         preprocessor=preprocessor,
         tts_client=tts_client,
@@ -63,7 +84,5 @@ async def health():
 app.include_router(admin_rest_router, prefix="/api", tags=["admin"])
 # WebSocket (admin audio input)
 app.include_router(admin_ws_router, prefix="/ws/admin", tags=["admin-ws"])
-# WebSocket (listener output: text transcripts only)
+# WebSocket (listener output: text transcripts + OGG/Opus audio)
 app.include_router(listener_router, prefix="/ws/listen", tags=["listener-ws"])
-# HTTP (listener audio stream: MP3 via <audio> element)
-app.include_router(audio_stream_router, prefix="/api/listen", tags=["listener-audio"])

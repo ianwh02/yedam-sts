@@ -4,6 +4,7 @@ Tests session state, sentence boundary detection, prompt building,
 broadcast hub, and processor logic. No running services required.
 """
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -175,9 +176,10 @@ class TestSentenceBoundaryDetector:
         # Feed enough words to meet min_words_sentence_split
         result = d.feed("This is a sentence. ")
         assert result is not None
-        sentence, idx = result
+        sentence, idx, delimiter = result
         assert sentence == "This is a sentence."
         assert idx == 0
+        assert delimiter == "."
 
     def test_short_sentence_no_split(self):
         """Short fragments like 'Yes.' shouldn't split."""
@@ -190,11 +192,13 @@ class TestSentenceBoundaryDetector:
         d = SentenceBoundaryDetector()
         result = d.feed("How are you doing? ")
         assert result is not None
+        assert result[2] == "?"
 
     def test_exclamation_splits(self):
         d = SentenceBoundaryDetector()
         result = d.feed("This is really great! ")
         assert result is not None
+        assert result[2] == "!"
 
     def test_comma_split_with_enough_words(self):
         d = SentenceBoundaryDetector()
@@ -202,6 +206,7 @@ class TestSentenceBoundaryDetector:
         text = "The quick brown fox jumped over the lazy, "
         result = d.feed(text)
         assert result is not None
+        assert result[2] == ","
 
     def test_comma_no_split_when_short(self):
         d = SentenceBoundaryDetector()
@@ -214,14 +219,16 @@ class TestSentenceBoundaryDetector:
         words = " ".join([f"word{i}" for i in range(36)])
         result = d.feed(words + " ")
         assert result is not None
+        assert result[2] == ""  # no delimiter for forced splits
 
     def test_flush_returns_remaining(self):
         d = SentenceBoundaryDetector()
         d.feed("Some remaining text")
         result = d.flush()
         assert result is not None
-        sentence, idx = result
+        sentence, idx, delimiter = result
         assert sentence == "Some remaining text"
+        assert delimiter == "."
 
     def test_flush_empty_returns_none(self):
         d = SentenceBoundaryDetector()
@@ -319,10 +326,13 @@ class TestPromptBuilding:
 @needs_orchestrator
 class TestBroadcastHub:
     @pytest.fixture
-    def hub(self):
-        return BroadcastHub()
+    async def hub(self):
+        h = BroadcastHub()
+        yield h
+        await h.close_all()
 
-    def test_initial_empty(self, hub):
+    @pytest.mark.asyncio
+    async def test_initial_empty(self, hub):
         assert hub.count == 0
 
     @pytest.mark.asyncio
@@ -349,17 +359,11 @@ class TestBroadcastHub:
         ws = AsyncMock()
         await hub.add(ws)
         await hub.broadcast_text({"type": "test", "data": "hello"})
+        # Drain task processes queue asynchronously
+        await asyncio.sleep(0.05)
         ws.send_text.assert_called_once()
         payload = ws.send_text.call_args[0][0]
         assert json.loads(payload)["type"] == "test"
-
-    @pytest.mark.asyncio
-    async def test_broadcast_binary(self, hub):
-        ws = AsyncMock()
-        await hub.add(ws)
-        data = b"\x00\x01\x02\x03"
-        await hub.broadcast_binary(data)
-        ws.send_bytes.assert_called_once_with(data)
 
     @pytest.mark.asyncio
     async def test_dead_listener_removed(self, hub):
@@ -368,6 +372,8 @@ class TestBroadcastHub:
         await hub.add(ws)
         assert hub.count == 1
         await hub.broadcast_text({"type": "test"})
+        # Drain task detects failure and evicts asynchronously
+        await asyncio.sleep(0.05)
         assert hub.count == 0
 
     @pytest.mark.asyncio
@@ -378,6 +384,8 @@ class TestBroadcastHub:
         await hub.add(ws2)
         assert hub.count == 2
         await hub.broadcast_text({"type": "test"})
+        # Drain tasks process queues asynchronously
+        await asyncio.sleep(0.05)
         ws1.send_text.assert_called_once()
         ws2.send_text.assert_called_once()
 

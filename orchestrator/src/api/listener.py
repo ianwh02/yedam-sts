@@ -16,10 +16,7 @@ PING_INTERVAL = 30  # seconds — keeps connection alive through reverse proxies
 
 @router.websocket("/{session_id}")
 async def listener_websocket(websocket: WebSocket, session_id: str):
-    """Listener WebSocket: receives translation text (transcripts only).
-
-    Audio is delivered separately via HTTP streaming at
-    GET /api/listen/{session_id}/audio (MP3, <audio> element compatible).
+    """Listener WebSocket: text transcripts (JSON) + audio (binary OGG/Opus).
 
     Protocol:
       Server → Client (text frames, JSON):
@@ -27,9 +24,13 @@ async def listener_websocket(websocket: WebSocket, session_id: str):
         { type: "stt_final", text: "...", segment_index: N }
         { type: "translation_partial", token: "...", segment_index: N }
         { type: "translation_final", text: "...", segment_index: N }
-        { type: "session_started", audio_url: "/api/listen/{id}/audio" }
+        { type: "session_started", session_id: "...", ... }
         { type: "session_ended" }
         { type: "ping" }
+
+      Server → Client (binary frames):
+        OGG/Opus audio stream (header pages sent on connect,
+        then audio pages as TTS produces them)
     """
     manager: PipelineManager = websocket.app.state.pipeline_manager
     session = manager.get_session(session_id)
@@ -47,7 +48,6 @@ async def listener_websocket(websocket: WebSocket, session_id: str):
         "source_lang": session.source_lang,
         "target_lang": session.target_lang,
         "listener_count": session.broadcast.count,
-        "audio_url": f"/api/listen/{session_id}/audio",
     })
 
     logger.info(

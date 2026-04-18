@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -20,47 +21,49 @@ MAX_AUDIO_QUEUE = 500
 # One Opus frame = 20ms at 48kHz
 FRAME_DURATION_S = 0.02
 
-# iOS kills audio sessions after ~10-30s of no audio output (varies by
-# version). Modal's proxy may also timeout idle HTTP connections.
-# Send one silence frame every 8s to cover both. Accumulation: 20ms per
-# 8s = 0.15s per minute of silence — negligible.
-IOS_KEEPALIVE_S = 8.0
+
+# Modal's proxy doesn't propagate client disconnects to the server.
+# Zombie generators keep running, each holding a queue in BroadcastHub.
+# Cap connection lifetime so zombies self-terminate and the client reconnects.
+MAX_STREAM_DURATION_S = 300  # 5 minutes
 
 
-async def _audio_generator(
-    queue: asyncio.Queue,
-    silence_frame: bytes,
-):
-    """OGG/Opus stream — audio delivered immediately, minimal silence.
+async def _audio_generator(queue: asyncio.Queue):
+    """OGG/Opus stream — real-time paced with empty OGG keepalive.
 
-    Audio frames are yielded as fast as they arrive. Between sentences,
-    nothing is sent — the browser stalls silently and resumes instantly
-    when new audio arrives (zero accumulated delay).
-
-    After 25s of no audio, one silence frame is sent to prevent iOS
-    from killing the audio session on lock screen. This adds only 20ms
-    of buffer per 25 seconds — negligible accumulation.
+    Audio frames are yielded as fast as they arrive. When the queue is
+    empty, empty OGG pages (no audio, no granule advance) are sent at
+    frame rate (~50/s) to keep the HTTP connection alive through
+    Modal's proxy and iOS lock screen. Cost: ~1.3 KB/s per listener.
 
     None sentinel = session ended, stop generator.
     """
     writer = OggPageWriter()
     yield writer.header_pages()
+    started = time.monotonic()
 
     try:
         while True:
+            # Kill zombie connections — Modal proxy doesn't propagate
+            # client disconnects, so old generators run forever.
+            if time.monotonic() - started > MAX_STREAM_DURATION_S:
+                logger.info("Audio stream max duration reached, closing")
+                return
+
             try:
                 frame = await asyncio.wait_for(
-                    queue.get(), timeout=IOS_KEEPALIVE_S,
+                    queue.get(), timeout=FRAME_DURATION_S,
                 )
             except TimeoutError:
-                # No audio for 25s — send one keepalive frame for iOS
-                yield writer.wrap_frame(silence_frame)
+                # Queue empty — send empty OGG page at frame rate.
+                # No granule advance = no silence in browser buffer.
+                yield writer.keepalive_page()
                 continue
 
             if frame is None:
                 return
             if frame is SILENCE_SENTINEL:
-                continue  # consume sentinel, send nothing
+                continue
 
             yield writer.wrap_frame(frame)
 
@@ -73,7 +76,7 @@ async def listen_audio_stream(session_id: str, request: Request):
     """HTTP audio stream for listeners.
 
     Returns a chunked OGG/Opus stream playable by an <audio> element.
-    Sparse silence keepalive keeps the stream alive during lock screen.
+    Empty OGG pages at frame rate keep the connection alive during idle.
 
     Opus encoding is shared (one encoder per session in BroadcastHub).
     This endpoint only does cheap OGG page wrapping per connection.
@@ -90,12 +93,9 @@ async def listen_audio_stream(session_id: str, request: Request):
     queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_AUDIO_QUEUE)
     await session.broadcast.add_audio_queue(queue)
 
-    # Get pre-encoded silence frame from shared encoder
-    silence_frame = session.broadcast.silence_frame
-
     async def stream_with_cleanup():
         try:
-            async for page in _audio_generator(queue, silence_frame):
+            async for page in _audio_generator(queue):
                 yield page
         finally:
             await session.broadcast.remove_audio_queue(queue)

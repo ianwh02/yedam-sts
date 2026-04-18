@@ -28,6 +28,7 @@ class TTSQueueItem:
     segment_index: int
     sentence_index: int
     language: str = "en"
+    delimiter: str = ""  # punctuation that caused the split (e.g. ".", ",", "?")
     enqueued_at: float = field(default_factory=time.time)
 
 
@@ -197,6 +198,7 @@ class TTSClient:
         segment_index: int,
         sentence_index: int,
         language: str = "en",
+        delimiter: str = "",
     ):
         """Add a sentence to the session's TTS synthesis queue."""
         queue = self._session_queues.get(session_id)
@@ -209,6 +211,7 @@ class TTSClient:
             segment_index=segment_index,
             sentence_index=sentence_index,
             language=language,
+            delimiter=delimiter,
         )
         await queue.put(item)
 
@@ -378,12 +381,27 @@ class TTSClient:
         """Background task: read audio/control messages from TTS WebSocket."""
         segment_idx = 0
         _first_audio_after_boundary = True
+        _last_chunk_t: float = 0.0
+        _chunk_count: int = 0
         try:
             async for message in ws:
                 if isinstance(message, bytes):
+                    now = time.monotonic()
+                    gap = (now - _last_chunk_t) * 1000 if _last_chunk_t > 0 else 0.0
+                    pcm_duration_ms = len(message) / (2 * 48000) * 1000  # s16le mono 48kHz
+                    _chunk_count += 1
                     if _first_audio_after_boundary:
-                        logger.info("[DIAG] B first_audio_received len=%d", len(message))
+                        logger.info(
+                            "[TTS-TIMING] first_chunk seg=%d len=%d pcm=%.1fms",
+                            segment_idx, len(message), pcm_duration_ms,
+                        )
                         _first_audio_after_boundary = False
+                    elif _chunk_count <= 10 or _chunk_count % 20 == 0 or gap > 100:
+                        logger.info(
+                            "[TTS-TIMING] chunk #%d gap=%.1fms len=%d pcm=%.1fms",
+                            _chunk_count, gap, len(message), pcm_duration_ms,
+                        )
+                    _last_chunk_t = now
                     # Binary = PCM audio chunk
                     callbacks = self._on_audio.get(session_id, [])
                     item = TTSQueueItem(
@@ -446,8 +464,22 @@ class TTSClient:
                 payload["instruct"] = voice_cfg.instruct
         return payload
 
+    # Desired silence duration (seconds) by delimiter type.
+    # Only inserted when the natural pipeline gap is shorter than the desired pause.
+    _DELIMITER_SILENCE: dict[str, float] = {
+        ".": 0.30,
+        "!": 0.28,
+        "?": 0.25,
+        ";": 0.20,
+        ":": 0.18,
+        ",": 0.10,
+    }
+    _DEFAULT_SILENCE: float = 0.15
+
     async def _consume_loop(self, session_id: str, queue: asyncio.Queue):
         """Process TTS queue items for a single session."""
+        last_audio_sent_at: float = 0.0
+
         while True:
             item = await queue.get()
             if item is None:
@@ -464,12 +496,22 @@ class TTSClient:
                         for cb in callbacks:
                             await cb(audio_bytes, item)
 
-                    # Append consistent inter-segment silence
-                    if settings.tts_inter_segment_pause_ms > 0:
-                        pause = self._make_silence(settings.tts_inter_segment_pause_ms)
+                    # Conditional silence: only insert when the natural pipeline
+                    # gap is shorter than the desired delimiter-based pause.
+                    # For back-to-back segments this adds natural rhythm;
+                    # for slow pipeline delivery (gap already > desired) it's a no-op.
+                    now = time.monotonic()
+                    actual_gap = now - last_audio_sent_at if last_audio_sent_at > 0 else float("inf")
+                    desired_gap = self._DELIMITER_SILENCE.get(item.delimiter, self._DEFAULT_SILENCE)
+
+                    if actual_gap < desired_gap:
+                        silence_ms = int((desired_gap - actual_gap) * 1000)
+                        pause = self._make_silence(silence_ms)
                         callbacks = self._on_audio.get(item.session_id, [])
                         for cb in callbacks:
                             await cb(pause, item)
+
+                    last_audio_sent_at = time.monotonic()
 
                     # Signal sentence done (triggers silence mode in audio streams)
                     for cb in self._on_sentence_done.get(item.session_id, []):
@@ -489,9 +531,21 @@ class TTSClient:
                 response.raise_for_status()
                 sample_format = response.headers.get("x-sample-format", "f32le")
                 callbacks = self._on_audio.get(item.session_id, [])
+                _stream_chunk_count = 0
+                _stream_last_t = 0.0
                 async for raw_chunk in response.aiter_bytes(chunk_size=4096):
                     if not raw_chunk:
                         continue
+                    now = time.monotonic()
+                    gap = (now - _stream_last_t) * 1000 if _stream_last_t > 0 else 0.0
+                    _stream_chunk_count += 1
+                    if _stream_chunk_count <= 5 or _stream_chunk_count % 20 == 0 or gap > 100:
+                        pcm_dur = len(raw_chunk) / (2 * 48000) * 1000 if sample_format == "s16le" else len(raw_chunk) / (4 * 48000) * 1000
+                        logger.info(
+                            "[TTS-TIMING] stream chunk #%d gap=%.1fms len=%d pcm=%.1fms",
+                            _stream_chunk_count, gap, len(raw_chunk), pcm_dur,
+                        )
+                    _stream_last_t = now
                     if sample_format == "s16le":
                         audio_bytes = raw_chunk
                     else:

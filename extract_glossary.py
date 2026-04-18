@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Extract text from Nazarene glossary docx files."""
-import sys
 import io
+import sys
+
 import docx
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')

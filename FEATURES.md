@@ -220,7 +220,7 @@ Identified 2026-03-28. Ranked by impact for the yedam-sts pipeline.
 
 **Source**: RealtimeSTT (`audio_recorder.py`)
 
-**Current behavior**: Single Whisper model (large-v3-turbo or whisper-small-komixv2 TRT) handles both partial and final transcription.
+**Current behavior**: Single Whisper model (large-v3-turbo or whisper-medium-komixv2 TRT) handles both partial and final transcription.
 
 **Proposed**: Use a smaller model for real-time partials (fast, lower quality) and a larger model for final transcription (slower, higher quality).
 
@@ -436,24 +436,37 @@ Identified 2026-03-28. Ranked by impact for the yedam-sts pipeline.
 
 ---
 
-## Implementation Priority
+## Implementation Priority (Revised for Real-Time Translation)
 
-### Phase 1 — Orchestrator-level changes (no model/VRAM changes)
-1. **K4 Early Transcription on Silence** — lowest risk, highest reward ratio
-2. **K2 Quick Answer / First Fragment Split** — modify SentenceBoundaryDetector thresholds
-3. **K9 Silence Insertion by Delimiter Type** — trivial to implement
-4. **K8 Speaker Embedding Caching** — save .pt files, load at startup
+The original priority ranking was designed for a voice chatbot. For **real-time Korean→English
+translation**, the constraints are different:
 
-### Phase 2 — STT server changes
-5. **K1 Speculative LLM Pre-generation** — needs partial stability tracking + LLM abort
-6. **K10 Background Noise Detection** — add similarity tracking to STT backend
-7. **K6 Realtime Text Stabilization** — common prefix computation
+- **Korean is SOV** — the verb at the end changes meaning of everything before it. Speculating
+  on incomplete Korean sentences produces wrong translations.
+- **One-directional** — the speaker talks continuously; there are no "turns" with an AI.
+- **Accuracy > speed** — a wrong translation 200ms earlier is worse than a correct one 200ms later.
+- **TTS prosody matters** — listeners need natural-sounding English to comprehend the translation.
+  Short isolated fragments produce unnatural intonation because the TTS model can't plan prosody
+  across the full sentence.
 
-### Phase 3 — Requires client changes
-8. **K11 Interruption Handling** — needs frontend AudioWorklet changes
-9. **K7 Buffer Threshold Flow Control** — needs client buffer reporting
-10. **K12 Adaptive Turn Detection Speed** — needs frontend UI
+### Recommended — Useful for translation
 
-### Phase 4 — Research / Training required
-11. **K3 ML-Based Turn Detection** — needs Korean sentence completion model
-12. **K5 Dual Whisper Model** — needs second Korean-tuned model + VRAM budget
+| Priority | Feature | Rationale |
+|----------|---------|-----------|
+| 1 | **K10 Background Noise Detection** | Prevents phantom translations — the #1 accuracy failure mode. Whisper hallucinating on ambient noise (congregation, HVAC, music) cascades through LLM+TTS, producing confidently-spoken nonsense. |
+| 2 | **K9 Silence Insertion by Delimiter Type** | More natural English TTS output with varied pauses (period=300ms, comma=100ms). Trivial to implement, improves comprehension. |
+| 3 | **K8 Speaker Embedding Caching** | Minor startup optimization (~50-100ms per new session). Zero risk, free win. |
+
+### Deprioritized — Not suitable for translation, or marginal value
+
+| Feature | Why deprioritized |
+|---------|-------------------|
+| **K7 Buffer Threshold Flow Control** | **Harmful for translation.** Pausing TTS when the buffer is full means sentences never get synthesized — the listener misses content. For translation, every sentence matters. Falling 5 seconds behind real-time is better than skipping 70% of the content. The current approach (keep everything in queue, play all of it) is correct. |
+| **K1 Speculative LLM Pre-generation** | **Harmful for Korean.** Korean SOV word order means incomplete clauses are untranslatable — "나는 학교에" could become "I went to school" / "I want to go to school" / "I didn't go to school." Korean grammar endings already identify the right flush points with linguistic precision. Speculating wastes GPU and risks wrong translations. |
+| **K2 Quick Answer / First Fragment Split** | **Degrades TTS quality.** Sending short English fragments to TTS independently prevents the model from planning prosody across the full sentence. "In the beginning," generated alone gets different (worse) intonation than when the model sees the full sentence. For translation, natural prosody is essential for listener comprehension. This is the same problem identified in Feature #3 (Continuous TTS Streaming). The current approach of waiting for full sentences is correct. |
+| **K3 ML-Based Turn Detection** | Korean grammar endings (`korean_endings.py`) are a better "turn detector" for Korean than any generic ML model. 80+ sentence endings + 50+ phrase endings with linguistic knowledge of Korean morphology. A DistilBERT model would need Korean fine-tuning to match, duplicating existing capability. |
+| **K4 Early Transcription on Silence** | STT already transcribes continuously via batch inference with rolling buffers. Korean grammar endings flush completed clauses regardless of silence. At best this shaves ~50ms on the rare case where silence is the only flush trigger. |
+| **K5 Dual Whisper Model** | Partials are display-only; translation uses final text. A tiny model's lower-quality Korean partials don't improve the pipeline. Not worth the VRAM. |
+| **K6 Realtime Text Stabilization** | Nice for display but doesn't affect translation accuracy. Existing `stability_count=2` already prevents jittery flushes. |
+| **K11 Interruption Handling** | Not applicable. One-directional translation — the speaker doesn't interact with the output. |
+| **K12 Adaptive Turn Detection Speed** | Korean grammar endings handle pace variation. The speaker's pauses are linguistic (between sentences), not turn-based. |

@@ -42,7 +42,7 @@ Audio In → [STT] → confirmed text → [Processor] → translated text → [T
 
 | Service | Model | VRAM (weights + KV cache + CUDA overhead) | Role |
 |---------|-------|------|------|
-| **STT** | Whisper small-komixv2 (int8_float16) | ~1.5 GB | Speech recognition |
+| **STT** | Whisper medium-komixv2 (int8_float16) | ~2.5 GB | Speech recognition |
 | **LLM** | Qwen3-8B-AWQ (4-bit) | ~5.5 GB | Translation / processing |
 | **TTS** | Qwen3-TTS 1.7B (BF16) + tokenizer + CUDA graphs | ~9.2 GB | Speech synthesis |
 | **Orchestrator** | — (CPU only) | 0 | Session management |
@@ -297,7 +297,7 @@ WHISPER_MODEL_REPO=large-v3       # or: medium, small, turbo
 WHISPER_COMPUTE_TYPE=int8_float16  # or: float16 for higher accuracy
 ```
 
-Update VRAM budget accordingly — `small` uses ~0.5 GB, `medium` ~1 GB, `large-v3` ~1.5 GB, `large-v3-turbo` ~1.5 GB. The default production config uses `seastar105/whisper-small-komixv2` (Korean fine-tuned).
+Update VRAM budget accordingly — `small` uses ~0.5 GB, `medium` ~1 GB, `large-v3` ~1.5 GB, `large-v3-turbo` ~1.5 GB. The default production config uses `seastar105/whisper-medium-komixv2` (Korean fine-tuned).
 
 The STT image downloads the model at build time, so rebuild after changing:
 
@@ -371,7 +371,7 @@ All measurements on **NVIDIA RTX 5060 Ti 16GB**, Docker Compose, CUDA MPS enable
 
 | Service | Model | Measured VRAM |
 |---------|-------|--------------|
-| STT | Whisper small-komixv2 (int8_float16) | ~1.5 GB |
+| STT | Whisper medium-komixv2 (int8_float16) | ~2.5 GB |
 | LLM | Qwen3-8B-AWQ (4-bit) | ~5.5 GB |
 | TTS | Qwen3-TTS 1.7B (BF16) + tokenizer + CUDA graphs | ~9.2 GB |
 | **Total (5 sessions)** | | **~16.2 GB** |
